@@ -1786,3 +1786,184 @@ async fn pipelined_client_runs_many_concurrent_produces() -> Result<()> {
     handle.shutdown().await?;
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Consumer-group coordination
+// ---------------------------------------------------------------------------
+
+use es_protocol::{
+    AssignmentResponse, HeartbeatRequest, HeartbeatResponse, JoinGroupRequest, JoinGroupResponse,
+    LeaveGroupRequest, TopicPartitionDto,
+};
+
+async fn join(
+    client: &Client,
+    base: &str,
+    group: &str,
+    member_id: Option<&str>,
+    topics: &[&str],
+) -> Result<JoinGroupResponse> {
+    Ok(client
+        .post(format!("{}/groups/{}/join", base, group))
+        .json(&JoinGroupRequest {
+            member_id: member_id.map(|s| s.to_string()),
+            topics: topics.iter().map(|s| s.to_string()).collect(),
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?)
+}
+
+async fn heartbeat(
+    client: &Client,
+    base: &str,
+    group: &str,
+    member_id: &str,
+    generation: u64,
+) -> Result<HeartbeatResponse> {
+    Ok(client
+        .post(format!("{}/groups/{}/heartbeat", base, group))
+        .json(&HeartbeatRequest {
+            member_id: member_id.to_string(),
+            generation,
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?)
+}
+
+async fn fetch_assignment(
+    client: &Client,
+    base: &str,
+    group: &str,
+    member_id: &str,
+) -> Result<AssignmentResponse> {
+    Ok(client
+        .get(format!(
+            "{}/groups/{}/assignment?member_id={}",
+            base, group, member_id
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?)
+}
+
+async fn boot_coord_fast(tmp: &TempDir) -> Result<(String, es_broker::BrokerHandle)> {
+    let mut cfg = Config::new(tmp.path().to_path_buf(), ephemeral_bind(), 1 << 20);
+    cfg.coord_member_timeout = Duration::from_millis(400);
+    cfg.coord_expire_interval = Duration::from_millis(100);
+    let handle = spawn(cfg).await?;
+    Ok((handle.base_url(), handle))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_members_split_two_partitions_one_each() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let (base, handle) = boot_coord_fast(&tmp).await?;
+    let client = Client::new();
+    create_topic(&client, &base, "shared", 2).await?;
+
+    let a = join(&client, &base, "g", None, &["shared"]).await?;
+    let b = join(&client, &base, "g", None, &["shared"]).await?;
+
+    // Generation must have advanced past 1 (it increments per join).
+    assert!(b.generation > 1);
+
+    // a's assignment is from generation 1 (stale). Re-fetch for the latest.
+    let a_now = fetch_assignment(&client, &base, "g", &a.member_id).await?;
+    let b_now = fetch_assignment(&client, &base, "g", &b.member_id).await?;
+    assert_eq!(a_now.generation, b_now.generation);
+    assert_eq!(a_now.assignment.len(), 1);
+    assert_eq!(b_now.assignment.len(), 1);
+    let combined: std::collections::BTreeSet<(String, u32)> = a_now
+        .assignment
+        .iter()
+        .chain(b_now.assignment.iter())
+        .map(|tp: &TopicPartitionDto| (tp.topic.clone(), tp.partition))
+        .collect();
+    assert_eq!(
+        combined,
+        std::collections::BTreeSet::from([
+            ("shared".to_string(), 0),
+            ("shared".to_string(), 1),
+        ])
+    );
+
+    handle.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn member_leave_rebalances_remaining_members() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let (base, handle) = boot_coord_fast(&tmp).await?;
+    let client = Client::new();
+    create_topic(&client, &base, "t", 4).await?;
+
+    let a = join(&client, &base, "g", None, &["t"]).await?;
+    let b = join(&client, &base, "g", None, &["t"]).await?;
+
+    // Leaving an unknown member is a no-op (still 204).
+    let resp = client
+        .post(format!("{}/groups/g/leave", base))
+        .json(&LeaveGroupRequest {
+            member_id: "nonexistent".to_string(),
+        })
+        .send()
+        .await?;
+    assert_eq!(resp.status().as_u16(), 204);
+
+    // Leave one of the real members; the other should now own all 4 partitions.
+    client
+        .post(format!("{}/groups/g/leave", base))
+        .json(&LeaveGroupRequest {
+            member_id: a.member_id.clone(),
+        })
+        .send()
+        .await?
+        .error_for_status()?;
+    let b_assign = fetch_assignment(&client, &base, "g", &b.member_id).await?;
+    assert_eq!(b_assign.assignment.len(), 4);
+
+    handle.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_member_is_evicted_and_remaining_rebalances() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let (base, handle) = boot_coord_fast(&tmp).await?;
+    let client = Client::new();
+    create_topic(&client, &base, "t", 2).await?;
+
+    let a = join(&client, &base, "g", None, &["t"]).await?;
+    let b = join(&client, &base, "g", None, &["t"]).await?;
+
+    // Keep a alive with heartbeats; let b go silent.
+    for _ in 0..6 {
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let r = heartbeat(&client, &base, "g", &a.member_id, a.generation).await?;
+        match r {
+            HeartbeatResponse::Ok { .. } | HeartbeatResponse::RebalanceRequired { .. } => {}
+            HeartbeatResponse::UnknownMember { .. } => {
+                panic!("a evicted unexpectedly");
+            }
+        }
+    }
+    // ~720ms elapsed — past the 400ms member_timeout for b.
+    let r = heartbeat(&client, &base, "g", &b.member_id, b.generation).await?;
+    assert!(matches!(r, HeartbeatResponse::UnknownMember { .. }));
+
+    // a should now own both partitions.
+    let a_assign = fetch_assignment(&client, &base, "g", &a.member_id).await?;
+    assert_eq!(a_assign.assignment.len(), 2);
+
+    handle.shutdown().await?;
+    Ok(())
+}

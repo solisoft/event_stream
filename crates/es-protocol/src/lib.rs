@@ -152,6 +152,56 @@ pub struct ResetOffsetsResponse {
     pub entries_reset: u32,
 }
 
+// --- consumer-group coordination ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JoinGroupRequest {
+    /// May be omitted on first join; the coordinator assigns one.
+    #[serde(default)]
+    pub member_id: Option<String>,
+    /// Topics the member wants to consume. Must already exist.
+    pub topics: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JoinGroupResponse {
+    pub member_id: String,
+    pub generation: u64,
+    /// Partitions assigned to *this* member as `(topic, partition)` pairs.
+    pub assignment: Vec<TopicPartitionDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeartbeatRequest {
+    pub member_id: String,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "lowercase")]
+pub enum HeartbeatResponse {
+    Ok { generation: u64 },
+    RebalanceRequired { current_generation: u64 },
+    UnknownMember { current_generation: u64 },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LeaveGroupRequest {
+    pub member_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssignmentResponse {
+    pub generation: u64,
+    pub assignment: Vec<TopicPartitionDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopicPartitionDto {
+    pub topic: String,
+    pub partition: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProduceResponse {
     pub results: Vec<ProduceResult>,

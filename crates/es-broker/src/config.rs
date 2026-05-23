@@ -53,6 +53,12 @@ pub struct Config {
     /// throughput. Page-cache visibility (other readers in the same broker)
     /// is independent of this — that always happens on every append.
     pub flush_every_records: u32,
+
+    /// A consumer-group member that hasn't sent a heartbeat within this window
+    /// is evicted, triggering a rebalance for that group.
+    pub coord_member_timeout: Duration,
+    /// How often the coordinator sweeps for stale members.
+    pub coord_expire_interval: Duration,
 }
 
 impl Config {
@@ -74,6 +80,8 @@ impl Config {
             producer_flush_interval: Duration::from_secs(2),
             bind_binary: None,
             flush_every_records: 1,
+            coord_member_timeout: Duration::from_secs(15),
+            coord_expire_interval: Duration::from_secs(2),
         }
     }
 }

@@ -3,6 +3,7 @@ pub mod admin_keys;
 pub mod admin_producers;
 pub mod auth_ext;
 pub mod consume;
+pub mod coord;
 pub mod error;
 pub mod groups;
 pub mod metrics;
@@ -31,6 +32,10 @@ pub fn router(broker: Arc<Broker>) -> Router {
         .route("/groups/:group/consume", get(consume::group_consume))
         .route("/groups/:group/commit", post(groups::commit))
         .route("/groups/:group/offsets", get(groups::offsets))
+        .route("/groups/:group/join", post(coord::join))
+        .route("/groups/:group/heartbeat", post(coord::heartbeat))
+        .route("/groups/:group/leave", post(coord::leave))
+        .route("/groups/:group/assignment", get(coord::assignment))
         .route("/admin/run-retention", post(admin::run_retention))
         .route("/admin/run-compaction", post(admin::run_compaction))
         .route("/admin/keys", get(admin_keys::list).post(admin_keys::create))

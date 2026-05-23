@@ -4,11 +4,12 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand, ValueEnum};
 use es_protocol::{
-    AclActionDto, AclRuleDto, CleanupPolicyDto, CommitRequest, ConsumeResponse,
-    CreateKeyRequest, CreateKeyResponse, CreateTopicRequest, DescribeTopicResponse,
-    GroupOffsetsResponse, ListKeysResponse, ListProducersResponse, ListTopicsResponse,
-    ProduceRecord, ProduceRequest, ProduceResponse, ResetOffsetsRequest, ResetOffsetsResponse,
-    TopicConfigDto, TopicConfigPatch, TopicSummary,
+    AclActionDto, AclRuleDto, AssignmentResponse, CleanupPolicyDto, CommitRequest,
+    ConsumeResponse, CreateKeyRequest, CreateKeyResponse, CreateTopicRequest,
+    DescribeTopicResponse, GroupOffsetsResponse, HeartbeatRequest, HeartbeatResponse,
+    JoinGroupRequest, JoinGroupResponse, LeaveGroupRequest, ListKeysResponse,
+    ListProducersResponse, ListTopicsResponse, ProduceRecord, ProduceRequest, ProduceResponse,
+    ResetOffsetsRequest, ResetOffsetsResponse, TopicConfigDto, TopicConfigPatch, TopicSummary,
 };
 
 #[derive(Parser, Debug)]
@@ -141,6 +142,41 @@ enum GroupCmd {
     Show {
         #[arg(long)]
         name: String,
+    },
+    /// Join a consumer group. Prints the assigned partitions + member_id you
+    /// will use for subsequent heartbeats.
+    Join {
+        #[arg(long)]
+        name: String,
+        /// Topic names to subscribe to. Repeat for multiple topics.
+        #[arg(long = "topic")]
+        topics: Vec<String>,
+        /// Optional — coordinator picks one if omitted.
+        #[arg(long)]
+        member_id: Option<String>,
+    },
+    /// Send a heartbeat from a member to the coordinator.
+    Heartbeat {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        member_id: String,
+        #[arg(long)]
+        generation: u64,
+    },
+    /// Leave the group.
+    Leave {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        member_id: String,
+    },
+    /// Fetch the current assignment for a member.
+    Assignment {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        member_id: String,
     },
 }
 
@@ -438,6 +474,82 @@ async fn main() -> Result<()> {
                         for (pid, off) in parts {
                             println!("  partition {} -> offset {}", pid, off);
                         }
+                    }
+                }
+            }
+            GroupCmd::Join {
+                name,
+                topics,
+                member_id,
+            } => {
+                let body = JoinGroupRequest { member_id, topics };
+                let resp: JoinGroupResponse =
+                    post_json(&client, &format!("{}/groups/{}/join", base, name), &body).await?;
+                println!("member_id:  {}", resp.member_id);
+                println!("generation: {}", resp.generation);
+                if resp.assignment.is_empty() {
+                    println!("assignment: (none)");
+                } else {
+                    println!("assignment:");
+                    for tp in resp.assignment {
+                        println!("  {}/{}", tp.topic, tp.partition);
+                    }
+                }
+            }
+            GroupCmd::Heartbeat {
+                name,
+                member_id,
+                generation,
+            } => {
+                let body = HeartbeatRequest {
+                    member_id,
+                    generation,
+                };
+                let resp: HeartbeatResponse =
+                    post_json(&client, &format!("{}/groups/{}/heartbeat", base, name), &body)
+                        .await?;
+                match resp {
+                    HeartbeatResponse::Ok { generation } => {
+                        println!("ok (generation {})", generation)
+                    }
+                    HeartbeatResponse::RebalanceRequired { current_generation } => {
+                        println!("rebalance required (current_generation {})", current_generation)
+                    }
+                    HeartbeatResponse::UnknownMember { current_generation } => println!(
+                        "unknown member (current_generation {}); rejoin required",
+                        current_generation
+                    ),
+                }
+            }
+            GroupCmd::Leave { name, member_id } => {
+                let body = LeaveGroupRequest { member_id };
+                let resp = client
+                    .post(format!("{}/groups/{}/leave", base, name))
+                    .json(&body)
+                    .send()
+                    .await?;
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(anyhow!("leave failed: {} {}", status, body));
+                }
+                println!("left");
+            }
+            GroupCmd::Assignment { name, member_id } => {
+                let resp: AssignmentResponse = get_json(
+                    &client,
+                    &format!(
+                        "{}/groups/{}/assignment?member_id={}",
+                        base, name, member_id
+                    ),
+                )
+                .await?;
+                println!("generation: {}", resp.generation);
+                if resp.assignment.is_empty() {
+                    println!("(no partitions assigned)");
+                } else {
+                    for tp in resp.assignment {
+                        println!("  {}/{}", tp.topic, tp.partition);
                     }
                 }
             }

@@ -3,6 +3,7 @@ pub mod binary;
 pub mod broker;
 pub mod compaction;
 pub mod config;
+pub mod coord;
 pub mod groups;
 pub mod http;
 pub mod partition;

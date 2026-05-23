@@ -8,6 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::auth::{AuthMode, KeyStore};
 use crate::config::Config;
+use crate::coord::GroupCoordinator;
 use crate::groups::GroupStore;
 use crate::producers::ProducerRegistry;
 use crate::topic::{Topic, TopicConfig};
@@ -19,6 +20,7 @@ pub struct Broker {
     pub groups: GroupStore,
     pub keys: Arc<KeyStore>,
     pub producers: Arc<ProducerRegistry>,
+    pub coordinator: Arc<GroupCoordinator>,
     pub shutdown: CancellationToken,
     background: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -50,6 +52,7 @@ impl Broker {
         let auth_required = config.auth_mode == AuthMode::Required;
         let (keys, _bootstrap_secret) = KeyStore::open(config.data_dir.clone(), auth_required)?;
         let producers = ProducerRegistry::open(config.data_dir.clone())?;
+        let coordinator = Arc::new(GroupCoordinator::new(config.coord_member_timeout));
 
         Ok(Arc::new(Self {
             config,
@@ -57,6 +60,7 @@ impl Broker {
             groups,
             keys,
             producers,
+            coordinator,
             shutdown: CancellationToken::new(),
             background: Mutex::new(Vec::new()),
         }))
@@ -84,9 +88,11 @@ impl Broker {
             self.config.producer_flush_interval,
             self.shutdown.clone(),
         );
+        let coord_expire = spawn_coord_expire(self.clone(), self.config.coord_expire_interval);
         guard.push(reaper);
         guard.push(compactor);
         guard.push(flusher);
+        guard.push(coord_expire);
     }
 
     pub async fn shutdown_background(&self) {
@@ -148,4 +154,20 @@ pub fn topics_root(data_dir: &std::path::Path) -> PathBuf {
 
 pub fn groups_root(data_dir: &std::path::Path) -> PathBuf {
     data_dir.join("groups")
+}
+
+fn spawn_coord_expire(broker: Arc<Broker>, interval: std::time::Duration) -> JoinHandle<()> {
+    let cancel = broker.shutdown.clone();
+    let weak = Arc::downgrade(&broker);
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = tokio::time::sleep(interval) => {}
+            }
+            let Some(b) = weak.upgrade() else { break; };
+            b.coordinator.expire_stale(&b).await;
+        }
+        tracing::info!("coord: expire task stopped");
+    })
 }
