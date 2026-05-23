@@ -330,3 +330,80 @@ async fn persistent_store_survives_restart() -> Result<()> {
 
 // Suppress unused-import warning on MemStore (kept exported for downstream use).
 fn _suppress() -> std::sync::Arc<dyn RaftStore> { std::sync::Arc::new(MemStore::new()) }
+
+// ---------------------------------------------------------------------------
+// Snapshot + log compaction
+// ---------------------------------------------------------------------------
+
+use es_broker::raft::PersistedSnapshot;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snapshot_compacts_log_and_survives_restart() -> Result<()> {
+    use tempfile::TempDir;
+    let tmp = TempDir::new()?;
+    let store_path = tmp.path().join("raft.json");
+
+    // Lifetime 1: propose 10 entries, snapshot, propose 3 more, shut down.
+    {
+        let store: std::sync::Arc<dyn RaftStore> =
+            std::sync::Arc::new(JsonStore::new(store_path.clone()));
+        let h = spawn_node_with_store(1, vec![], timing_fast(), store)?;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(h.role().await, Role::Leader);
+
+        for i in 0..10u32 {
+            let _ = h.propose(format!("e{}", i).into_bytes()).await?;
+        }
+        // Wait for commits + applies to propagate; single-node clusters commit
+        // synchronously but the apply Action is dispatched via the channel.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(h.commit_index().await, 10);
+        // Take a snapshot — application data is empty in this test.
+        let snap: PersistedSnapshot = h.take_snapshot(b"sm-state".to_vec()).await?;
+        assert!(snap.last_index >= 1);
+
+        // Three more proposes after the snapshot.
+        for i in 0..3u32 {
+            let _ = h.propose(format!("post{}", i).into_bytes()).await?;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(h.commit_index().await, 13);
+
+        // Give the apply_and_persist a moment to flush after the last propose.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // The on-disk log should now have at most 3 entries (snapshot took
+        // care of the first 10).
+        let trimmed: es_broker::raft::PersistedRaft =
+            serde_json::from_slice(&std::fs::read(&store_path)?)?;
+        assert!(
+            trimmed.log.len() <= 3,
+            "expected log compaction; got {} entries",
+            trimmed.log.len()
+        );
+
+        h.shutdown().await;
+    }
+
+    // Lifetime 2: re-open; the snapshot fast-forwards the log + commit/applied
+    // indices, then any post-snapshot entries replay.
+    {
+        let store: std::sync::Arc<dyn RaftStore> =
+            std::sync::Arc::new(JsonStore::new(store_path.clone()));
+        let h = spawn_node_with_store(1, vec![], timing_fast(), store)?;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let s = h.state.lock().await;
+        // Log spans the snapshot boundary: in-memory entries are the
+        // 3 post-snapshot ones, base_index marks where the snapshot ends.
+        assert_eq!(s.log.last_index(), 13);
+        assert!(s.log.base_index >= 10, "base_index didn't restore from snapshot");
+        // commit_index reflects what's safely committed. Per Raft §5.4.2 the
+        // newly-elected leader can't commit prior-term entries by counting
+        // alone, so it stays at the snapshot boundary until a fresh proposal.
+        assert_eq!(s.commit_index, s.log.base_index);
+        drop(s);
+        h.shutdown().await;
+    }
+
+    Ok(())
+}

@@ -17,7 +17,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use super::log::{Log, PersistedRaft};
+use super::log::{Log, PersistedRaft, PersistedSnapshot};
 use super::messages::{
     AppendEntries, AppendEntriesResp, LogEntry, LogIndex, Message, NodeId, RequestVote,
     RequestVoteResp, Term,
@@ -80,17 +80,55 @@ impl RaftState {
         }
     }
 
-    /// Restore from a persisted snapshot (used by the driver on boot).
-    pub fn restore(&mut self, snap: PersistedRaft) -> anyhow::Result<()> {
-        self.current_term = snap.current_term;
-        self.voted_for = snap.voted_for;
-        self.log = snap.into_log()?;
+    /// Restore from persisted state + an optional state-machine snapshot.
+    /// When a snapshot is present, its `last_index` becomes the log's base —
+    /// any log entries the driver re-applies will only carry indices above it.
+    pub fn restore(
+        &mut self,
+        persisted: PersistedRaft,
+        snapshot: Option<&PersistedSnapshot>,
+    ) -> anyhow::Result<()> {
+        self.current_term = persisted.current_term;
+        self.voted_for = persisted.voted_for;
+        self.log = persisted.into_log()?;
+        if let Some(snap) = snapshot {
+            self.log.base_index = snap.last_index;
+            self.log.base_term = snap.last_term;
+            // The application is responsible for re-applying the snapshot to
+            // its state machine; from Raft's perspective everything up to
+            // last_index is committed AND applied.
+            if snap.last_index > self.commit_index {
+                self.commit_index = snap.last_index;
+            }
+            if snap.last_index > self.last_applied {
+                self.last_applied = snap.last_index;
+            }
+        }
         self.dirty = false;
         Ok(())
     }
 
     pub fn snapshot_persistent(&self) -> PersistedRaft {
         PersistedRaft::from_runtime(self.current_term, self.voted_for, &self.log)
+    }
+
+    /// Capture a snapshot at `last_applied` and compact the log through that
+    /// point. `data` is the state-machine-specific payload (opaque to Raft).
+    pub fn take_snapshot(&mut self, data: Vec<u8>) -> anyhow::Result<PersistedSnapshot> {
+        if self.last_applied == 0 {
+            anyhow::bail!("nothing to snapshot yet (last_applied=0)");
+        }
+        let term = self
+            .log
+            .term_at(self.last_applied)
+            .ok_or_else(|| anyhow::anyhow!("last_applied entry not in log"))?;
+        self.log.compact_through(self.last_applied, term);
+        self.dirty = true;
+        Ok(PersistedSnapshot {
+            last_index: self.last_applied,
+            last_term: term,
+            data,
+        })
     }
 
     pub fn take_dirty(&mut self) -> bool {

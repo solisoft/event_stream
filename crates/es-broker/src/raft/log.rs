@@ -18,48 +18,70 @@ use serde::{Deserialize, Serialize};
 
 use super::messages::{LogEntry, LogIndex, NodeId, Term};
 
-/// In-memory log. Index 1 is the first entry.
+/// In-memory log with optional snapshot-compacted prefix.
+///
+/// `base_index` and `base_term` describe the last entry whose payload is no
+/// longer in memory (it was folded into a snapshot). Entries in `entries` all
+/// have `index > base_index`. With no snapshot, base = 0 and indexing matches
+/// the textbook Raft "index 1 is first entry."
 #[derive(Debug, Default, Clone)]
 pub struct Log {
     pub entries: Vec<LogEntry>,
+    pub base_index: LogIndex,
+    pub base_term: Term,
 }
 
 impl Log {
     pub fn last_index(&self) -> LogIndex {
-        self.entries.last().map(|e| e.index).unwrap_or(0)
+        self.entries.last().map(|e| e.index).unwrap_or(self.base_index)
     }
 
     pub fn last_term(&self) -> Term {
-        self.entries.last().map(|e| e.term).unwrap_or(0)
+        self.entries.last().map(|e| e.term).unwrap_or(self.base_term)
     }
 
-    /// Term at `index` (1-based), or `None` if out of range.
+    /// Term at `index`. `Some(0)` for index 0 (Raft sentinel). `None` if the
+    /// entry has been compacted away or is past the tail.
     pub fn term_at(&self, index: LogIndex) -> Option<Term> {
         if index == 0 {
             return Some(0);
         }
-        let pos = index.checked_sub(1)? as usize;
+        if index == self.base_index {
+            return Some(self.base_term);
+        }
+        if index < self.base_index {
+            return None; // compacted
+        }
+        if self.entries.is_empty() {
+            return None;
+        }
+        let first_idx = self.entries[0].index;
+        if index < first_idx || index > self.last_index() {
+            return None;
+        }
+        let pos = (index - first_idx) as usize;
         self.entries.get(pos).map(|e| e.term)
     }
 
-    /// Entries in `[start, end_exclusive)`. Bounds-tolerant.
+    /// Entries in `[start, end_exclusive)`. Returns an empty Vec if the range
+    /// is empty, falls fully below `base_index`, or sits past the tail.
+    /// When the start clips into the compacted region, the slice begins at the
+    /// first in-memory entry.
     pub fn slice(&self, start: LogIndex, end_exclusive: LogIndex) -> Vec<LogEntry> {
-        if start == 0 || end_exclusive <= start {
+        if start == 0 || end_exclusive <= start || self.entries.is_empty() {
             return Vec::new();
         }
-        let start = (start - 1) as usize;
-        let end = (end_exclusive - 1) as usize;
-        if start >= self.entries.len() {
+        let first_idx = self.entries[0].index;
+        let start = start.max(first_idx);
+        let end = end_exclusive.min(self.last_index() + 1);
+        if end <= start {
             return Vec::new();
         }
-        let end = end.min(self.entries.len());
-        self.entries[start..end].to_vec()
+        let s = (start - first_idx) as usize;
+        let e = (end - first_idx) as usize;
+        self.entries[s..e].to_vec()
     }
 
-    /// Append entries that are guaranteed to follow the current tail.
-    /// Caller is responsible for any conflict resolution (truncation) before
-    /// calling this. Indices are reassigned to be contiguous on append; the
-    /// `index` in the inbound entries is used only for cross-checking.
     pub fn append_assign_indices(&mut self, mut entries: Vec<LogEntry>) {
         let mut next = self.last_index() + 1;
         for e in &mut entries {
@@ -69,34 +91,33 @@ impl Log {
         self.entries.extend(entries);
     }
 
-    /// Truncate the log so that no entry has `index >= cut_index`. Idempotent.
     pub fn truncate_from(&mut self, cut_index: LogIndex) {
-        if cut_index == 0 {
+        if cut_index <= self.base_index {
             self.entries.clear();
             return;
         }
-        let keep = (cut_index - 1) as usize;
-        if keep < self.entries.len() {
-            self.entries.truncate(keep);
+        if self.entries.is_empty() {
+            return;
         }
+        let first_idx = self.entries[0].index;
+        if cut_index <= first_idx {
+            self.entries.clear();
+            return;
+        }
+        let keep = (cut_index - first_idx) as usize;
+        self.entries.truncate(keep);
     }
 
-    /// Append entries at a specific index, handling overlap correctly:
-    /// any existing entry at the same index with a different term wins
-    /// truncation, then matching prefix is skipped, then the tail is appended.
     pub fn append_at(&mut self, start_index: LogIndex, mut new_entries: Vec<LogEntry>) {
-        // Walk the prefix that already matches.
         let mut idx = start_index;
         let mut skip = 0usize;
         while skip < new_entries.len() {
-            let term_here = self.term_at(idx);
-            match term_here {
+            match self.term_at(idx) {
                 Some(t) if t == new_entries[skip].term => {
                     skip += 1;
                     idx += 1;
                 }
                 Some(_) => {
-                    // Conflict: drop everything from `idx` onward.
                     self.truncate_from(idx);
                     break;
                 }
@@ -106,9 +127,7 @@ impl Log {
         if skip == new_entries.len() {
             return;
         }
-        // The remaining entries don't exist yet (after any truncate above).
         let to_append = new_entries.split_off(skip);
-        // Force the index field so callers don't have to.
         let mut next = self.last_index() + 1;
         let mut out = Vec::with_capacity(to_append.len());
         for mut e in to_append {
@@ -118,14 +137,44 @@ impl Log {
         }
         self.entries.extend(out);
     }
+
+    /// Drop every entry with `index <= cut_index`. `cut_term` becomes the new
+    /// `base_term`. Safe to call repeatedly; idempotent if `cut_index` is
+    /// already ≤ `base_index`.
+    pub fn compact_through(&mut self, cut_index: LogIndex, cut_term: Term) {
+        if cut_index <= self.base_index {
+            return;
+        }
+        let drop_count = if let Some(first) = self.entries.first() {
+            ((cut_index + 1).saturating_sub(first.index) as usize).min(self.entries.len())
+        } else {
+            0
+        };
+        self.entries.drain(..drop_count);
+        self.base_index = cut_index;
+        self.base_term = cut_term;
+    }
 }
 
 /// Persistent metadata + log. All writes must be durable before the caller
 /// responds to the RPC that requested them — Raft's election-safety property
 /// depends on this.
+///
+/// `save_snapshot` and `load_snapshot` are independent of `save_all`/`load`:
+/// the snapshot file lives next to the log so they can be written separately.
 pub trait RaftStore: Send + Sync {
     fn load(&self) -> Result<PersistedRaft>;
     fn save_all(&self, snap: &PersistedRaft) -> Result<()>;
+    fn load_snapshot(&self) -> Result<Option<PersistedSnapshot>>;
+    fn save_snapshot(&self, snap: &PersistedSnapshot) -> Result<()>;
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PersistedSnapshot {
+    pub last_index: LogIndex,
+    pub last_term: Term,
+    /// State-machine-specific bytes. Opaque to Raft.
+    pub data: Vec<u8>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -179,7 +228,11 @@ impl PersistedRaft {
             .into_iter()
             .map(PersistedEntry::to)
             .collect::<Result<Vec<_>>>()?;
-        Ok(Log { entries })
+        Ok(Log {
+            entries,
+            base_index: 0,
+            base_term: 0,
+        })
     }
 }
 
@@ -190,6 +243,16 @@ pub struct JsonStore {
 impl JsonStore {
     pub fn new(path: PathBuf) -> Self {
         Self { path }
+    }
+}
+
+impl JsonStore {
+    fn snapshot_path(&self) -> PathBuf {
+        let stem = self.path.file_stem().unwrap_or_default();
+        let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
+        let mut name = stem.to_os_string();
+        name.push(".snapshot.json");
+        parent.join(name)
     }
 }
 
@@ -222,17 +285,47 @@ impl RaftStore for JsonStore {
         std::fs::rename(&tmp, &self.path)?;
         Ok(())
     }
+
+    fn load_snapshot(&self) -> Result<Option<PersistedSnapshot>> {
+        let path = self.snapshot_path();
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok(Some(
+                serde_json::from_slice(&bytes)
+                    .with_context(|| format!("parse snapshot {:?}", path))?,
+            )),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn save_snapshot(&self, snap: &PersistedSnapshot) -> Result<()> {
+        let path = self.snapshot_path();
+        let parent = path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+        std::fs::create_dir_all(&parent)?;
+        let tmp = path.with_extension("json.tmp");
+        let bytes = serde_json::to_vec(snap)?;
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&bytes)?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
+    }
 }
 
 /// In-memory store for tests that want to bypass disk entirely.
 pub struct MemStore {
     inner: std::sync::Mutex<PersistedRaft>,
+    snap: std::sync::Mutex<Option<PersistedSnapshot>>,
 }
 
 impl MemStore {
     pub fn new() -> Self {
         Self {
             inner: std::sync::Mutex::new(PersistedRaft::default()),
+            snap: std::sync::Mutex::new(None),
         }
     }
 }
@@ -249,6 +342,13 @@ impl RaftStore for MemStore {
     }
     fn save_all(&self, snap: &PersistedRaft) -> Result<()> {
         *self.inner.lock().unwrap() = snap.clone();
+        Ok(())
+    }
+    fn load_snapshot(&self) -> Result<Option<PersistedSnapshot>> {
+        Ok(self.snap.lock().unwrap().clone())
+    }
+    fn save_snapshot(&self, s: &PersistedSnapshot) -> Result<()> {
+        *self.snap.lock().unwrap() = Some(s.clone());
         Ok(())
     }
 }

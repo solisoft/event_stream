@@ -12,7 +12,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use super::log::RaftStore;
+use super::log::{PersistedSnapshot, RaftStore};
 use super::messages::{LogEntry, LogIndex, Message, NodeId};
 use super::state::{Action, ProposeOutcome, RaftState, Role};
 
@@ -63,6 +63,9 @@ pub struct NodeHandle {
     pub cancel: CancellationToken,
     pub join: Option<JoinHandle<()>>,
     propose_tx: mpsc::UnboundedSender<ProposeReq>,
+    /// Shared with the node loop so application-triggered snapshots can be
+    /// persisted alongside everything else the loop persists.
+    pub store: Arc<dyn RaftStore>,
 }
 
 impl NodeHandle {
@@ -102,6 +105,27 @@ impl NodeHandle {
         self.committed.as_mut().and_then(|r| r.try_recv().ok())
     }
 
+    /// Capture a Raft snapshot at the current `last_applied` and persist it.
+    /// The log is compacted in-memory and on the next persist cycle the
+    /// shrunken log file is written out.
+    pub async fn take_snapshot(&self, data: Vec<u8>) -> Result<PersistedSnapshot> {
+        let (snap, persisted) = {
+            let mut s = self.state.lock().await;
+            let snap = s.take_snapshot(data)?;
+            // The log was compacted; capture a fresh persisted-log snapshot
+            // so save_all writes the trimmed version.
+            let persisted = s.snapshot_persistent();
+            (snap, persisted)
+        };
+        // Persist snapshot first, then the trimmed log. If we crash between
+        // these, the snapshot is durable and the larger log is harmless — on
+        // restart we'd re-apply log entries above the snapshot, which is the
+        // normal behavior.
+        self.store.save_snapshot(&snap)?;
+        self.store.save_all(&persisted)?;
+        Ok(snap)
+    }
+
     /// Propose a new log entry. Resolves when the entry has been appended to
     /// the leader's log (NOT yet when committed). Callers monitor commitment
     /// via the `committed` receiver.
@@ -123,7 +147,8 @@ pub fn spawn_node_with_store(
 ) -> Result<NodeHandle> {
     let mut initial = RaftState::new(me, peers.clone());
     let snap = store.load()?;
-    initial.restore(snap)?;
+    let snapshot = store.load_snapshot()?;
+    initial.restore(snap, snapshot.as_ref())?;
     let state = Arc::new(Mutex::new(initial));
 
     let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel::<Message>();
@@ -134,6 +159,7 @@ pub fn spawn_node_with_store(
 
     let state_for_task = state.clone();
     let cancel_for_task = cancel.clone();
+    let store_for_handle = store.clone();
     let join = tokio::spawn(async move {
         let mut election_deadline = randomized_deadline(timing);
         let mut heartbeat_tick = tokio::time::interval(timing.heartbeat);
@@ -213,6 +239,7 @@ pub fn spawn_node_with_store(
         cancel,
         join: Some(join),
         propose_tx,
+        store: store_for_handle,
     })
 }
 
