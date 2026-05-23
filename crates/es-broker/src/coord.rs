@@ -249,52 +249,97 @@ pub enum AssignmentReply {
 }
 
 /// Bump generation and re-assign every (topic, partition) the union of
-/// subscribed topics covers, round-robin across the members (sorted by id).
+/// subscribed topics covers, using a **sticky** algorithm:
+///
+///   1. Keep each member's previous (topic, partition) tuples that are still
+///      valid (member still exists, still subscribed to that topic, partition
+///      still exists), capped at `ceil(total / members)` so no member is over
+///      its fair share.
+///   2. Distribute orphan partitions (no previous owner or owner departed)
+///      round-robin to the least-loaded subscribed members.
+///
+/// The result is balanced (no member has more than `ceil(N/M)`) and stable —
+/// members keep what they had unless they were over-allocated or unsubscribed.
 fn recompute_assignment(broker: &Arc<Broker>, state: &mut GroupState) {
+    let previous = std::mem::take(&mut state.assignment);
     state.generation += 1;
-    state.assignment.clear();
     if state.members.is_empty() {
         return;
     }
 
-    // Build the global sorted (topic, partition) list from the union of
-    // every member's subscriptions. Deduplicate.
-    let mut partitions: BTreeSet<(String, u32)> = BTreeSet::new();
+    // Set of (topic, partition) that *should* be assigned to someone in this group.
+    let mut all_partitions: BTreeSet<(String, u32)> = BTreeSet::new();
     for m in state.members.values() {
         for t in &m.topics {
             if let Some(topic) = broker.topic(t) {
                 for p in &topic.partitions {
-                    partitions.insert((t.clone(), p.id));
+                    all_partitions.insert((t.clone(), p.id));
                 }
             }
         }
     }
 
-    // Sort members by id; round-robin assign.
     let member_ids: Vec<String> = state.members.keys().cloned().collect();
-    for id in &member_ids {
-        state.assignment.insert(id.clone(), Vec::new());
+    let m_count = member_ids.len();
+    let total = all_partitions.len();
+    let target_max = total.div_ceil(m_count);
+
+    let mut current: BTreeMap<String, Vec<(String, u32)>> = BTreeMap::new();
+    for mid in &member_ids {
+        current.insert(mid.clone(), Vec::new());
     }
-    for (i, tp) in partitions.iter().enumerate() {
-        // Filter: only assign (topic, partition) to a member that subscribed to that topic.
-        // To preserve round-robin fairness when subscriptions vary, walk the
-        // member ring starting at `i % len` and take the first subscribed.
-        let len = member_ids.len();
-        let mut taken = false;
-        for j in 0..len {
-            let mid = &member_ids[(i + j) % len];
+    let mut assigned: BTreeSet<(String, u32)> = BTreeSet::new();
+
+    // Pass 1 — sticky. Iterate previous owners in sorted order so the choice
+    // is deterministic when two members both have a claim.
+    for (prev_owner, prev_parts) in &previous {
+        let Some(member) = state.members.get(prev_owner) else { continue };
+        let bucket = current.get_mut(prev_owner).unwrap();
+        for tp in prev_parts {
+            if !all_partitions.contains(tp) {
+                continue; // partition gone (topic deleted or partition count shrank)
+            }
+            if !member.topics.contains(&tp.0) {
+                continue; // member no longer subscribed
+            }
+            if bucket.len() >= target_max {
+                continue; // would exceed fair share
+            }
+            bucket.push(tp.clone());
+            assigned.insert(tp.clone());
+        }
+    }
+
+    // Pass 2 — distribute orphans to least-loaded subscribed member.
+    let orphans: Vec<(String, u32)> = all_partitions
+        .iter()
+        .filter(|tp| !assigned.contains(*tp))
+        .cloned()
+        .collect();
+    for tp in orphans {
+        let mut best: Option<String> = None;
+        let mut best_load = usize::MAX;
+        for mid in &member_ids {
             let m = state.members.get(mid).unwrap();
-            if m.topics.contains(&tp.0) {
-                state.assignment.get_mut(mid).unwrap().push(tp.clone());
-                taken = true;
-                break;
+            if !m.topics.contains(&tp.0) {
+                continue;
+            }
+            let load = current[mid].len();
+            if load < target_max && load < best_load {
+                best = Some(mid.clone());
+                best_load = load;
             }
         }
-        if !taken {
-            // No member subscribes to this topic — drop it (shouldn't happen
-            // since we built `partitions` from member subscriptions).
+        if let Some(mid) = best {
+            current.get_mut(&mid).unwrap().push(tp);
         }
     }
+
+    // Sort each member's assignment for stable ordering on the wire.
+    for v in current.values_mut() {
+        v.sort();
+    }
+    state.assignment = current;
 }
 
 fn validate_group_name(name: &str) -> Result<()> {

@@ -1967,3 +1967,103 @@ async fn stale_member_is_evicted_and_remaining_rebalances() -> Result<()> {
     handle.shutdown().await?;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn leave_preserves_remaining_members_partitions_when_possible() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let (base, handle) = boot_coord_fast(&tmp).await?;
+    let client = Client::new();
+    create_topic(&client, &base, "t", 4).await?;
+
+    let a = join(&client, &base, "g", None, &["t"]).await?;
+    let b = join(&client, &base, "g", None, &["t"]).await?;
+    let c = join(&client, &base, "g", None, &["t"]).await?;
+
+    // After three members + four partitions, target_max = 2. Capture state.
+    let a0 = fetch_assignment(&client, &base, "g", &a.member_id).await?;
+    let c0 = fetch_assignment(&client, &base, "g", &c.member_id).await?;
+
+    // B leaves. Sticky rebalance: target_max becomes 2 still (4/2 = 2),
+    // a and c keep what they had, b's partition goes to whichever has room.
+    client
+        .post(format!("{}/groups/g/leave", base))
+        .json(&LeaveGroupRequest { member_id: b.member_id.clone() })
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let a1 = fetch_assignment(&client, &base, "g", &a.member_id).await?;
+    let c1 = fetch_assignment(&client, &base, "g", &c.member_id).await?;
+
+    // Stickiness: every partition a previously owned and still has room for
+    // must still be assigned to a (since target_max didn't drop below |a0|).
+    let a0_set: std::collections::BTreeSet<(String, u32)> = a0
+        .assignment
+        .iter()
+        .map(|tp| (tp.topic.clone(), tp.partition))
+        .collect();
+    let a1_set: std::collections::BTreeSet<(String, u32)> = a1
+        .assignment
+        .iter()
+        .map(|tp| (tp.topic.clone(), tp.partition))
+        .collect();
+    for tp in &a0_set {
+        assert!(
+            a1_set.contains(tp),
+            "sticky violation: a lost partition {:?} on rebalance",
+            tp
+        );
+    }
+
+    // Coverage: a + c together still own all four partitions.
+    let combined: std::collections::BTreeSet<(String, u32)> = a1_set
+        .into_iter()
+        .chain(c1.assignment.iter().map(|tp| (tp.topic.clone(), tp.partition)))
+        .collect();
+    assert_eq!(combined.len(), 4);
+
+    handle.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn join_only_takes_from_over_allocated_members() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let (base, handle) = boot_coord_fast(&tmp).await?;
+    let client = Client::new();
+    create_topic(&client, &base, "t", 6).await?;
+
+    // Two members, six partitions → each gets 3.
+    let a = join(&client, &base, "g", None, &["t"]).await?;
+    let b = join(&client, &base, "g", None, &["t"]).await?;
+    let a0 = fetch_assignment(&client, &base, "g", &a.member_id).await?;
+    let b0 = fetch_assignment(&client, &base, "g", &b.member_id).await?;
+    assert_eq!(a0.assignment.len(), 3);
+    assert_eq!(b0.assignment.len(), 3);
+
+    // C joins. target_max = ceil(6/3) = 2 now. a and b should each drop one
+    // partition (since both are over the new target_max), and c picks them up.
+    let c = join(&client, &base, "g", None, &["t"]).await?;
+    let a1 = fetch_assignment(&client, &base, "g", &a.member_id).await?;
+    let b1 = fetch_assignment(&client, &base, "g", &b.member_id).await?;
+    let c1 = fetch_assignment(&client, &base, "g", &c.member_id).await?;
+
+    // Balance: each member has exactly 2 partitions.
+    assert_eq!(a1.assignment.len(), 2);
+    assert_eq!(b1.assignment.len(), 2);
+    assert_eq!(c1.assignment.len(), 2);
+
+    // Stickiness: the two partitions each kept were in their previous assignment.
+    let a0_set: std::collections::BTreeSet<(String, u32)> = a0
+        .assignment
+        .iter()
+        .map(|tp| (tp.topic.clone(), tp.partition))
+        .collect();
+    for tp in &a1.assignment {
+        let key = (tp.topic.clone(), tp.partition);
+        assert!(a0_set.contains(&key), "a's kept partition {:?} wasn't in its old assignment", key);
+    }
+
+    handle.shutdown().await?;
+    Ok(())
+}
