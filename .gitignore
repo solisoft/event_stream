@@ -1,0 +1,4 @@
+/target
+/data
+*.swp
+.DS_Store

@@ -1,0 +1,423 @@
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+
+use anyhow::Result;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio_util::sync::CancellationToken;
+
+use es_protocol::wire::{
+    FEATURE_GZIP, HandshakeStatus, Opcode, WireConsumeResponse, WireProduceResult, WireRecord,
+    WIRE_MAGIC, decode_consume_request, decode_produce_request, encode_consume_response,
+    encode_produce_response,
+};
+
+use crate::auth::{AclAction, ApiKey, AuthMode};
+use crate::broker::Broker;
+use crate::producers::DedupeOutcome;
+
+/// Maximum allowed frame body size. Caps memory per connection.
+const MAX_FRAME_BYTES: u32 = 64 * 1024 * 1024;
+
+/// Run the binary protocol accept loop on `listener` until `cancel` fires.
+pub async fn serve_binary(
+    broker: Arc<Broker>,
+    listener: TcpListener,
+    cancel: CancellationToken,
+) -> Result<()> {
+    let addr = listener.local_addr()?;
+    tracing::info!(?addr, "binary: listening");
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                tracing::info!(?addr, "binary: accept loop stopping");
+                return Ok(());
+            }
+            res = listener.accept() => {
+                let (sock, peer) = match res {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "binary: accept failed");
+                        continue;
+                    }
+                };
+                let broker = broker.clone();
+                let cancel = cancel.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_connection(broker, sock, peer, cancel).await {
+                        tracing::debug!(peer = ?peer, error = %e, "binary: connection ended");
+                    }
+                });
+            }
+        }
+    }
+}
+
+async fn handle_connection(
+    broker: Arc<Broker>,
+    mut sock: TcpStream,
+    peer: SocketAddr,
+    cancel: CancellationToken,
+) -> Result<()> {
+    // TCP_NODELAY off keeps frame writes small. We coalesce header + payload
+    // in `write_frame` so a single write_all is one packet; NODELAY just makes
+    // sure the kernel doesn't add latency waiting for more bytes.
+    sock.set_nodelay(true).ok();
+    // ---- Handshake ----
+    // Client: magic(4) | features(u32) | auth_token_len(u32) | auth_token
+    let mut magic = [0u8; 4];
+    sock.read_exact(&mut magic).await?;
+    if magic != WIRE_MAGIC {
+        write_handshake_status(&mut sock, HandshakeStatus::BadMagic, "bad magic").await?;
+        return Ok(());
+    }
+    let mut buf4 = [0u8; 4];
+    sock.read_exact(&mut buf4).await?;
+    let client_features = u32::from_be_bytes(buf4);
+    sock.read_exact(&mut buf4).await?;
+    let token_len = u32::from_be_bytes(buf4);
+    if token_len > 1024 {
+        write_handshake_status(&mut sock, HandshakeStatus::AuthFailed, "auth token too long").await?;
+        return Ok(());
+    }
+    let mut token_bytes = vec![0u8; token_len as usize];
+    if !token_bytes.is_empty() {
+        sock.read_exact(&mut token_bytes).await?;
+    }
+    let token = String::from_utf8(token_bytes).unwrap_or_default();
+
+    // Authenticate the connection up-front. The principal is captured for every
+    // request issued on this stream.
+    let key = match broker.config.auth_mode {
+        AuthMode::Disabled => Arc::new(crate::auth::ApiKey {
+            key_id: "anonymous".to_string(),
+            name: "anonymous".to_string(),
+            acls: vec![crate::auth::AclRule {
+                action: crate::auth::AclAction::Admin,
+                topic_prefix: "*".to_string(),
+            }],
+            produce_bytes_per_sec: None,
+            consume_bytes_per_sec: None,
+            created_at_ms: 0,
+            disabled: false,
+        }),
+        AuthMode::Required => {
+            if token.is_empty() {
+                write_handshake_status(&mut sock, HandshakeStatus::AuthRequired, "auth token required").await?;
+                return Ok(());
+            }
+            match broker.keys.authenticate(&token) {
+                Some(k) => k,
+                None => {
+                    write_handshake_status(&mut sock, HandshakeStatus::AuthFailed, "invalid token").await?;
+                    return Ok(());
+                }
+            }
+        }
+    };
+
+    // We support only the gzip feature bit. The negotiated set is the
+    // intersection of what the client requested and what we know about.
+    let supported: u32 = FEATURE_GZIP;
+    let negotiated = client_features & supported;
+    write_handshake_ok(&mut sock, negotiated).await?;
+    let gzip = (negotiated & FEATURE_GZIP) != 0;
+    tracing::debug!(?peer, principal = %key.name, gzip, "binary: handshake complete");
+
+    // ---- Frame loop ----
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return Ok(()),
+            res = read_frame(&mut sock, gzip) => {
+                let (request_id, opcode, payload) = match res {
+                    Ok(Some(v)) => v,
+                    Ok(None) => return Ok(()), // peer closed
+                    Err(e) => return Err(e.into()),
+                };
+                let response_payload = dispatch(&broker, &key, opcode, &payload).await;
+                match response_payload {
+                    Ok((resp_op, body)) => {
+                        write_frame(&mut sock, request_id, resp_op, &body, gzip).await?;
+                    }
+                    Err(msg) => {
+                        write_frame(&mut sock, request_id, Opcode::Error, msg.as_bytes(), gzip).await?;
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn write_handshake_ok(sock: &mut TcpStream, features: u32) -> std::io::Result<()> {
+    sock.write_all(&WIRE_MAGIC).await?;
+    sock.write_all(&[HandshakeStatus::Ok as u8]).await?;
+    sock.write_all(&features.to_be_bytes()).await?;
+    sock.write_all(&0u32.to_be_bytes()).await?; // empty msg
+    Ok(())
+}
+
+async fn write_handshake_status(
+    sock: &mut TcpStream,
+    status: HandshakeStatus,
+    msg: &str,
+) -> std::io::Result<()> {
+    // Server reply: magic(4) | status(u8) | features(u32) | msg_len(u32) | msg
+    sock.write_all(&WIRE_MAGIC).await?;
+    sock.write_all(&[status as u8]).await?;
+    sock.write_all(&0u32.to_be_bytes()).await?; // no features yet
+    let msg_bytes = msg.as_bytes();
+    sock.write_all(&(msg_bytes.len() as u32).to_be_bytes()).await?;
+    sock.write_all(msg_bytes).await?;
+    Ok(())
+}
+
+async fn read_frame(
+    sock: &mut TcpStream,
+    gzip: bool,
+) -> std::io::Result<Option<(u32, Opcode, Vec<u8>)>> {
+    let mut len_buf = [0u8; 4];
+    match sock.read_exact(&mut len_buf).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    let total = u32::from_be_bytes(len_buf);
+    if total < 5 || total > MAX_FRAME_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("frame size {} out of bounds", total),
+        ));
+    }
+    let mut frame = vec![0u8; total as usize];
+    sock.read_exact(&mut frame).await?;
+    let request_id = u32::from_be_bytes(frame[0..4].try_into().unwrap());
+    let opcode_byte = frame[4];
+    let opcode = Opcode::from_u8(opcode_byte).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unknown opcode {:#x}", opcode_byte),
+        )
+    })?;
+    let raw_payload = &frame[5..];
+    let payload = if gzip {
+        decompress(raw_payload)?
+    } else {
+        raw_payload.to_vec()
+    };
+    Ok(Some((request_id, opcode, payload)))
+}
+
+async fn write_frame(
+    sock: &mut TcpStream,
+    request_id: u32,
+    opcode: Opcode,
+    payload: &[u8],
+    gzip: bool,
+) -> std::io::Result<()> {
+    let body: std::borrow::Cow<[u8]> = if gzip {
+        std::borrow::Cow::Owned(compress(payload)?)
+    } else {
+        std::borrow::Cow::Borrowed(payload)
+    };
+    let total = (4 + 1 + body.len()) as u32;
+    let mut frame = Vec::with_capacity(4 + 4 + 1 + body.len());
+    frame.extend_from_slice(&total.to_be_bytes());
+    frame.extend_from_slice(&request_id.to_be_bytes());
+    frame.push(opcode as u8);
+    frame.extend_from_slice(&body);
+    sock.write_all(&frame).await?;
+    Ok(())
+}
+
+fn compress(input: &[u8]) -> std::io::Result<Vec<u8>> {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+    let mut enc = GzEncoder::new(Vec::with_capacity(input.len() / 2 + 32), Compression::default());
+    enc.write_all(input)?;
+    enc.finish()
+}
+
+fn decompress(input: &[u8]) -> std::io::Result<Vec<u8>> {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+    let mut dec = GzDecoder::new(input);
+    let mut out = Vec::with_capacity(input.len() * 2);
+    dec.read_to_end(&mut out)?;
+    Ok(out)
+}
+
+async fn dispatch(
+    broker: &Arc<Broker>,
+    key: &Arc<ApiKey>,
+    opcode: Opcode,
+    payload: &[u8],
+) -> std::result::Result<(Opcode, Vec<u8>), String> {
+    match opcode {
+        Opcode::Ping => Ok((Opcode::PingOk, Vec::new())),
+        Opcode::Produce => {
+            let req = decode_produce_request(payload).map_err(|e| format!("decode: {}", e))?;
+            if !key.can(AclAction::Write, &req.topic) {
+                return Err(format!(
+                    "forbidden: key '{}' has no write access to '{}'",
+                    key.key_id, req.topic
+                ));
+            }
+            let topic = broker
+                .topic(&req.topic)
+                .ok_or_else(|| format!("topic '{}' not found", req.topic))?;
+
+            let request_bytes: u64 = req
+                .records
+                .iter()
+                .map(|r| r.key.as_ref().map(|k| k.len() as u64).unwrap_or(0) + r.value.len() as u64)
+                .sum();
+            if let Err(retry_after) = broker
+                .keys
+                .check_produce(&key.key_id, request_bytes as u32)
+            {
+                return Err(format!("rate_limited: retry in {:.1}s", retry_after));
+            }
+
+            // Idempotent path mirrors the HTTP handler.
+            if req.producer_id.is_some() {
+                for (i, r) in req.records.iter().enumerate() {
+                    if r.sequence.is_none() {
+                        return Err(format!(
+                            "record {} missing sequence (required when producer_id is set)",
+                            i
+                        ));
+                    }
+                }
+            }
+
+            let mut results: Vec<WireProduceResult> = Vec::with_capacity(req.records.len());
+            let mut total_appended: u64 = 0;
+            let mut records_appended: u64 = 0;
+            for r in &req.records {
+                let partition_id = topic
+                    .route(r.key.as_deref(), r.partition)
+                    .map_err(|e| format!("route: {}", e))?;
+
+                if let Some(pid) = &req.producer_id {
+                    let seq = r.sequence.unwrap();
+                    match broker
+                        .producers
+                        .check_and_advance(pid, &req.topic, partition_id, seq)
+                        .await
+                    {
+                        DedupeOutcome::Duplicate { prev_offset } => {
+                            results.push(WireProduceResult {
+                                partition: partition_id,
+                                offset: prev_offset,
+                                duplicate: true,
+                            });
+                            continue;
+                        }
+                        DedupeOutcome::Accept => {}
+                        DedupeOutcome::SequenceTooLow { last_seen } => {
+                            return Err(format!(
+                                "sequence_too_low: producer={} partition={} seq={} last_seen={}",
+                                pid, partition_id, seq, last_seen
+                            ));
+                        }
+                        DedupeOutcome::Gap { expected, got } => {
+                            return Err(format!(
+                                "sequence_gap: producer={} partition={} expected={} got={}",
+                                pid, partition_id, expected, got
+                            ));
+                        }
+                        DedupeOutcome::NeedsInit => {
+                            return Err(format!("producer {} state missing", pid));
+                        }
+                    }
+                }
+
+                let partition = &topic.partitions[partition_id as usize];
+                let offset = partition
+                    .append(r.key.as_deref(), &r.value)
+                    .await
+                    .map_err(|e| format!("append: {}", e))?;
+                if let Some(pid) = &req.producer_id {
+                    broker
+                        .producers
+                        .record_offset(pid, &req.topic, partition_id, r.sequence.unwrap(), offset)
+                        .await;
+                }
+                total_appended += r.key.as_ref().map(|k| k.len() as u64).unwrap_or(0)
+                    + r.value.len() as u64;
+                records_appended += 1;
+                results.push(WireProduceResult {
+                    partition: partition_id,
+                    offset,
+                    duplicate: false,
+                });
+            }
+
+            topic
+                .records_produced_total
+                .fetch_add(records_appended, Ordering::Relaxed);
+            topic
+                .bytes_produced_total
+                .fetch_add(total_appended, Ordering::Relaxed);
+
+            let body = encode_produce_response(&results);
+            Ok((Opcode::ProduceOk, body))
+        }
+        Opcode::Consume => {
+            let req = decode_consume_request(payload).map_err(|e| format!("decode: {}", e))?;
+            if !key.can(AclAction::Read, &req.topic) {
+                return Err(format!(
+                    "forbidden: key '{}' has no read access to '{}'",
+                    key.key_id, req.topic
+                ));
+            }
+            let topic = broker
+                .topic(&req.topic)
+                .ok_or_else(|| format!("topic '{}' not found", req.topic))?;
+            let partition = topic
+                .partitions
+                .get(req.partition as usize)
+                .ok_or_else(|| format!("partition {} out of range", req.partition))?;
+
+            let (records, next_offset, high_watermark) = partition
+                .read_records_raw(req.offset, req.max_records as usize, req.max_bytes as usize)
+                .map_err(|e| format!("read: {}", e))?;
+
+            let consumed_bytes: u64 = records
+                .iter()
+                .map(|r| r.key.as_ref().map(|k| k.len() as u64).unwrap_or(0) + r.value.len() as u64)
+                .sum();
+            let _ = broker
+                .keys
+                .check_consume(&key.key_id, consumed_bytes as u32);
+
+            topic
+                .records_consumed_total
+                .fetch_add(records.len() as u64, Ordering::Relaxed);
+            topic
+                .bytes_consumed_total
+                .fetch_add(consumed_bytes, Ordering::Relaxed);
+
+            let wire_records: Vec<WireRecord> = records
+                .into_iter()
+                .map(|r| WireRecord {
+                    partition: req.partition,
+                    offset: r.offset,
+                    timestamp_ms: r.timestamp_ms,
+                    key: r.key,
+                    value: r.value,
+                })
+                .collect();
+            let body = encode_consume_response(&WireConsumeResponse {
+                records: wire_records,
+                next_offset,
+                high_watermark,
+            });
+            Ok((Opcode::ConsumeOk, body))
+        }
+        // Server response codes should never arrive on the request side.
+        _ => Err(format!("unexpected opcode in request: {:?}", opcode)),
+    }
+}

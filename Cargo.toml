@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/es-protocol",
+    "crates/es-broker",
+    "crates/es-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+es-protocol = { path = "crates/es-protocol" }
+
+anyhow = "1"
+arc-swap = "1"
+axum = "0.7"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+base64 = "0.22"
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+crc32fast = "1"
+dashmap = "6"
+flate2 = "1"
+futures = "0.3"
+governor = "0.6"
+humantime = "2"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rustls = "0.23"
+rustls-pemfile = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tower = "0.5"
+tower-http = { version = "0.5", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
