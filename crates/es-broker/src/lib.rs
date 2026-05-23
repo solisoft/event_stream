@@ -7,6 +7,7 @@ pub mod groups;
 pub mod http;
 pub mod partition;
 pub mod producers;
+pub mod raft;
 pub mod retention;
 pub mod storage;
 pub mod topic;
