@@ -216,8 +216,16 @@ impl RaftState {
         let mut out = Vec::new();
         while self.last_applied < self.commit_index {
             self.last_applied += 1;
-            if let Some(e) = self.log.entries.get((self.last_applied - 1) as usize) {
-                out.push(Action::Apply(e.clone()));
+            // After snapshot, entries no longer start at index 1 — look up by
+            // the entry's logical index relative to the first in-memory entry.
+            if let Some(first) = self.log.entries.first() {
+                let first_idx = first.index;
+                if self.last_applied >= first_idx {
+                    let pos = (self.last_applied - first_idx) as usize;
+                    if let Some(e) = self.log.entries.get(pos) {
+                        out.push(Action::Apply(e.clone()));
+                    }
+                }
             }
         }
         out

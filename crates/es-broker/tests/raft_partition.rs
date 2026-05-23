@@ -23,6 +23,7 @@ async fn single_node_append_roundtrip() -> Result<()> {
             peers: vec![],
             raft_store_path: raft_path.clone(),
             timing: test_timing(),
+            snapshot_after_applies: 0, // disabled for this test
         },
     )?;
 
@@ -75,6 +76,7 @@ async fn raft_partition_state_survives_restart() -> Result<()> {
                 peers: vec![],
                 raft_store_path: raft_path.clone(),
                 timing: test_timing(),
+                snapshot_after_applies: 0,
             },
         )?;
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -99,6 +101,7 @@ async fn raft_partition_state_survives_restart() -> Result<()> {
                 peers: vec![],
                 raft_store_path: raft_path,
                 timing: test_timing(),
+                snapshot_after_applies: 0,
             },
         )?;
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -117,5 +120,80 @@ async fn raft_partition_state_survives_restart() -> Result<()> {
         rp.shutdown().await;
     }
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_snapshot_keeps_raft_log_bounded() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let part_dir = tmp.path().join("p0");
+    let raft_path = tmp.path().join("raft.json");
+
+    let rp = RaftPartition::open(
+        part_dir.clone(),
+        0,
+        1 << 20,
+        1,
+        RaftPartitionConfig {
+            node_id: 1,
+            peers: vec![],
+            raft_store_path: raft_path.clone(),
+            timing: test_timing(),
+            snapshot_after_applies: 50, // small so we see multiple snapshots
+        },
+    )?;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let n = 300u32;
+    for i in 0..n {
+        rp.append(None, format!("v{}", i).as_bytes()).await?;
+    }
+    // Give the apply loop a tick to land the final snapshot.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // The partition has every record …
+    assert_eq!(rp.partition().end_offset(), n as u64);
+    // … and the on-disk Raft log has been compacted: at most one batch worth
+    // of entries past the snapshot boundary.
+    let raft: es_broker::raft::PersistedRaft =
+        serde_json::from_slice(&std::fs::read(&raft_path)?)?;
+    assert!(
+        raft.log.len() as u32 <= 50,
+        "raft log not compacted: {} entries",
+        raft.log.len()
+    );
+    // The snapshot file exists and reflects what was committed.
+    let snap_path = tmp.path().join("raft.snapshot.json");
+    assert!(snap_path.exists(), "snapshot file should be written");
+    let snap: es_broker::raft::PersistedSnapshot =
+        serde_json::from_slice(&std::fs::read(&snap_path)?)?;
+    assert!(snap.last_index > 0);
+
+    rp.shutdown().await;
+    drop(rp);
+
+    // Restart: the partition has all 300 records, Raft state catches up via
+    // the snapshot + the remaining trimmed log.
+    let rp = RaftPartition::open(
+        part_dir,
+        0,
+        1 << 20,
+        1,
+        RaftPartitionConfig {
+            node_id: 1,
+            peers: vec![],
+            raft_store_path: raft_path,
+            timing: test_timing(),
+            snapshot_after_applies: 50,
+        },
+    )?;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(rp.partition().end_offset(), n as u64);
+
+    // A fresh append lands at the right offset after restart.
+    let off = rp.append(None, b"after-restart").await?;
+    assert_eq!(off, n as u64);
+
+    rp.shutdown().await;
     Ok(())
 }

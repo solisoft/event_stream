@@ -31,10 +31,12 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::partition::Partition;
+use crate::raft::state::RaftState;
 use crate::raft::{
     JsonStore, LogIndex, NodeHandle, NodeId, ProposeReply, RaftStore, Timing,
     spawn_node_with_store,
 };
+use tokio::sync::Mutex as TokioMutex;
 
 /// Wire format for a Raft-replicated append command.
 ///
@@ -108,6 +110,23 @@ pub struct RaftPartitionConfig {
     /// Where the Raft persistent state lives.
     pub raft_store_path: PathBuf,
     pub timing: Timing,
+    /// Take a Raft snapshot after this many entries have been applied since
+    /// the last snapshot. `0` disables auto-snapshot (manual only). For
+    /// `RaftPartition` the snapshot data is just the partition's `end_offset`,
+    /// since the actual record bytes live in the segmented log on disk.
+    pub snapshot_after_applies: u32,
+}
+
+impl RaftPartitionConfig {
+    pub fn with_defaults(node_id: NodeId, raft_store_path: PathBuf) -> Self {
+        Self {
+            node_id,
+            peers: Vec::new(),
+            raft_store_path,
+            timing: Timing::default(),
+            snapshot_after_applies: 1024,
+        }
+    }
 }
 
 impl RaftPartition {
@@ -128,7 +147,13 @@ impl RaftPartition {
             flush_every_records,
         )?;
         let store: Arc<dyn RaftStore> = Arc::new(JsonStore::new(config.raft_store_path));
-        let mut raft = spawn_node_with_store(config.node_id, config.peers, config.timing, store)?;
+        let mut raft = spawn_node_with_store(
+            config.node_id,
+            config.peers,
+            config.timing,
+            store.clone(),
+        )?;
+        let raft_state = raft.state.clone();
 
         let slots: Arc<Mutex<HashMap<LogIndex, Slot>>> = Arc::new(Mutex::new(HashMap::new()));
         let cancel = CancellationToken::new();
@@ -140,8 +165,19 @@ impl RaftPartition {
         let p_for_apply = partition.clone();
         let slots_for_apply = slots.clone();
         let cancel_for_apply = cancel.clone();
+        let store_for_apply = store.clone();
+        let snapshot_threshold = config.snapshot_after_applies;
         let apply_join = tokio::spawn(async move {
-            apply_loop(committed, p_for_apply, slots_for_apply, cancel_for_apply).await;
+            apply_loop(
+                committed,
+                p_for_apply,
+                slots_for_apply,
+                cancel_for_apply,
+                raft_state,
+                store_for_apply,
+                snapshot_threshold,
+            )
+            .await;
         });
 
         Ok(Arc::new(Self {
@@ -229,11 +265,15 @@ async fn apply_loop(
     partition: Arc<Partition>,
     slots: Arc<Mutex<HashMap<LogIndex, Slot>>>,
     cancel: CancellationToken,
+    raft_state: Arc<TokioMutex<RaftState>>,
+    store: Arc<dyn RaftStore>,
+    snapshot_after_applies: u32,
 ) {
     // Invariant: Raft index N corresponds to partition offset N-1. On restart,
     // the partition has already been written through to its end_offset, but
     // Raft replays its log from the beginning. Skip everything already applied.
     let skip_at_or_below = partition.end_offset();
+    let mut applies_since_snapshot: u32 = 0;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
@@ -257,18 +297,32 @@ async fn apply_loop(
                     }
                     Err(e) => Err(format!("decode: {}", e)),
                 };
-                let mut s = slots.lock().unwrap();
-                match s.remove(&entry.index) {
-                    Some(Slot::Pending(tx)) => { let _ = tx.send(outcome); }
-                    Some(Slot::Applied(_)) => {
-                        // Re-applied — shouldn't happen.
+                let succeeded = outcome.is_ok();
+                {
+                    let mut s = slots.lock().unwrap();
+                    match s.remove(&entry.index) {
+                        Some(Slot::Pending(tx)) => { let _ = tx.send(outcome); }
+                        Some(Slot::Applied(_)) => {
+                            // Re-applied — shouldn't happen.
+                        }
+                        None => {
+                            // No proposer waiting (single-node fast path or
+                            // follower-side apply). Store for the proposer to
+                            // pick up; followers won't have a waiter so the entry
+                            // will eventually be evicted on shutdown.
+                            s.insert(entry.index, Slot::Applied(outcome));
+                        }
                     }
-                    None => {
-                        // No proposer waiting (single-node fast path or
-                        // follower-side apply). Store for the proposer to
-                        // pick up; followers won't have a waiter so the entry
-                        // will eventually be evicted on shutdown.
-                        s.insert(entry.index, Slot::Applied(outcome));
+                }
+                if succeeded {
+                    applies_since_snapshot += 1;
+                    if snapshot_after_applies > 0
+                        && applies_since_snapshot >= snapshot_after_applies
+                    {
+                        if let Err(e) = take_snapshot(&raft_state, &store, &partition).await {
+                            tracing::warn!(error = %e, "raft_partition: snapshot failed");
+                        }
+                        applies_since_snapshot = 0;
                     }
                 }
             }
@@ -292,6 +346,33 @@ async fn apply_loop(
         }
     }
     tracing::debug!("raft_partition: apply loop exited");
+}
+
+/// Snapshot helper used by the apply loop. Locks state briefly to capture +
+/// compact, then persists the snapshot followed by the trimmed log.
+async fn take_snapshot(
+    state: &Arc<TokioMutex<RaftState>>,
+    store: &Arc<dyn RaftStore>,
+    partition: &Arc<Partition>,
+) -> anyhow::Result<()> {
+    let data = partition.end_offset().to_be_bytes().to_vec();
+    let (snap, persisted) = {
+        let mut s = state.lock().await;
+        if s.last_applied == 0 {
+            return Ok(());
+        }
+        let snap = s.take_snapshot(data)?;
+        let persisted = s.snapshot_persistent();
+        (snap, persisted)
+    };
+    store.save_snapshot(&snap)?;
+    store.save_all(&persisted)?;
+    tracing::info!(
+        last_index = snap.last_index,
+        last_term = snap.last_term,
+        "raft_partition: snapshot taken"
+    );
+    Ok(())
 }
 
 /// Default fast timing for tests.

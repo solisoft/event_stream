@@ -238,11 +238,18 @@ impl PersistedRaft {
 
 pub struct JsonStore {
     path: PathBuf,
+    /// Serializes concurrent writers so the tmp+rename dance can't race
+    /// between, e.g., the node loop's `save_all` and an application-driven
+    /// `save_snapshot` / `save_all` from a different task.
+    write_lock: std::sync::Mutex<()>,
 }
 
 impl JsonStore {
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            write_lock: std::sync::Mutex::new(()),
+        }
     }
 }
 
@@ -267,7 +274,7 @@ impl RaftStore for JsonStore {
     }
 
     fn save_all(&self, snap: &PersistedRaft) -> Result<()> {
-        // tmp + fsync + rename — same pattern used elsewhere in the codebase.
+        let _guard = self.write_lock.lock().unwrap();
         let parent = self
             .path
             .parent()
@@ -299,6 +306,7 @@ impl RaftStore for JsonStore {
     }
 
     fn save_snapshot(&self, snap: &PersistedSnapshot) -> Result<()> {
+        let _guard = self.write_lock.lock().unwrap();
         let path = self.snapshot_path();
         let parent = path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
         std::fs::create_dir_all(&parent)?;
