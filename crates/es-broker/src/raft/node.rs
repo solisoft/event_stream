@@ -56,7 +56,10 @@ pub struct NodeHandle {
     pub state: Arc<Mutex<RaftState>>,
     pub inbound: mpsc::UnboundedSender<Message>,
     outbound: Option<mpsc::UnboundedReceiver<Outbound>>,
-    pub committed: mpsc::UnboundedReceiver<LogEntry>,
+    /// Stream of committed log entries. Take this with [`Self::take_committed`]
+    /// to drive a state-machine apply loop; otherwise the entries accumulate
+    /// in the buffer.
+    pub committed: Option<mpsc::UnboundedReceiver<LogEntry>>,
     pub cancel: CancellationToken,
     pub join: Option<JoinHandle<()>>,
     propose_tx: mpsc::UnboundedSender<ProposeReq>,
@@ -89,6 +92,14 @@ impl NodeHandle {
 
     pub fn try_recv_outbound(&mut self) -> Option<Outbound> {
         self.outbound.as_mut().and_then(|r| r.try_recv().ok())
+    }
+
+    pub fn take_committed(&mut self) -> Option<mpsc::UnboundedReceiver<LogEntry>> {
+        self.committed.take()
+    }
+
+    pub fn try_recv_committed(&mut self) -> Option<LogEntry> {
+        self.committed.as_mut().and_then(|r| r.try_recv().ok())
     }
 
     /// Propose a new log entry. Resolves when the entry has been appended to
@@ -198,7 +209,7 @@ pub fn spawn_node_with_store(
         state,
         inbound: inbound_tx,
         outbound: Some(outbound_rx),
-        committed: committed_rx,
+        committed: Some(committed_rx),
         cancel,
         join: Some(join),
         propose_tx,

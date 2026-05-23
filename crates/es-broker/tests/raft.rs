@@ -239,7 +239,7 @@ async fn three_node_propose_and_replicate() -> Result<()> {
         for _ in 0..5 {
             // try_recv until something's there
             for _ in 0..50 {
-                if let Ok(e) = h.committed.try_recv() {
+                if let Some(e) = h.try_recv_committed() {
                     got.push(e.index);
                     break;
                 }
