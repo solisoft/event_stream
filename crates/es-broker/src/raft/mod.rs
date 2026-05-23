@@ -20,12 +20,14 @@
 //! transport are designed so step 2 can add log replication without
 //! reshaping anything.
 
+pub mod log;
 pub mod messages;
 pub mod node;
 pub mod state;
 pub mod transport;
 
-pub use messages::{Message, NodeId, Term};
-pub use node::{NodeHandle, Outbound, Timing, spawn_node};
+pub use log::{JsonStore, Log, MemStore, PersistedRaft, RaftStore};
+pub use messages::{LogEntry, LogIndex, Message, NodeId, Term};
+pub use node::{NodeHandle, Outbound, ProposeReply, Timing, spawn_node, spawn_node_with_store};
 pub use state::{Action, RaftState, Role};
 pub use transport::{Transport, spawn_transport};

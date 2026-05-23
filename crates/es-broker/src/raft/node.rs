@@ -1,20 +1,20 @@
-//! Raft node driver. Owns the [`RaftState`], the election + heartbeat timers,
-//! the inbound message queue, and an outbound channel to the transport.
+//! Raft node driver.
 //!
-//! The state machine itself is pure; this module is the impure shell that
-//! actually executes [`Action`]s and fires timers.
+//! Owns the [`RaftState`], the election + heartbeat timers, inbound messages,
+//! outbound messages, the persistent store, and the committed-entry stream.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 use rand::Rng;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use super::messages::{Message, NodeId};
-use super::state::{Action, RaftState, Role};
+use super::log::RaftStore;
+use super::messages::{LogEntry, LogIndex, Message, NodeId};
+use super::state::{Action, ProposeOutcome, RaftState, Role};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Timing {
@@ -33,24 +33,33 @@ impl Default for Timing {
     }
 }
 
-/// Things the driver emits to the transport: "deliver this message to that peer."
 #[derive(Debug)]
 pub enum Outbound {
     SendTo(NodeId, Message),
     Broadcast(Message),
 }
 
-/// Handle returned to the surrounding code so it can observe / shut down the node.
+/// Reply to a propose request.
+#[derive(Debug)]
+pub enum ProposeReply {
+    Accepted { index: LogIndex },
+    NotLeader { leader_hint: Option<NodeId> },
+}
+
+struct ProposeReq {
+    payload: Vec<u8>,
+    ack: oneshot::Sender<ProposeReply>,
+}
+
 pub struct NodeHandle {
     pub id: NodeId,
     pub state: Arc<Mutex<RaftState>>,
     pub inbound: mpsc::UnboundedSender<Message>,
-    /// Outbound messages emitted by the node loop. `take_outbound()` hands
-    /// ownership to a transport; `pump_outbound()` consumes it directly for
-    /// in-process tests.
     outbound: Option<mpsc::UnboundedReceiver<Outbound>>,
+    pub committed: mpsc::UnboundedReceiver<LogEntry>,
     pub cancel: CancellationToken,
     pub join: Option<JoinHandle<()>>,
+    propose_tx: mpsc::UnboundedSender<ProposeReq>,
 }
 
 impl NodeHandle {
@@ -60,33 +69,56 @@ impl NodeHandle {
     pub async fn current_term(&self) -> u64 {
         self.state.lock().await.current_term
     }
+    pub async fn commit_index(&self) -> u64 {
+        self.state.lock().await.commit_index
+    }
+    pub async fn last_log_index(&self) -> u64 {
+        self.state.lock().await.log.last_index()
+    }
+
     pub async fn shutdown(mut self) {
         self.cancel.cancel();
         if let Some(j) = self.join.take() {
             let _ = j.await;
         }
     }
-    /// Take ownership of the outbound channel — typically to hand it to a
-    /// `Transport`. Returns `None` if it's already been taken.
+
     pub fn take_outbound(&mut self) -> Option<mpsc::UnboundedReceiver<Outbound>> {
         self.outbound.take()
     }
-    /// Receive one outbound message (test helper / `pump_outbound`). Returns
-    /// `None` if the channel was already taken or the node loop exited.
+
     pub fn try_recv_outbound(&mut self) -> Option<Outbound> {
         self.outbound.as_mut().and_then(|r| r.try_recv().ok())
     }
+
+    /// Propose a new log entry. Resolves when the entry has been appended to
+    /// the leader's log (NOT yet when committed). Callers monitor commitment
+    /// via the `committed` receiver.
+    pub async fn propose(&self, payload: Vec<u8>) -> Result<ProposeReply> {
+        let (tx, rx) = oneshot::channel();
+        self.propose_tx
+            .send(ProposeReq { payload, ack: tx })
+            .map_err(|_| anyhow::anyhow!("node loop exited"))?;
+        rx.await.map_err(|_| anyhow::anyhow!("propose ack dropped"))
+    }
 }
 
-/// Spawn the node loop. Returns the handle holding inbound/outbound channels
-/// plus the shared state for observation.
-///
-/// The caller wires `inbound`/`outbound` up to a transport. For the in-process
-/// integration test, that's a hub that just forwards messages between nodes.
-pub fn spawn_node(me: NodeId, peers: Vec<NodeId>, timing: Timing) -> NodeHandle {
-    let state = Arc::new(Mutex::new(RaftState::new(me, peers)));
+/// Spawn the node loop.
+pub fn spawn_node_with_store(
+    me: NodeId,
+    peers: Vec<NodeId>,
+    timing: Timing,
+    store: Arc<dyn RaftStore>,
+) -> Result<NodeHandle> {
+    let mut initial = RaftState::new(me, peers.clone());
+    let snap = store.load()?;
+    initial.restore(snap)?;
+    let state = Arc::new(Mutex::new(initial));
+
     let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel::<Message>();
     let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<Outbound>();
+    let (committed_tx, committed_rx) = mpsc::unbounded_channel::<LogEntry>();
+    let (propose_tx, mut propose_rx) = mpsc::unbounded_channel::<ProposeReq>();
     let cancel = CancellationToken::new();
 
     let state_for_task = state.clone();
@@ -97,8 +129,6 @@ pub fn spawn_node(me: NodeId, peers: Vec<NodeId>, timing: Timing) -> NodeHandle 
         heartbeat_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
-            // Snapshot whether we're currently the leader; that decides whether
-            // the heartbeat tick is meaningful this loop.
             let role = state_for_task.lock().await.role;
 
             tokio::select! {
@@ -106,43 +136,100 @@ pub fn spawn_node(me: NodeId, peers: Vec<NodeId>, timing: Timing) -> NodeHandle 
 
                 msg = inbound_rx.recv() => {
                     let Some(msg) = msg else { break; };
-                    let actions = state_for_task.lock().await.on_message(msg);
-                    apply(&state_for_task, &outbound_tx, &mut election_deadline, timing, actions).await;
+                    let actions = {
+                        let mut s = state_for_task.lock().await;
+                        s.on_message(msg)
+                    };
+                    apply_and_persist(&state_for_task, &store, &outbound_tx, &committed_tx,
+                                      &mut election_deadline, timing, actions).await;
+                }
+
+                req = propose_rx.recv() => {
+                    let Some(req) = req else { break; };
+                    let (reply, mut actions) = {
+                        let mut s = state_for_task.lock().await;
+                        let (outcome, apply_actions) = s.try_propose(req.payload);
+                        match outcome {
+                            ProposeOutcome::Accepted { index } => {
+                                // Trigger immediate replication on top of any
+                                // Apply actions (single-node clusters commit
+                                // synchronously).
+                                let mut all = apply_actions;
+                                all.extend(s.on_heartbeat_tick());
+                                (ProposeReply::Accepted { index }, all)
+                            }
+                            ProposeOutcome::NotLeader(hint) => {
+                                (ProposeReply::NotLeader { leader_hint: hint }, apply_actions)
+                            }
+                        }
+                    };
+                    // Persist BEFORE acking — Raft requires the new log entry
+                    // to be durable before we tell the client it succeeded.
+                    apply_and_persist(&state_for_task, &store, &outbound_tx, &committed_tx,
+                                      &mut election_deadline, timing, std::mem::take(&mut actions)).await;
+                    let _ = req.ack.send(reply);
                 }
 
                 _ = tokio::time::sleep_until(election_deadline) => {
-                    let actions = state_for_task.lock().await.on_election_timeout();
-                    apply(&state_for_task, &outbound_tx, &mut election_deadline, timing, actions).await;
-                    // Always reset the deadline after firing.
+                    let actions = {
+                        let mut s = state_for_task.lock().await;
+                        s.on_election_timeout()
+                    };
+                    apply_and_persist(&state_for_task, &store, &outbound_tx, &committed_tx,
+                                      &mut election_deadline, timing, actions).await;
                     election_deadline = randomized_deadline(timing);
                 }
 
                 _ = heartbeat_tick.tick(), if role == Role::Leader => {
-                    let actions = state_for_task.lock().await.on_heartbeat_tick();
-                    apply(&state_for_task, &outbound_tx, &mut election_deadline, timing, actions).await;
+                    let actions = {
+                        let mut s = state_for_task.lock().await;
+                        s.on_heartbeat_tick()
+                    };
+                    apply_and_persist(&state_for_task, &store, &outbound_tx, &committed_tx,
+                                      &mut election_deadline, timing, actions).await;
                 }
             }
         }
         tracing::debug!(node = me, "raft node loop exited");
     });
 
-    NodeHandle {
+    Ok(NodeHandle {
         id: me,
         state,
         inbound: inbound_tx,
         outbound: Some(outbound_rx),
+        committed: committed_rx,
         cancel,
         join: Some(join),
-    }
+        propose_tx,
+    })
 }
 
-async fn apply(
-    _state: &Arc<Mutex<RaftState>>,
+/// Backwards-compat helper: spawn with an in-memory store.
+pub fn spawn_node(me: NodeId, peers: Vec<NodeId>, timing: Timing) -> NodeHandle {
+    let store: Arc<dyn RaftStore> = Arc::new(crate::raft::log::MemStore::new());
+    spawn_node_with_store(me, peers, timing, store).expect("MemStore can't fail")
+}
+
+async fn apply_and_persist(
+    state: &Arc<Mutex<RaftState>>,
+    store: &Arc<dyn RaftStore>,
     outbound: &mpsc::UnboundedSender<Outbound>,
+    committed: &mpsc::UnboundedSender<LogEntry>,
     election_deadline: &mut tokio::time::Instant,
     timing: Timing,
     actions: Vec<Action>,
 ) {
+    // Persistence MUST happen before any outbound messages — Raft requires
+    // current_term / voted_for / log to be durable before responding.
+    let dirty = state.lock().await.take_dirty();
+    if dirty {
+        let snap = state.lock().await.snapshot_persistent();
+        // store.save_all is sync (file write + fsync). Tiny pause OK for step 2.
+        if let Err(e) = store.save_all(&snap) {
+            tracing::error!(error = %e, "raft store save failed");
+        }
+    }
     for a in actions {
         match a {
             Action::SendTo(peer, msg) => {
@@ -153,6 +240,9 @@ async fn apply(
             }
             Action::ResetElectionTimer => {
                 *election_deadline = randomized_deadline(timing);
+            }
+            Action::Apply(entry) => {
+                let _ = committed.send(entry);
             }
         }
     }
@@ -170,14 +260,12 @@ fn randomized_deadline(timing: Timing) -> tokio::time::Instant {
 }
 
 /// Test-only helper: drain each node's outbound queue and route messages
-/// directly to the destination nodes' inbound channels. Real deployments use
-/// the TCP transport (`transport.rs`).
+/// directly to the destination nodes' inbound channels.
 pub async fn pump_outbound(
     handles: &mut std::collections::BTreeMap<NodeId, NodeHandle>,
     deadline: std::time::Instant,
 ) -> Result<()> {
     use std::time::Instant;
-    // Snapshot inbound senders once — they're cheap to clone (mpsc Sender is Arc-y).
     let inbound_for: std::collections::BTreeMap<NodeId, mpsc::UnboundedSender<Message>> =
         handles
             .iter()
