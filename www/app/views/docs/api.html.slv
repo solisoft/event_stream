@@ -301,6 +301,87 @@ X-Es-Key: esk_AbCdEf...</pre>
   </p>
 </div>
 
+<h2><span class="num">§</span>Partitions — how they work</h2>
+<p>
+  A <strong>partition</strong> is an independent, ordered, append-only log. Each topic has one or more partitions, and each partition has its own segment files, its own offsets, and its own write lock. Partitions are the unit of parallelism in <span class="font-display italic text-slate-200">es</span>.
+</p>
+
+<h3 class="mt-6">Why partitions matter</h3>
+<div class="grid grid-cols-1 md:grid-cols-3 gap-3 my-3 text-[13px]">
+  <div class="px-4 py-3 rounded-lg bg-white/[0.03] ring-1 ring-white/[0.06]">
+    <p class="font-mono text-[10px] tracking-[0.18em] uppercase text-emerald-300/80 mb-1">Throughput</p>
+    <p class="text-slate-300">Each partition has its own write lock. Multiple partitions let concurrent producers write in parallel without contention.</p>
+  </div>
+  <div class="px-4 py-3 rounded-lg bg-white/[0.03] ring-1 ring-white/[0.06]">
+    <p class="font-mono text-[10px] tracking-[0.18em] uppercase text-indigo-300/80 mb-1">Ordering</p>
+    <p class="text-slate-300">Records with the same key always land on the same partition, preserving per-key order. Records across partitions have no ordering guarantee.</p>
+  </div>
+  <div class="px-4 py-3 rounded-lg bg-white/[0.03] ring-1 ring-white/[0.06]">
+    <p class="font-mono text-[10px] tracking-[0.18em] uppercase text-amber-300/80 mb-1">Consumers</p>
+    <p class="text-slate-300">Each partition can be consumed by exactly one member of a consumer group at a time. More partitions = more consumer parallelism.</p>
+  </div>
+</div>
+
+<h3 class="mt-8">Routing rules</h3>
+<p>
+  When you produce a record, the broker picks a partition using this precedence:
+</p>
+<ol class="text-[14px] text-slate-300 space-y-1 mb-3 list-decimal list-inside">
+  <li><strong>Explicit <code>partition</code></strong> — you set it, the broker uses it. Fastest, most predictable.</li>
+  <li><strong>Key hash</strong> — FNV-1a hash of the key bytes, modulo partition count. Same key → same partition. Ensures per-key ordering.</li>
+  <li><strong>Round-robin</strong> — no key, no explicit partition. Distributed evenly across all partitions.</li>
+</ol>
+
+<div class="codeblock mb-4">
+  <div class="codeblock-bar">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="label">routing examples</span>
+    <span class="lang">bash</span>
+  </div>
+<pre><span class="c-com"># Explicit — always partition 0</span>
+<span class="c-fn">$</span> es produce <span class="c-key">--topic</span> orders <span class="c-key">--key</span> k1 <span class="c-key">--partition</span> <span class="c-num">0</span> ...
+
+<span class="c-com"># Key routing — "user-42" always lands on the same partition</span>
+<span class="c-fn">$</span> es produce <span class="c-key">--topic</span> orders <span class="c-key">--key</span> user-42 ...
+
+<span class="c-com"># Round-robin — spread evenly</span>
+<span class="c-fn">$</span> es produce <span class="c-key">--topic</span> orders <span class="c-key">--value</span> <span class="c-str">'...'</span>  <span class="c-com"># no --key</span></pre>
+</div>
+
+<h3 class="mt-8">How many partitions?</h3>
+<div class="overflow-hidden rounded-xl ring-1 ring-white/[0.07]">
+  <table class="w-full text-left text-[12.5px]">
+    <thead>
+      <tr class="border-b border-white/[0.06] bg-white/[0.015]">
+        <th class="px-4 py-2.5 font-mono text-[10px] tracking-[0.15em] uppercase text-slate-500 font-normal">Use case</th>
+        <th class="px-4 py-2.5 font-mono text-[10px] tracking-[0.15em] uppercase text-slate-500 font-normal">Recommended</th>
+        <th class="px-4 py-2.5 font-mono text-[10px] tracking-[0.15em] uppercase text-slate-500 font-normal hidden sm:table-cell">Why</th>
+      </tr>
+    </thead>
+    <tbody class="divide-y divide-white/[0.04]">
+      <tr><td class="px-4 py-2.5 text-slate-300">Single producer, ordered</td><td class="px-4 py-2.5 text-emerald-200/90 font-mono">1</td><td class="px-4 py-2.5 text-slate-500 hidden sm:table-cell text-[11.5px]">Global ordering, no overhead</td></tr>
+      <tr><td class="px-4 py-2.5 text-slate-300">Per-key ordering</td><td class="px-4 py-2.5 text-emerald-200/90 font-mono">4–8</td><td class="px-4 py-2.5 text-slate-500 hidden sm:table-cell text-[11.5px]">Keys hash to partitions; order per key</td></tr>
+      <tr><td class="px-4 py-2.5 text-slate-300">High throughput, no ordering</td><td class="px-4 py-2.5 text-emerald-200/90 font-mono">4–16</td><td class="px-4 py-2.5 text-slate-500 hidden sm:table-cell text-[11.5px]">Concurrent producers with pinned partitions</td></tr>
+      <tr><td class="px-4 py-2.5 text-slate-300">Many consumer instances</td><td class="px-4 py-2.5 text-emerald-200/90 font-mono">≥ consumers</td><td class="px-4 py-2.5 text-slate-500 hidden sm:table-cell text-[11.5px]">One consumer instance per partition max</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="mt-6 flex items-start gap-3 p-4 rounded-xl bg-amber-400/[0.06] ring-1 ring-amber-300/20">
+  <span class="font-mono text-[10px] tracking-[0.2em] uppercase text-amber-300 mt-0.5">Important</span>
+  <p class="text-[13.5px] leading-relaxed text-slate-200">
+    <strong>You can only increase partition count, never decrease it.</strong> Records are distributed by hash or round-robin — removing a partition would orphan its records. If you create a topic with too few partitions, create a new topic with more and migrate. Partitions are allocated when the topic is created and cannot be changed later.
+  </p>
+</div>
+
+<h3 class="mt-8">Partitions &amp; consumer groups</h3>
+<p>
+  Each partition in a topic is assigned to exactly <strong>one member</strong> of a consumer group. If you have 4 partitions and 2 consumers, each consumer gets 2 partitions. If you have 4 consumers for 4 partitions, each gets 1. A 5th consumer would get nothing — it sits idle as a standby.
+</p>
+<p class="text-[13.5px] text-slate-400 mt-1">
+  The sticky coordinator preserves assignments across rebalances: when a new member joins, only the partitions that need to move are reassigned; existing members keep their current partitions. Partition count should be at least the number of consumer instances you plan to run for maximum parallelism.
+</p>
+
 <h2><span class="num">§</span>Produce</h2>
 <div class="space-y-2">
   <div class="flex items-center gap-3 px-4 py-3 rounded-lg bg-white/[0.025] ring-1 ring-white/[0.06]">
@@ -311,7 +392,7 @@ X-Es-Key: esk_AbCdEf...</pre>
 </div>
 
 <p class="mt-5">
-  Partition selection follows a fixed precedence: an explicit <code>partition</code> wins; otherwise a non-null <code>key</code> is hashed with FNV-1a so the same key always lands on the same partition; otherwise round-robin.
+  See <a href="#partitions" class="underline decoration-slate-600 hover:decoration-white">§ Partitions</a> above for routing rules and partition selection.
 </p>
 
 <div class="codeblock">

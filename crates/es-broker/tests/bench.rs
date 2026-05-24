@@ -49,7 +49,7 @@ async fn bench_throughput() -> Result<()> {
     let val_bytes = val.as_bytes();
 
     // --- binary pipelined across partitions ---
-    for npart in &[1u32, 4u32] {
+    for npart in &[1u32, 4u32, 8u32] {
         let name = format!("p{}", npart);
         http.post(format!("{}/topics", base))
             .json(&CreateTopicRequest {
