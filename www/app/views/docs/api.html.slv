@@ -542,6 +542,11 @@ X-Es-Key: esk_AbCdEf...</pre>
     <code class="font-mono text-[13px] text-slate-200">/admin/reset-offsets</code>
     <span class="ml-auto text-[12.5px] text-slate-400">rewind every group on a topic to its start_offset</span>
   </div>
+  <div class="flex items-center gap-3 px-4 py-3 rounded-lg bg-white/[0.025] ring-1 ring-white/[0.06]">
+    <span class="verb get">GET</span>
+    <code class="font-mono text-[13px] text-slate-200">/admin/tiered/:topic/:partition</code>
+    <span class="ml-auto text-[12.5px] text-slate-400">list remote segments in cold storage</span>
+  </div>
 </div>
 <p class="text-[13.5px] text-slate-400">
   Both endpoints return <code>204</code> when the pass has finished — useful for tests, demos, and ops scripts that need deterministic behavior instead of waiting for the next background tick. The pass still respects <code>segment_delete_grace</code>, so call duration depends on that knob.

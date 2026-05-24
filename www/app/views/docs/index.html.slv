@@ -159,7 +159,12 @@
   <a href="<%= docs_api_path() %>" class="group block p-5 rounded-xl bg-white/[0.03] ring-1 ring-white/[0.08] hover:bg-white/[0.05] hover:ring-white/20 transition">
     <p class="font-mono text-[10px] tracking-[0.2em] uppercase text-slate-400 mb-2">§03</p>
     <p class="font-display text-[19px] tracking-tight text-white">HTTP API →</p>
-    <p class="text-[12.5px] text-slate-400 mt-1">Every endpoint, request shape, response shape.</p>
+    <p class="text-[12.5px] text-slate-400 mt-1">30 endpoints: topics, produce, consume, groups, schemas, admin.</p>
+  </a>
+  <a href="<%= docs_cli_path() %>" class="group block p-5 rounded-xl bg-white/[0.03] ring-1 ring-white/[0.08] hover:bg-white/[0.05] hover:ring-white/20 transition">
+    <p class="font-mono text-[10px] tracking-[0.2em] uppercase text-slate-400 mb-2">§04</p>
+    <p class="font-display text-[19px] tracking-tight text-white">CLI →</p>
+    <p class="text-[12.5px] text-slate-400 mt-1">`es` binary: topic, produce, consume, group, key, schema, tiered.</p>
   </a>
   <a href="<%= docs_storage_path() %>" class="group block p-5 rounded-xl bg-white/[0.03] ring-1 ring-white/[0.08] hover:bg-white/[0.05] hover:ring-white/20 transition">
     <p class="font-mono text-[10px] tracking-[0.2em] uppercase text-slate-400 mb-2">§05</p>

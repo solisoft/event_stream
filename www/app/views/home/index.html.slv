@@ -161,7 +161,7 @@
             <ul class="space-y-2 text-[12.5px] text-teal-200/85 leading-relaxed">
               <li class="flex items-start gap-2"><span class="text-teal-500/50 mt-0.5">—</span>Time-based &amp; size-based retention</li>
               <li class="flex items-start gap-2"><span class="text-teal-500/50 mt-0.5">—</span>Log compaction with tombstone aging</li>
-              <li class="flex items-start gap-2"><span class="text-teal-500/50 mt-0.5">—</span>Tiered storage (cold offload on retention)</li>
+              <li class="flex items-start gap-2"><span class="text-teal-500/50 mt-0.5">—</span>Tiered storage (cold offload on retention, CLI)</li>
             </ul>
           </div>
 
@@ -203,7 +203,8 @@
               <li class="flex items-start gap-2"><span class="text-purple-500/50 mt-0.5">—</span>HTTP/JSON API + binary protocol</li>
               <li class="flex items-start gap-2"><span class="text-purple-500/50 mt-0.5">—</span>Binary: gzip handshake, pipelining</li>
               <li class="flex items-start gap-2"><span class="text-purple-500/50 mt-0.5">—</span>Idempotent producer (replay dedup)</li>
-              <li class="flex items-start gap-2"><span class="text-purple-500/50 mt-0.5">—</span>Schema registry (JSON Schema, compat checks)</li>
+              <li class="flex items-start gap-2"><span class="text-purple-500/50 mt-0.5">—</span>Schema registry (JSON Schema, compat checks, CLI)</li>
+              <li class="flex items-start gap-2"><span class="text-purple-500/50 mt-0.5">—</span>Zero-copy consume encoding</li>
             </ul>
           </div>
 

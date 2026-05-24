@@ -237,6 +237,50 @@ topic orders
   </p>
 </div>
 
+<h2><span class="num">§</span>Schema registry</h2>
+<div class="codeblock">
+  <div class="codeblock-bar">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="label">es schema …</span>
+    <span class="lang">shell</span>
+  </div>
+<pre><span class="c-com"># Register a JSON Schema for user records</span>
+<span class="c-fn">$</span> es schema register <span class="c-key">\</span>
+    <span class="c-key">--subject</span> user-value <span class="c-key">\</span>
+    <span class="c-key">--type</span> json_schema <span class="c-key">\</span>
+    <span class="c-key">--schema</span> <span class="c-str">'{"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer"}},"required":["name"]}'</span>
+<span class="c-com">→ id: 1</span>
+
+<span class="c-com"># List all schemas</span>
+<span class="c-fn">$</span> es schema list
+<span class="c-com">→ [{"id":1,"subject":"user-value",...}]</span>
+
+<span class="c-com"># Get a schema by ID</span>
+<span class="c-fn">$</span> es schema get <span class="c-key">--id</span> <span class="c-num">1</span>
+
+<span class="c-com"># Get the latest version for a subject</span>
+<span class="c-fn">$</span> es schema latest <span class="c-key">--subject</span> user-value
+
+<span class="c-com"># Register from a file</span>
+<span class="c-fn">$</span> es schema register <span class="c-key">--subject</span> order-value <span class="c-key">--schema</span> ./schemas/order.json
+
+<span class="c-com"># Backward-incompatible change → rejected with 400</span>
+<span class="c-fn">$</span> es schema register <span class="c-key">--subject</span> user-value <span class="c-key">--schema</span> <span class="c-str">'{"type":"object","required":["name","email"]}'</span>
+<span class="c-com">→ Error: backward-incompatible: new schema adds required field 'email'</span></pre>
+</div>
+
+<h2><span class="num">§</span>Tiered storage</h2>
+<div class="codeblock">
+  <div class="codeblock-bar">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="label">es tiered …</span>
+    <span class="lang">shell</span>
+  </div>
+<pre><span class="c-com"># List segments offloaded to cold storage</span>
+<span class="c-fn">$</span> es tiered list <span class="c-key">--topic</span> orders <span class="c-key">--partition</span> <span class="c-num">0</span>
+<span class="c-com">→ [0, 20, 40]  (base offsets of remote segments)</span></pre>
+</div>
+
 <h2><span class="num">§</span>Running the broker</h2>
 <div class="codeblock">
   <div class="codeblock-bar">
