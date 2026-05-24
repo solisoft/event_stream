@@ -19,8 +19,8 @@ use std::collections::{BTreeMap, HashSet};
 
 use super::log::{Log, PersistedRaft, PersistedSnapshot};
 use super::messages::{
-    AppendEntries, AppendEntriesResp, LogEntry, LogIndex, Message, NodeId, RequestVote,
-    RequestVoteResp, Term,
+    AppendEntries, AppendEntriesResp, InstallSnapshot, InstallSnapshotResp, LogEntry, LogIndex,
+    Message, NodeId, RequestVote, RequestVoteResp, Term,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +37,8 @@ pub enum Action {
     ResetElectionTimer,
     /// Hand a committed entry to the state machine.
     Apply(LogEntry),
+    /// Leader needs to send a snapshot to this peer (follower's log is behind).
+    SendSnapshot(NodeId),
 }
 
 #[derive(Debug)]
@@ -59,6 +61,50 @@ pub struct RaftState {
 
     votes_received: HashSet<NodeId>,
     dirty: bool,
+}
+
+const CONFIG_MAGIC: [u8; 4] = [0xEE, 0xEE, 0xEE, 0xEE];
+
+pub fn encode_config_change(add: Vec<NodeId>, remove: Vec<NodeId>) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&CONFIG_MAGIC);
+    out.extend_from_slice(&(add.len() as u32).to_be_bytes());
+    for id in &add {
+        out.extend_from_slice(&id.to_be_bytes());
+    }
+    out.extend_from_slice(&(remove.len() as u32).to_be_bytes());
+    for id in &remove {
+        out.extend_from_slice(&id.to_be_bytes());
+    }
+    out
+}
+
+fn decode_config_change(payload: &[u8]) -> Option<(Vec<NodeId>, Vec<NodeId>)> {
+    if payload.len() < 8 || payload[..4] != CONFIG_MAGIC {
+        return None;
+    }
+    let mut pos = 4;
+    let add_len = u32::from_be_bytes(payload[pos..pos + 4].try_into().ok()?) as usize;
+    pos += 4;
+    let mut add = Vec::with_capacity(add_len);
+    for _ in 0..add_len {
+        let id = u32::from_be_bytes(payload[pos..pos + 4].try_into().ok()?);
+        pos += 4;
+        add.push(id);
+    }
+    let remove_len = u32::from_be_bytes(payload[pos..pos + 4].try_into().ok()?) as usize;
+    pos += 4;
+    let mut remove = Vec::with_capacity(remove_len);
+    for _ in 0..remove_len {
+        let id = u32::from_be_bytes(payload[pos..pos + 4].try_into().ok()?);
+        pos += 4;
+        remove.push(id);
+    }
+    Some((add, remove))
+}
+
+pub fn is_config_entry(payload: &[u8]) -> bool {
+    payload.len() >= 4 && payload[..4] == CONFIG_MAGIC
 }
 
 impl RaftState {
@@ -158,7 +204,12 @@ impl RaftState {
         }
         let mut out = Vec::with_capacity(self.peers.len());
         for peer in self.peers.clone() {
-            out.push(Action::SendTo(peer, self.build_append_for(peer)));
+            let next = self.next_index.get(&peer).copied().unwrap_or(1);
+            if next <= self.log.base_index {
+                out.push(Action::SendSnapshot(peer));
+            } else {
+                out.push(Action::SendTo(peer, self.build_append_for(peer)));
+            }
         }
         out
     }
@@ -179,6 +230,8 @@ impl RaftState {
             Message::RequestVoteResp(rvr) => self.handle_request_vote_resp(rvr),
             Message::AppendEntries(ae) => self.handle_append_entries(ae),
             Message::AppendEntriesResp(aer) => self.handle_append_entries_resp(aer),
+            Message::InstallSnapshot(is) => self.handle_install_snapshot(is),
+            Message::InstallSnapshotResp(isr) => self.handle_install_snapshot_resp(isr),
         };
 
         if stepped_down && !actions.iter().any(|a| matches!(a, Action::ResetElectionTimer)) {
@@ -187,6 +240,18 @@ impl RaftState {
 
         actions.extend(self.drain_apply_actions());
         actions
+    }
+
+    /// Propose a membership change. Must be called on the Leader.
+    pub fn try_change_membership(
+        &mut self,
+        add: Vec<NodeId>,
+        remove: Vec<NodeId>,
+    ) -> (ProposeOutcome, Vec<Action>) {
+        if self.role != Role::Leader {
+            return (ProposeOutcome::NotLeader(self.leader_hint), Vec::new());
+        }
+        self.try_propose(encode_config_change(add, remove))
     }
 
     /// Client / broker calls this on the Leader to append a new entry.
@@ -216,19 +281,45 @@ impl RaftState {
         let mut out = Vec::new();
         while self.last_applied < self.commit_index {
             self.last_applied += 1;
-            // After snapshot, entries no longer start at index 1 — look up by
-            // the entry's logical index relative to the first in-memory entry.
             if let Some(first) = self.log.entries.first() {
                 let first_idx = first.index;
                 if self.last_applied >= first_idx {
                     let pos = (self.last_applied - first_idx) as usize;
                     if let Some(e) = self.log.entries.get(pos) {
-                        out.push(Action::Apply(e.clone()));
+                        if let Some((add, remove)) = decode_config_change(&e.payload) {
+                            self.apply_config_change(add, remove);
+                        } else {
+                            out.push(Action::Apply(e.clone()));
+                        }
                     }
                 }
             }
         }
         out
+    }
+
+    fn apply_config_change(&mut self, add: Vec<NodeId>, remove: Vec<NodeId>) {
+        for id in &remove {
+            self.peers.retain(|p| p != id);
+            self.match_index.remove(id);
+            self.next_index.remove(id);
+        }
+        for id in &add {
+            if !self.peers.contains(id) && *id != self.me {
+                self.peers.push(*id);
+                self.next_index.insert(*id, 1);
+                self.match_index.insert(*id, 0);
+            }
+        }
+        self.peers.sort_unstable();
+        self.dirty = true;
+        tracing::info!(
+            me = self.me,
+            added = ?add,
+            removed = ?remove,
+            new_peers = ?self.peers,
+            "raft: config change applied"
+        );
     }
 
     // ---------- internals ----------
@@ -398,10 +489,64 @@ impl RaftState {
         }
         // Send an immediate AppendEntries to this peer to flush the next batch
         // or retry the failed one.
-        vec![Action::SendTo(
-            aer.responder_id,
-            self.build_append_for(aer.responder_id),
-        )]
+        let next = self.next_index.get(&aer.responder_id).copied().unwrap_or(1);
+        if next <= self.log.base_index {
+            vec![Action::SendSnapshot(aer.responder_id)]
+        } else {
+            vec![Action::SendTo(
+                aer.responder_id,
+                self.build_append_for(aer.responder_id),
+            )]
+        }
+    }
+
+    fn handle_install_snapshot(&mut self, is: InstallSnapshot) -> Vec<Action> {
+        if is.term < self.current_term {
+            return vec![Action::SendTo(
+                is.leader_id,
+                Message::InstallSnapshotResp(InstallSnapshotResp {
+                    term: self.current_term,
+                    success: false,
+                    responder_id: self.me,
+                }),
+            )];
+        }
+        self.role = Role::Follower;
+        self.leader_hint = Some(is.leader_id);
+        if is.term > self.current_term {
+            self.current_term = is.term;
+            self.voted_for = None;
+            self.dirty = true;
+        }
+        if is.last_index > self.log.base_index {
+            self.log.compact_through(is.last_index, is.last_term);
+        }
+        if is.last_index > self.commit_index {
+            self.commit_index = is.last_index;
+        }
+        if is.last_index > self.last_applied {
+            self.last_applied = is.last_index;
+        }
+        self.dirty = true;
+        let resp = Message::InstallSnapshotResp(InstallSnapshotResp {
+            term: self.current_term,
+            success: true,
+            responder_id: self.me,
+        });
+        vec![
+            Action::SendTo(is.leader_id, resp),
+            Action::ResetElectionTimer,
+        ]
+    }
+
+    fn handle_install_snapshot_resp(&mut self, isr: InstallSnapshotResp) -> Vec<Action> {
+        if self.role != Role::Leader || isr.term != self.current_term {
+            return Vec::new();
+        }
+        if isr.success {
+            self.recompute_commit_index();
+        }
+        Vec::new()
     }
 
     fn become_leader(&mut self) {

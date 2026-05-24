@@ -1,0 +1,312 @@
+<div class="reveal">
+  <p class="font-mono text-[11px] tracking-[0.28em] uppercase text-indigo-300/80 mb-5">§04 · CLI</p>
+  <h1 class="font-display text-[42px] md:text-[62px] leading-[1.0] tracking-[-0.025em] text-white font-light">
+    The
+    <span class="font-mono text-[0.78em] align-middle px-3 py-1 ml-1 mr-1 rounded-md bg-white/[0.06] ring-1 ring-white/[0.12] text-indigo-200">es</span>
+    binary, in detail.
+  </h1>
+</div>
+
+<p class="reveal d1 mt-7 text-[17px] leading-[1.7] text-slate-300 max-w-[58ch] font-light">
+  A thin <code>reqwest</code> wrapper around the HTTP API. Reads the broker URL from <code>--broker</code> or the <code>ES_BROKER</code> environment variable (default <code>http://127.0.0.1:9000</code>). When the broker enforces auth, pass the bearer token via <code>--auth</code> or the <code>ES_AUTH</code> environment variable.
+</p>
+
+<div class="codeblock">
+  <div class="codeblock-bar">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="label">env</span>
+    <span class="lang">shell</span>
+  </div>
+<pre><span class="c-fn">$</span> <span class="c-key">export</span> ES_BROKER=<span class="c-str">https://broker.internal:9000</span>
+<span class="c-fn">$</span> <span class="c-key">export</span> ES_AUTH=<span class="c-str">esk_AbCdEf...</span>
+<span class="c-fn">$</span> es topic list</pre>
+</div>
+
+<h2 class="mt-10"><span class="num">§</span>End-to-end workflow</h2>
+<div class="codeblock mt-4">
+  <div class="codeblock-bar">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="label">full lifecycle</span>
+    <span class="lang">bash</span>
+  </div>
+<pre><span class="c-com"># Start the broker (separate terminal)</span>
+<span class="c-fn">$</span> es-broker <span class="c-key">--bind</span> 127.0.0.1:9000
+
+<span class="c-com"># ----- topic lifecycle -----</span>
+<span class="c-fn">$</span> es topic create <span class="c-key">--name</span> orders <span class="c-key">--partitions</span> <span class="c-num">3</span>
+<span class="c-fn">$</span> es topic list
+<span class="c-com">→ orders</span>
+<span class="c-fn">$</span> es topic describe <span class="c-key">--name</span> orders
+<span class="c-com">→ partition 0  start=0  end=0  segments=1  size_bytes=0
+→ partition 1  start=0  end=0  segments=1  size_bytes=0
+→ partition 2  start=0  end=0  segments=1  size_bytes=0</span>
+
+<span class="c-com"># ----- produce -----</span>
+<span class="c-fn">$</span> es produce <span class="c-key">--topic</span> orders <span class="c-key">--key</span> alice <span class="c-key">--value</span> <span class="c-str">'{"action":"checkout"}'</span>
+<span class="c-com">→ partition=0 offset=0</span>
+<span class="c-fn">$</span> es produce <span class="c-key">--topic</span> orders <span class="c-key">--key</span> bob <span class="c-key">--value</span> <span class="c-str">'{"action":"signup"}'</span>
+<span class="c-com">→ partition=1 offset=0</span>
+
+<span class="c-com"># Produce a batch from a JSON-lines file</span>
+<span class="c-fn">$</span> <span class="c-key">cat</span> > events.jsonl <span class="c-key">&lt;&lt;'EOF'</span>
+{<span class="c-str">"key"</span>:<span class="c-str">"carol"</span>,<span class="c-str">"value"</span>:<span class="c-str">"{\"action\":\"login\"}"</span>}
+{<span class="c-str">"key"</span>:<span class="c-str">"alice"</span>,<span class="c-str">"value"</span>:<span class="c-str">"{\"action\":\"logout\"}"</span>}
+<span class="c-key">EOF</span>
+<span class="c-fn">$</span> es produce <span class="c-key">--topic</span> orders <span class="c-key">--from-file</span> events.jsonl
+<span class="c-com">→ partition=2 offset=0
+→ partition=0 offset=1  (same key → same partition)</span>
+
+<span class="c-com"># ----- consume -----</span>
+<span class="c-fn">$</span> es consume <span class="c-key">--topic</span> orders <span class="c-key">--partition</span> <span class="c-num">0</span> <span class="c-key">--offset</span> <span class="c-num">0</span>
+<span class="c-com">→ offset=0 key=alice value={"action":"checkout"}
+→ offset=1 key=alice value={"action":"logout"}</span>
+
+<span class="c-com"># ----- consumer groups -----</span>
+<span class="c-fn">$</span> es consume <span class="c-key">--topic</span> orders <span class="c-key">--partition</span> <span class="c-num">0</span> <span class="c-key">--group</span> analytics
+<span class="c-com">→  resume from committed offset (0 by default)</span>
+<span class="c-fn">$</span> es commit <span class="c-key">--group</span> analytics <span class="c-key">--topic</span> orders <span class="c-key">--partition</span> <span class="c-num">0</span> <span class="c-key">--offset</span> <span class="c-num">2</span>
+<span class="c-fn">$</span> es group show <span class="c-key">--name</span> analytics
+<span class="c-com">→ topic orders
+→   partition 0 -> offset 2</span>
+<span class="c-fn">$</span> es consume <span class="c-key">--topic</span> orders <span class="c-key">--partition</span> <span class="c-num">0</span> <span class="c-key">--group</span> analytics
+<span class="c-com">→  nothing returned — caught up</span></pre>
+</div>
+
+<div class="rule-x my-14"></div>
+
+<h2><span class="num">§</span>Topics</h2>
+<div class="codeblock">
+  <div class="codeblock-bar">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="label">es topic …</span>
+    <span class="lang">shell</span>
+  </div>
+<pre><span class="c-com"># Create a topic. All config flags are optional.</span>
+<span class="c-fn">$</span> es topic create <span class="c-key">--name</span> orders <span class="c-key">--partitions</span> <span class="c-num">3</span> <span class="c-key">\</span>
+    <span class="c-key">--retention-ms</span> <span class="c-num">86400000</span> <span class="c-key">\</span>
+    <span class="c-key">--retention-bytes</span> <span class="c-num">1073741824</span> <span class="c-key">\</span>
+    <span class="c-key">--cleanup-policy</span> compact,delete <span class="c-key">\</span>
+    <span class="c-key">--segment-bytes</span> <span class="c-num">67108864</span> <span class="c-key">\</span>
+    <span class="c-key">--tombstone-retention-ms</span> <span class="c-num">86400000</span>
+
+<span class="c-com"># Merge-patch update; omitted flags preserve the current value.</span>
+<span class="c-fn">$</span> es topic alter <span class="c-key">--name</span> orders <span class="c-key">--retention-ms</span> <span class="c-num">3600000</span>
+
+<span class="c-fn">$</span> es topic list
+<span class="c-fn">$</span> es topic describe    <span class="c-key">--name</span> orders   <span class="c-com"># includes config + per-partition size_bytes</span>
+<span class="c-fn">$</span> es topic show-config <span class="c-key">--name</span> orders</pre>
+</div>
+
+<div class="mt-6 grid grid-cols-1 sm:grid-cols-2 gap-3 text-[13px]">
+  <div class="px-4 py-3 rounded-lg bg-white/[0.03] ring-1 ring-white/[0.06]">
+    <p class="font-mono text-[10px] tracking-[0.18em] uppercase text-indigo-300/80 mb-1">--retention-ms</p>
+    <p class="text-slate-300">Reaper deletes sealed segments whose newest record is older than this.</p>
+  </div>
+  <div class="px-4 py-3 rounded-lg bg-white/[0.03] ring-1 ring-white/[0.06]">
+    <p class="font-mono text-[10px] tracking-[0.18em] uppercase text-indigo-300/80 mb-1">--retention-bytes</p>
+    <p class="text-slate-300">Reaper drops oldest sealed segments until total partition size is below this.</p>
+  </div>
+  <div class="px-4 py-3 rounded-lg bg-white/[0.03] ring-1 ring-white/[0.06]">
+    <p class="font-mono text-[10px] tracking-[0.18em] uppercase text-indigo-300/80 mb-1">--cleanup-policy</p>
+    <p class="text-slate-300"><code>delete</code>, <code>compact</code>, or <code>compact,delete</code>.</p>
+  </div>
+  <div class="px-4 py-3 rounded-lg bg-white/[0.03] ring-1 ring-white/[0.06]">
+    <p class="font-mono text-[10px] tracking-[0.18em] uppercase text-indigo-300/80 mb-1">--segment-bytes</p>
+    <p class="text-slate-300">Per-topic override of the broker default. Takes effect on the next roll.</p>
+  </div>
+</div>
+
+<h2><span class="num">§</span>Produce</h2>
+<div class="codeblock">
+  <div class="codeblock-bar">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="label">es produce …</span>
+    <span class="lang">shell</span>
+  </div>
+<pre><span class="c-com"># inline value</span>
+<span class="c-fn">$</span> es produce <span class="c-key">--topic</span> orders <span class="c-key">--key</span> k1 <span class="c-key">--value</span> <span class="c-str">'{"id":1}'</span>
+
+<span class="c-com"># pin to a specific partition</span>
+<span class="c-fn">$</span> es produce <span class="c-key">--topic</span> orders <span class="c-key">--key</span> k1 <span class="c-key">--value</span> hi <span class="c-key">--partition</span> <span class="c-num">0</span>
+
+<span class="c-com"># one record per non-blank line of a file</span>
+<span class="c-fn">$</span> es produce <span class="c-key">--topic</span> orders <span class="c-key">--from-file</span> events.jsonl</pre>
+</div>
+<p class="text-[14px] text-slate-400">
+  Pick <code>--value</code> <em>or</em> <code>--from-file</code> — they're mutually exclusive.
+</p>
+
+<h2><span class="num">§</span>Consume</h2>
+<div class="codeblock">
+  <div class="codeblock-bar">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="label">es consume …</span>
+    <span class="lang">shell</span>
+  </div>
+<pre><span class="c-com"># direct read from a specific partition + offset</span>
+<span class="c-fn">$</span> es consume <span class="c-key">--topic</span> orders <span class="c-key">--partition</span> <span class="c-num">0</span> <span class="c-key">--offset</span> <span class="c-num">0</span> <span class="c-key">[--max</span> <span class="c-num">100</span><span class="c-key">]</span>
+
+<span class="c-com"># group-aware — resumes from committed offset (no auto-commit)</span>
+<span class="c-fn">$</span> es consume <span class="c-key">--topic</span> orders <span class="c-key">--partition</span> <span class="c-num">0</span> <span class="c-key">--group</span> analytics</pre>
+</div>
+<p class="text-[14px] text-slate-400">
+  The output prints one line per record, followed by a trailing summary line with <code>next_offset</code>, <code>high_watermark</code>, and the record count.
+</p>
+
+<h2><span class="num">§</span>Committing &amp; inspecting groups</h2>
+<div class="codeblock">
+  <div class="codeblock-bar">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="label">groups</span>
+    <span class="lang">shell</span>
+  </div>
+<pre><span class="c-fn">$</span> es commit <span class="c-key">--group</span> analytics <span class="c-key">--topic</span> orders <span class="c-key">--partition</span> <span class="c-num">0</span> <span class="c-key">--offset</span> <span class="c-num">42</span>
+<span class="c-fn">$</span> es group show <span class="c-key">--name</span> analytics
+
+topic orders
+  partition 0 -> offset 42</pre>
+</div>
+
+<h2><span class="num">§</span>Consumer-group coordination</h2>
+<div class="codeblock">
+  <div class="codeblock-bar">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="label">es group …</span>
+    <span class="lang">shell</span>
+  </div>
+<pre><span class="c-com"># Join — coordinator assigns a member_id if one isn't supplied.</span>
+<span class="c-fn">$</span> es group join <span class="c-key">--name</span> analytics <span class="c-key">--topic</span> orders <span class="c-key">--topic</span> billing
+
+<span class="c-com"># Heartbeat — pass the member_id + generation you got back from join.</span>
+<span class="c-fn">$</span> es group heartbeat <span class="c-key">--name</span> analytics <span class="c-key">--member-id</span> m_abc... <span class="c-key">--generation</span> <span class="c-num">3</span>
+
+<span class="c-fn">$</span> es group assignment <span class="c-key">--name</span> analytics <span class="c-key">--member-id</span> m_abc...
+<span class="c-fn">$</span> es group leave      <span class="c-key">--name</span> analytics <span class="c-key">--member-id</span> m_abc...</pre>
+</div>
+<p class="text-[14px] text-slate-400">
+  A heartbeat that returns <code>rebalance_required</code> means assignment changed (a peer joined, left, or was evicted); re-fetch via <code>es group assignment</code>. <code>unknown_member</code> means you were evicted past the timeout; rejoin.
+</p>
+
+<h2><span class="num">§</span>Idempotent producer / admin</h2>
+<div class="codeblock">
+  <div class="codeblock-bar">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="label">idempotency</span>
+    <span class="lang">shell</span>
+  </div>
+<pre><span class="c-com"># Single record with explicit sequence — retries return the same offset.</span>
+<span class="c-fn">$</span> es produce <span class="c-key">--topic</span> orders <span class="c-key">--partition</span> <span class="c-num">0</span> <span class="c-key">--value</span> <span class="c-str">'…'</span> <span class="c-key">\</span>
+    <span class="c-key">--producer-id</span> checkout-svc-1 <span class="c-key">--sequence</span> <span class="c-num">42</span>
+
+<span class="c-com"># Bulk from a file — sequence auto-increments from --sequence.</span>
+<span class="c-fn">$</span> es produce <span class="c-key">--topic</span> orders <span class="c-key">--partition</span> <span class="c-num">0</span> <span class="c-key">--from-file</span> events.jsonl <span class="c-key">\</span>
+    <span class="c-key">--producer-id</span> checkout-svc-1 <span class="c-key">--sequence</span> <span class="c-num">100</span>
+
+<span class="c-fn">$</span> es producer list
+<span class="c-fn">$</span> es producer revoke <span class="c-key">--id</span> checkout-svc-1
+
+<span class="c-com"># Rewind every consumer group's offset on a topic to its start_offset.</span>
+<span class="c-fn">$</span> es reset-offsets <span class="c-key">--topic</span> orders</pre>
+</div>
+<p class="text-[14px] text-slate-400">
+  The produce output marks duplicates: <code>partition=0 offset=42 (duplicate)</code>.
+</p>
+
+<h2><span class="num">§</span>API keys</h2>
+<div class="codeblock">
+  <div class="codeblock-bar">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="label">es key …</span>
+    <span class="lang">shell</span>
+  </div>
+<pre><span class="c-com"># Create a key. ACL syntax: action:topic_prefix. Repeat --acl for several rules.</span>
+<span class="c-fn">$</span> es key create <span class="c-key">--name</span> orders-writer <span class="c-key">\</span>
+    <span class="c-key">--acl</span> <span class="c-str">write:orders.</span> <span class="c-key">\</span>
+    <span class="c-key">--acl</span> <span class="c-str">read:billing</span> <span class="c-key">\</span>
+    <span class="c-key">--produce-bytes-per-sec</span> <span class="c-num">1048576</span>
+<span class="c-com"># SECRET is printed once; save it.</span>
+
+<span class="c-fn">$</span> es key list
+<span class="c-fn">$</span> es key revoke <span class="c-key">--id</span> key_a1b2c3</pre>
+</div>
+
+<div class="mt-6 flex items-start gap-3 p-4 rounded-xl bg-rose-400/[0.06] ring-1 ring-rose-300/20">
+  <span class="font-mono text-[10px] tracking-[0.2em] uppercase text-rose-300 mt-0.5">Care</span>
+  <p class="text-[13.5px] leading-relaxed text-slate-200">
+    The secret is only readable once at creation time. The broker stores its SHA-256 hash — there is no recovery path. Capture it from the <code>SECRET</code> line of <code>key create</code> and stash it in your secret manager before the terminal scrolls.
+  </p>
+</div>
+
+<h2><span class="num">§</span>Running the broker</h2>
+<div class="codeblock">
+  <div class="codeblock-bar">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="label">es-broker</span>
+    <span class="lang">shell</span>
+  </div>
+<pre><span class="c-fn">$</span> es-broker <span class="c-key">\</span>
+    <span class="c-key">--data-dir</span> ./data <span class="c-key">\</span>
+    <span class="c-key">--bind</span> <span class="c-str">127.0.0.1:9000</span> <span class="c-key">\</span>
+    <span class="c-key">--segment-bytes</span> <span class="c-num">67108864</span> <span class="c-key">\</span>
+    <span class="c-key">--retention-check-interval</span> 30s <span class="c-key">\</span>
+    <span class="c-key">--compaction-check-interval</span> 60s <span class="c-key">\</span>
+    <span class="c-key">--segment-delete-grace</span> 60s</pre>
+</div>
+
+<div class="grid grid-cols-1 sm:grid-cols-3 gap-3 text-[13px]">
+  <div class="px-4 py-3 rounded-lg bg-white/[0.03] ring-1 ring-white/[0.06]">
+    <p class="font-mono text-[10px] tracking-[0.18em] uppercase text-indigo-300/80 mb-1">--data-dir</p>
+    <p class="text-slate-300">Where topic logs and group offsets live.</p>
+  </div>
+  <div class="px-4 py-3 rounded-lg bg-white/[0.03] ring-1 ring-white/[0.06]">
+    <p class="font-mono text-[10px] tracking-[0.18em] uppercase text-indigo-300/80 mb-1">--bind</p>
+    <p class="text-slate-300">HTTP listen address. Port 0 = let the OS pick.</p>
+  </div>
+  <div class="px-4 py-3 rounded-lg bg-white/[0.03] ring-1 ring-white/[0.06]">
+    <p class="font-mono text-[10px] tracking-[0.18em] uppercase text-indigo-300/80 mb-1">--segment-bytes</p>
+    <p class="text-slate-300">Default segment size. Topics override per-topic.</p>
+  </div>
+  <div class="px-4 py-3 rounded-lg bg-white/[0.03] ring-1 ring-white/[0.06]">
+    <p class="font-mono text-[10px] tracking-[0.18em] uppercase text-indigo-300/80 mb-1">--retention-check-interval</p>
+    <p class="text-slate-300">How often the reaper scans for sealed segments to delete.</p>
+  </div>
+  <div class="px-4 py-3 rounded-lg bg-white/[0.03] ring-1 ring-white/[0.06]">
+    <p class="font-mono text-[10px] tracking-[0.18em] uppercase text-indigo-300/80 mb-1">--compaction-check-interval</p>
+    <p class="text-slate-300">How often the compactor runs.</p>
+  </div>
+  <div class="px-4 py-3 rounded-lg bg-white/[0.03] ring-1 ring-white/[0.06]">
+    <p class="font-mono text-[10px] tracking-[0.18em] uppercase text-indigo-300/80 mb-1">--segment-delete-grace</p>
+    <p class="text-slate-300">Wait this long before unlinking dropped segment files (lets in-flight readers finish).</p>
+  </div>
+  <div class="px-4 py-3 rounded-lg bg-white/[0.03] ring-1 ring-white/[0.06]">
+    <p class="font-mono text-[10px] tracking-[0.18em] uppercase text-indigo-300/80 mb-1">--auth</p>
+    <p class="text-slate-300"><code>disabled</code> (default) or <code>required</code>. Enforces bearer-token auth and ACLs.</p>
+  </div>
+  <div class="px-4 py-3 rounded-lg bg-white/[0.03] ring-1 ring-white/[0.06]">
+    <p class="font-mono text-[10px] tracking-[0.18em] uppercase text-indigo-300/80 mb-1">--tls-cert / --tls-key</p>
+    <p class="text-slate-300">PEM files. Setting both makes the broker listen on TLS (rustls).</p>
+  </div>
+  <div class="px-4 py-3 rounded-lg bg-white/[0.03] ring-1 ring-white/[0.06]">
+    <p class="font-mono text-[10px] tracking-[0.18em] uppercase text-indigo-300/80 mb-1">--bind-binary</p>
+    <p class="text-slate-300">Second listener for the binary protocol (e.g. <code>127.0.0.1:9001</code>). Off by default.</p>
+  </div>
+  <div class="px-4 py-3 rounded-lg bg-white/[0.03] ring-1 ring-white/[0.06]">
+    <p class="font-mono text-[10px] tracking-[0.18em] uppercase text-indigo-300/80 mb-1">--flush-every-records</p>
+    <p class="text-slate-300">fsync the log every N records. <code>1</code> = safest. Higher = faster (with proportional crash window).</p>
+  </div>
+  <div class="px-4 py-3 rounded-lg bg-white/[0.03] ring-1 ring-white/[0.06]">
+    <p class="font-mono text-[10px] tracking-[0.18em] uppercase text-indigo-300/80 mb-1">--max-request-body-bytes</p>
+    <p class="text-slate-300">Cap HTTP request bodies (default <code>10485760</code> = 10 MiB).</p>
+  </div>
+  <div class="px-4 py-3 rounded-lg bg-white/[0.03] ring-1 ring-white/[0.06]">
+    <p class="font-mono text-[10px] tracking-[0.18em] uppercase text-indigo-300/80 mb-1">--shutdown-timeout</p>
+    <p class="text-slate-300">Max time to wait for graceful drain before forcing exit (default <code>30s</code>).</p>
+  </div>
+</div>
+
+<div class="mt-6 flex items-start gap-3 p-4 rounded-xl bg-amber-400/[0.06] ring-1 ring-amber-300/20">
+  <span class="font-mono text-[10px] tracking-[0.2em] uppercase text-amber-300 mt-0.5">Tip</span>
+  <p class="text-[13.5px] leading-relaxed text-slate-200">
+    Set <code>RUST_LOG=info</code> for structured logs from <code>tracing</code>. In the demo, the script writes broker logs to <code>data/broker.log</code> so the demo output stays readable. The broker handles both <strong>SIGINT</strong> and <strong>SIGTERM</strong>, draining connections within the <code>--shutdown-timeout</code> window before exit.
+  </p>
+</div>

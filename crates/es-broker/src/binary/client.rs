@@ -12,17 +12,11 @@ use es_protocol::wire::{
     decode_produce_response, encode_consume_request, encode_produce_request,
 };
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct ClientOptions {
     /// Request gzip compression on the connection. The server may decline,
     /// in which case the client falls back to uncompressed frames.
     pub gzip: bool,
-}
-
-impl Default for ClientOptions {
-    fn default() -> Self {
-        Self { gzip: false }
-    }
 }
 
 pub struct BinaryClient {

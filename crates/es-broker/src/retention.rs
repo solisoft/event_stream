@@ -32,6 +32,54 @@ pub fn spawn_reaper(
     })
 }
 
+async fn offload_victims(
+    broker: &Arc<Broker>,
+    topic_name: &str,
+    partition_id: u32,
+    victims: &[u64],
+) {
+    let store = match &broker.tiered_store {
+        Some(s) => s.clone(),
+        None => return,
+    };
+    for &base in victims {
+        if let Some(topic) = broker.topic(topic_name) {
+            if let Some(ph) = topic.partitions.get(partition_id as usize) {
+                let inner = ph.inner();
+                let snapshot = inner.segments_snapshot();
+                if let Some(seg) = snapshot.iter().find(|s| s.base_offset == base) {
+                    match store.offload(
+                        topic_name,
+                        partition_id,
+                        base,
+                        &seg.log_path,
+                        &seg.index_path,
+                    ) {
+                        Ok(bytes) => {
+                            tracing::info!(
+                                topic = %topic_name,
+                                partition = partition_id,
+                                base_offset = base,
+                                bytes,
+                                "reaper: segment offloaded to cold storage"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                topic = %topic_name,
+                                partition = partition_id,
+                                base_offset = base,
+                                error = %e,
+                                "reaper: offload failed, segment will be deleted instead"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub async fn run_pass(broker: &Arc<Broker>, grace: Duration, cancel: &CancellationToken) {
     let topic_names: Vec<String> = broker
         .topics
@@ -47,7 +95,6 @@ pub async fn run_pass(broker: &Arc<Broker>, grace: Duration, cancel: &Cancellati
         if !config.cleanup_policy.includes_delete() {
             continue;
         }
-        // Skip if neither retention setting is configured.
         if config.retention_ms.is_none() && config.retention_bytes.is_none() {
             continue;
         }
@@ -55,25 +102,27 @@ pub async fn run_pass(broker: &Arc<Broker>, grace: Duration, cancel: &Cancellati
             if cancel.is_cancelled() {
                 return;
             }
-            let victims = plan_victims(partition, &config);
+            let victims = plan_victims(partition.inner(), &config);
             if victims.is_empty() {
                 continue;
             }
+            // Offload to cold storage before deleting (if configured).
+            offload_victims(broker, &name, partition.id(), &victims).await;
             let victim_count = victims.len() as u64;
             match partition.drop_sealed_segments(&victims, grace, cancel).await {
                 Err(e) => {
-                    tracing::warn!(topic = %name, partition = partition.id, error = %e, "reaper: drop failed");
+                    tracing::warn!(topic = %name, partition = partition.id(), error = %e, "reaper: drop failed");
                 }
                 Ok(reclaimed) => {
                     partition
-                        .retention_segments_deleted_total
+                        .retention_segments_deleted()
                         .fetch_add(victim_count, Ordering::Relaxed);
                     partition
-                        .retention_bytes_reclaimed_total
+                        .retention_bytes_reclaimed()
                         .fetch_add(reclaimed, Ordering::Relaxed);
                     tracing::info!(
                         topic = %name,
-                        partition = partition.id,
+                        partition = partition.id(),
                         victims = victim_count,
                         bytes_reclaimed = reclaimed,
                         "reaper: retention enforced"

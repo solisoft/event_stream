@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
+use tokio::signal::unix::{SignalKind, signal};
 use tracing_subscriber::EnvFilter;
 
 use es_broker::{Config, spawn};
@@ -56,6 +57,19 @@ struct Args {
     /// on crash for proportionally higher throughput.
     #[arg(long, default_value_t = 1)]
     flush_every_records: u32,
+
+    /// Maximum HTTP request body size in bytes (default 10 MiB).
+    #[arg(long, default_value_t = 10 * 1024 * 1024)]
+    max_request_body_bytes: usize,
+
+    /// Maximum time to wait for graceful shutdown before forcing exit.
+    #[arg(long, default_value = "30s", value_parser = parse_duration)]
+    shutdown_timeout: Duration,
+
+    /// Cold-storage directory for tiered storage. When set, sealed segments
+    /// are offloaded here instead of being deleted by retention.
+    #[arg(long)]
+    cold_storage_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -83,6 +97,24 @@ async fn main() -> Result<()> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
 
+    // Log panics with backtrace instead of letting them go to stderr silently.
+    std::panic::set_hook(Box::new(|info| {
+        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "unknown panic payload".to_string()
+        };
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_default();
+        tracing::error!(%payload, %location, "panic");
+        // Also print to stderr so it is visible even if the subscriber is gone.
+        eprintln!("panic at {location}: {payload}");
+    }));
+
     // rustls needs a default crypto provider installed before use.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -97,6 +129,9 @@ async fn main() -> Result<()> {
     config.tls_key_path = args.tls_key;
     config.bind_binary = args.bind_binary;
     config.flush_every_records = args.flush_every_records;
+    config.max_request_body_bytes = args.max_request_body_bytes;
+    config.shutdown_timeout = args.shutdown_timeout;
+    config.cold_storage_dir = args.cold_storage_dir;
 
     let handle = spawn(config).await?;
     tracing::info!(addr = %handle.addr, scheme = handle.scheme, "broker listening");
@@ -104,8 +139,18 @@ async fn main() -> Result<()> {
         tracing::info!(addr = %bin_addr, "broker binary protocol listening");
     }
 
-    tokio::signal::ctrl_c().await?;
-    tracing::info!("ctrl-c received, shutting down");
+    // Wait for SIGINT or SIGTERM.
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sigterm = signal(SignalKind::terminate())?;
+    tokio::select! {
+        _ = sigint.recv() => {
+            tracing::info!("SIGINT received, shutting down");
+        }
+        _ = sigterm.recv() => {
+            tracing::info!("SIGTERM received, shutting down");
+        }
+    }
+
     handle.shutdown().await?;
     Ok(())
 }

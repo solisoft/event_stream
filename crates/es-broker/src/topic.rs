@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -7,7 +9,8 @@ use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
-use crate::partition::Partition;
+use crate::partition_handle::{PartitionHandle, RaftConfig};
+use crate::raft::Timing;
 use es_protocol::{CleanupPolicyDto, TopicConfigDto, TopicConfigPatch};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,8 +85,7 @@ impl TopicConfig {
 }
 
 /// On-disk representation. Every field is optional; absent fields fall back to
-/// the broker defaults at load time. This keeps `topic.json` backwards-compatible
-/// with files written by older versions.
+/// the broker defaults at load time.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct PersistedTopicConfig {
     #[serde(default)]
@@ -96,6 +98,17 @@ struct PersistedTopicConfig {
     segment_bytes: Option<u64>,
     #[serde(default)]
     tombstone_retention_ms: Option<u64>,
+    #[serde(default)]
+    raft: Option<PersistedRaftConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedRaftConfig {
+    node_id: u32,
+    #[serde(default)]
+    peers: Vec<u32>,
+    #[serde(default)]
+    snapshot_after_applies: u32,
 }
 
 impl PersistedTopicConfig {
@@ -106,6 +119,7 @@ impl PersistedTopicConfig {
             cleanup_policy: patch.cleanup_policy.map(|p| CleanupPolicy::from_dto(p).as_str().to_string()),
             segment_bytes: patch.segment_bytes,
             tombstone_retention_ms: patch.tombstone_retention_ms,
+            raft: None,
         }
     }
 
@@ -115,6 +129,18 @@ impl PersistedTopicConfig {
         if let Some(p) = patch.cleanup_policy { self.cleanup_policy = Some(CleanupPolicy::from_dto(p).as_str().to_string()); }
         if let Some(v) = patch.segment_bytes { self.segment_bytes = Some(v); }
         if let Some(v) = patch.tombstone_retention_ms { self.tombstone_retention_ms = Some(v); }
+    }
+
+    fn resolve_raft(&self, data_dir: &Path) -> Option<RaftConfig> {
+        self.raft.as_ref().map(|rc| RaftConfig {
+            node_id: rc.node_id,
+            peers: rc.peers.clone(),
+            raft_store_dir: data_dir.join("raft"),
+            timing: Timing::default(),
+            snapshot_after_applies: rc.snapshot_after_applies.max(1),
+            bind: None,
+            peer_addrs: BTreeMap::new(),
+        })
     }
 
     fn resolve(&self, broker: &Config) -> Result<TopicConfig> {
@@ -144,18 +170,14 @@ struct TopicMeta {
 
 pub struct Topic {
     pub name: String,
-    pub partitions: Vec<Arc<Partition>>,
+    pub partitions: Vec<PartitionHandle>,
     pub rr_counter: AtomicU64,
     pub config: ArcSwap<TopicConfig>,
-    /// Cumulative counters used by the `/metrics` endpoint.
     pub records_produced_total: AtomicU64,
     pub bytes_produced_total: AtomicU64,
     pub records_consumed_total: AtomicU64,
     pub bytes_consumed_total: AtomicU64,
     meta_path: PathBuf,
-    /// Lives next to the runtime config so `update_config` can rewrite without
-    /// re-deriving from the resolved values (which would lose the "field unset"
-    /// distinction).
     persisted: std::sync::Mutex<PersistedTopicConfig>,
 }
 
@@ -184,6 +206,7 @@ impl Topic {
             .map(PersistedTopicConfig::from_patch)
             .unwrap_or_default();
         let resolved = persisted.resolve(broker)?;
+        let raft_cfg = persisted.resolve_raft(&broker.data_dir);
         let meta = TopicMeta {
             partitions,
             config: persisted.clone(),
@@ -194,11 +217,12 @@ impl Topic {
         for id in 0..partitions {
             let dir = topic_dir.join(id.to_string());
             std::fs::create_dir_all(&dir)?;
-            parts.push(Partition::open(
+            parts.push(PartitionHandle::open(
                 dir,
                 id,
                 resolved.segment_bytes,
                 broker.flush_every_records,
+                raft_cfg.as_ref(),
             )?);
         }
         Ok(Arc::new(Self {
@@ -215,6 +239,33 @@ impl Topic {
         }))
     }
 
+    /// Connect Raft transports for all Raft-backed partitions. Called after
+    /// the broker has bound its ports.
+    pub async fn connect_raft_transports(&self, raft_cfg: &RaftConfig) {
+        for (i, p) in self.partitions.iter().enumerate() {
+            if let Some(bind_addr) = raft_cfg.bind {
+                let tcfg = crate::raft_partition::RaftTransportConfig {
+                    bind: SocketAddr::new(bind_addr.ip(), bind_addr.port() + i as u16),
+                    peer_addrs: raft_cfg
+                        .peer_addrs
+                        .iter()
+                        .map(|(id, addr)| {
+                            (*id, SocketAddr::new(addr.ip(), addr.port() + i as u16))
+                        })
+                        .collect(),
+                };
+                if let Err(e) = p.connect_transport(tcfg).await {
+                    tracing::warn!(
+                        topic = %self.name,
+                        partition = i,
+                        error = %e,
+                        "raft transport connection failed; operating in single-node mode"
+                    );
+                }
+            }
+        }
+    }
+
     pub fn open(root: &Path, name: &str, broker: &Config) -> Result<Arc<Self>> {
         let topic_dir = root.join(name);
         let meta_path = topic_dir.join("topic.json");
@@ -223,14 +274,16 @@ impl Topic {
         let meta: TopicMeta = serde_json::from_slice(&meta_bytes)
             .with_context(|| format!("parse topic meta {:?}", meta_path))?;
         let resolved = meta.config.resolve(broker)?;
+        let raft_cfg = meta.config.resolve_raft(&broker.data_dir);
         let mut parts = Vec::with_capacity(meta.partitions as usize);
         for id in 0..meta.partitions {
             let dir = topic_dir.join(id.to_string());
-            parts.push(Partition::open(
+            parts.push(PartitionHandle::open(
                 dir,
                 id,
                 resolved.segment_bytes,
                 broker.flush_every_records,
+                raft_cfg.as_ref(),
             )?);
         }
         Ok(Arc::new(Self {
@@ -251,9 +304,6 @@ impl Topic {
         self.config.load_full()
     }
 
-    /// Merge a patch into the topic's persisted config, rewrite `topic.json`
-    /// atomically, swap the resolved config, and push any side-effects (live
-    /// segment-bytes update) into each partition.
     pub fn update_config(
         &self,
         patch: &TopicConfigPatch,
@@ -273,18 +323,13 @@ impl Topic {
         let resolved = Arc::new(resolved);
         self.config.store(resolved.clone());
 
-        // Live-propagate segment_bytes to every partition's atomic so the next
-        // append rolls against the new threshold.
         for p in &self.partitions {
-            p.segment_bytes.store(resolved.segment_bytes, Ordering::Release);
+            p.set_segment_bytes(resolved.segment_bytes);
         }
 
         Ok(resolved)
     }
 
-    /// Pick a partition for a record. Explicit `hint` wins; otherwise key-hash
-    /// when present (so the same key always lands on the same partition), else
-    /// round-robin.
     pub fn route(&self, key: Option<&[u8]>, hint: Option<u32>) -> Result<u32> {
         if let Some(h) = hint {
             if (h as usize) >= self.partitions.len() {

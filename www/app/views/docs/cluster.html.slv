@@ -1,0 +1,370 @@
+<div class="reveal">
+  <p class="font-mono text-[11px] tracking-[0.28em] uppercase text-indigo-300/80 mb-5">§06 · Cluster setup</p>
+  <h1 class="font-display text-[42px] md:text-[62px] leading-[1.0] tracking-[-0.025em] text-white font-light">
+    Raft consensus,
+    <span class="font-display italic text-indigo-200/90 font-light">multi-node</span>
+    replication.
+  </h1>
+</div>
+
+<div class="reveal d1 mt-7 flex items-start gap-3 p-4 rounded-xl bg-amber-400/[0.06] ring-1 ring-amber-300/20">
+  <span class="font-mono text-[10px] tracking-[0.2em] uppercase text-amber-300 mt-0.5">Steps 1+2 / N</span>
+  <p class="text-[13.5px] leading-relaxed text-slate-200">
+    A Raft consensus module lives under <code>crates/es-broker/src/raft/</code> with leader election and log replication working in isolation. Multi-broker partition replication — wiring Raft into the produce/consume paths — is the next major milestone. This page documents the current architecture and how to configure a cluster.
+  </p>
+</div>
+
+<p class="reveal d1 mt-7 text-[17px] leading-[1.7] text-slate-300 max-w-[58ch] font-light">
+  The Raft module implements the core Raft protocol (leader election, log replication, persistent state) with a TCP transport layer. It can run as a single-node cluster today — multi-node wiring into the partition log is deferred to a later step.
+</p>
+
+<div class="rule-x my-14"></div>
+
+<h2 id="architecture"><span class="num">§</span>Architecture</h2>
+<p>
+  Each Raft-backed partition has three layers:
+</p>
+
+<div class="grid grid-cols-1 md:grid-cols-3 gap-3 text-[13px] mt-6">
+  <div class="px-4 py-3 rounded-lg bg-white/[0.03] ring-1 ring-white/[0.06]">
+    <p class="font-mono text-[10px] tracking-[0.18em] uppercase text-indigo-300/80 mb-1">1 — Raft node</p>
+    <p class="text-slate-300">Election timeouts, leader heartbeat, log replication. Runs as a tokio task via <code>spawn_node</code>.</p>
+  </div>
+  <div class="px-4 py-3 rounded-lg bg-white/[0.03] ring-1 ring-white/[0.06]">
+    <p class="font-mono text-[10px] tracking-[0.18em] uppercase text-indigo-300/80 mb-1">2 — TCP transport</p>
+    <p class="text-slate-300">Per-peer persistent connections with magic-prefixed handshake and length-prefixed RPC frames.</p>
+  </div>
+  <div class="px-4 py-3 rounded-lg bg-white/[0.03] ring-1 ring-white/[0.06]">
+    <p class="font-mono text-[10px] tracking-[0.18em] uppercase text-indigo-300/80 mb-1">3 — Apply task</p>
+    <p class="text-slate-300">Watches committed Raft entries, decodes them, appends to the partition's segmented log.</p>
+  </div>
+</div>
+
+<h3>Component map</h3>
+<div class="codeblock">
+  <div class="codeblock-bar">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="label">raft module</span>
+    <span class="lang">source map</span>
+  </div>
+<pre><span class="c-fn">raft/state.rs</span>       <span class="c-com">Raft state machine: elections, log replication, commit</span>
+<span class="c-fn">raft/messages.rs</span>     <span class="c-com">Wire-format types (VoteRequest, AppendEntries, etc.)</span>
+<span class="c-fn">raft/node.rs</span>        <span class="c-com">Tokio task driver: timers, propose/committed streams</span>
+<span class="c-fn">raft/log.rs</span>         <span class="c-com">Persistent store trait + JSON-file + in-memory impls</span>
+<span class="c-fn">raft/transport.rs</span>    <span class="c-com">Per-peer TCP connections, reconnect, framing</span>
+<span class="c-fn">raft_partition.rs</span>    <span class="c-com">Partition→Raft integration (POC)</span></pre>
+</div>
+
+<h2 id="config"><span class="num">§</span>Configuration</h2>
+<p>
+  Enable the Raft cluster by passing these flags when starting the broker. Without <code>--raft-node-id</code>, the broker runs standalone — no Raft is started.
+</p>
+
+<div class="codeblock">
+  <div class="codeblock-bar">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="label">es-broker --help (raft flags)</span>
+    <span class="lang">cli</span>
+  </div>
+<pre><span class="c-fn">--raft-node-id</span> <span class="c-key">NODE_ID</span>       <span class="c-com">This broker's Raft node ID (u32)</span>
+<span class="c-fn">--raft-bind</span> <span class="c-key">ADDR</span>              <span class="c-com">TCP address for Raft RPCs (e.g. 0.0.0.0:6000)</span>
+<span class="c-fn">--raft-peer</span> <span class="c-key">NODE_ID:ADDR</span>      <span class="c-com">Repeatable: add a peer (id and its Raft address)</span></pre>
+</div>
+
+<p class="text-[14px] text-slate-400">
+  <strong>Example:</strong> a 3-node cluster would use <code>--raft-node-id 1 --raft-bind 0.0.0.0:6000 --raft-peer 2:10.0.1.2:6000 --raft-peer 3:10.0.1.3:6000</code> on node 1, and mirrored configs on nodes 2 and 3.
+</p>
+
+<p>
+  Internally these map to <code>BrokerConfig</code> fields in <code>config.rs</code>:
+</p>
+<ul>
+  <li><code>raft_node_id: Option&lt;u32&gt;</code> — set to enter Raft mode; omitted = standalone.</li>
+  <li><code>raft_bind: Option&lt;SocketAddr&gt;</code> — the TCP port this node listens on for Raft RPCs.</li>
+  <li><code>raft_peer_addrs: BTreeMap&lt;u32, SocketAddr&gt;</code> — map of peer node IDs to their Raft addresses.</li>
+</ul>
+
+<h2 id="single-node"><span class="num">§</span>Starting a single-node cluster</h2>
+<p>
+  A single-node Raft cluster is the simplest way to run with consensus — no peers, no network, just one node that elects itself leader and commits immediately.
+</p>
+
+<div class="codeblock">
+  <div class="codeblock-bar">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="label">terminal</span>
+    <span class="lang">shell</span>
+  </div>
+<pre><span class="c-dim"># Start a single-node Raft broker</span>
+<span class="c-add">es-broker</span> \
+  --raft-node-id 1 \
+  --raft-bind 127.0.0.1:6000 \
+  --data-dir ./data</pre>
+</div>
+
+<p class="mt-4">
+  With a single node:
+</p>
+<ul>
+  <li>The node starts as Follower, then promotes to Candidate, then to Leader — all within ~150-300&nbsp;ms (the election timeout).</li>
+  <li>There are no peers to contact, so votes are self-granted and append entries succeed immediately.</li>
+  <li>The Raft node's persistent store (<code>raft.json</code>) is written to <code>--data-dir</code> with atomic-rename + fsync.</li>
+  <li>The <code>RaftPartition</code> apply loop decodes committed entries and writes them into the segmented partition log.</li>
+</ul>
+
+<h3>What lands on disk</h3>
+<div class="codeblock">
+  <div class="codeblock-bar">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="label">./data</span>
+    <span class="lang">tree</span>
+  </div>
+<pre><span class="c-em">data/</span>
+├── topics/
+│   └── my-topic/
+│       ├── <span class="c-fn">topic.json</span>
+│       ├── 0/
+│       │   ├── <span class="c-fn">raft.json</span>            <span class="c-com">Raft persistent state (term, voted_for, log)</span>
+│       │   ├── <span class="c-fn">raft.snapshot.json</span>    <span class="c-com">Optional snapshot (compacted log prefix)</span>
+│       │   ├── <span class="c-key">00000000000000000000.log</span>
+│       │   └── <span class="c-key">00000000000000000000.index</span>
+│       └── 1/  ...</pre>
+</div>
+
+<h2 id="multi-node"><span class="num">§</span>Multi-node cluster setup</h2>
+<p>
+  For multi-node replication, start each broker with matching Raft configuration. The peer list must be symmetric — every node lists every other node. The transport layer establishes persistent TCP connections between all peers.
+</p>
+
+<h3>Example: 3-node cluster</h3>
+<div class="codeblock">
+  <div class="codeblock-bar">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="label">terminal — node 1</span>
+    <span class="lang">shell</span>
+  </div>
+<pre><span class="c-dim"># Node 1 (leader candidate)</span>
+<span class="c-add">es-broker</span> \
+  --raft-node-id 1 \
+  --raft-bind 0.0.0.0:6000 \
+  --raft-peer 2:10.0.0.2:6000 \
+  --raft-peer 3:10.0.0.3:6000 \
+  --data-dir ./data</pre>
+</div>
+
+<div class="codeblock">
+  <div class="codeblock-bar">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="label">terminal — node 2</span>
+    <span class="lang">shell</span>
+  </div>
+<pre><span class="c-dim"># Node 2 (follower)</span>
+<span class="c-add">es-broker</span> \
+  --raft-node-id 2 \
+  --raft-bind 0.0.0.0:6000 \
+  --raft-peer 1:10.0.0.1:6000 \
+  --raft-peer 3:10.0.0.3:6000 \
+  --data-dir ./data</pre>
+</div>
+
+<div class="codeblock">
+  <div class="codeblock-bar">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="label">terminal — node 3</span>
+    <span class="lang">shell</span>
+  </div>
+<pre><span class="c-dim"># Node 3 (follower)</span>
+<span class="c-add">es-broker</span> \
+  --raft-node-id 3 \
+  --raft-bind 0.0.0.0:6000 \
+  --raft-peer 1:10.0.0.1:6000 \
+  --raft-peer 2:10.0.0.2:6000 \
+  --data-dir ./data</pre>
+</div>
+
+<h3>What happens at startup</h3>
+<p>
+  When all three nodes boot with Raft enabled:
+</p>
+<ol>
+  <li>Each node initializes its <code>RaftState</code> (Follower, term 0, no vote).</li>
+  <li>Each loads its persistent state from <code>raft.json</code> (or starts fresh).</li>
+  <li>The transport layer binds to <code>--raft-bind</code> and dials every peer listed in <code>--raft-peer</code>.</li>
+  <li>TCP connections carry a <code>"RAFT"</code> magic-prefix handshake, then length-prefixed RPC frames.</li>
+  <li>After election timeout (150-300&nbsp;ms randomized), one node becomes Candidate, requests votes, and — if it wins a majority — becomes Leader.</li>
+  <li>The leader starts sending heartbeats (every 50&nbsp;ms) to maintain authority.</li>
+</ol>
+
+<div class="mt-6 flex items-start gap-3 p-4 rounded-xl bg-emerald-400/[0.06] ring-1 ring-emerald-400/20">
+  <span class="font-mono text-[10px] tracking-[0.2em] uppercase text-emerald-300 mt-0.5">Tip</span>
+  <p class="text-[13.5px] leading-relaxed text-slate-200">
+    The Raft TCP port (<code>--raft-bind</code>) is separate from the HTTP API port (<code>--bind</code>) and the binary protocol port (<code>--bind-binary</code>). All three can coexist on the same broker. The Raft port only carries internal consensus RPCs — clients never touch it.
+  </p>
+</div>
+
+<h2 id="replication-flow"><span class="num">§</span>Replication flow</h2>
+<p>
+  When a produce request arrives at the leader (via the RaftPartition integration), it follows this path:
+</p>
+
+<div class="mt-6 space-y-3">
+  <div class="flex items-start gap-4">
+    <span class="shrink-0 w-7 h-7 rounded-md bg-indigo-400/[0.08] ring-1 ring-indigo-400/20 flex items-center justify-center font-mono text-[11px] text-indigo-200">01</span>
+    <p class="text-[14.5px] text-slate-300"><strong>Propose.</strong> The producer calls <code>RaftPartition::append(key, value)</code>, which serializes the record and calls <code>NodeHandle::propose(payload)</code> on the Raft leader.</p>
+  </div>
+  <div class="flex items-start gap-4">
+    <span class="shrink-0 w-7 h-7 rounded-md bg-indigo-400/[0.08] ring-1 ring-indigo-400/20 flex items-center justify-center font-mono text-[11px] text-indigo-200">02</span>
+    <p class="text-[14.5px] text-slate-300"><strong>Replicate.</strong> The leader appends the entry to its own log, then sends <code>AppendEntries</code> to every follower. Each follower validates the prev-log-index/term consistency check, appends if it matches, or signals a conflict.</p>
+  </div>
+  <div class="flex items-start gap-4">
+    <span class="shrink-0 w-7 h-7 rounded-md bg-indigo-400/[0.08] ring-1 ring-indigo-400/20 flex items-center justify-center font-mono text-[11px] text-indigo-200">03</span>
+    <p class="text-[14.5px] text-slate-300"><strong>Commit.</strong> Once the entry is replicated to a majority of nodes (quorum = floor(N/2) + 1), the leader advances <code>commit_index</code>. The next heartbeat notifies followers of the new commit point.</p>
+  </div>
+  <div class="flex items-start gap-4">
+    <span class="shrink-0 w-7 h-7 rounded-md bg-indigo-400/[0.08] ring-1 ring-indigo-400/20 flex items-center justify-center font-mono text-[11px] text-indigo-200">04</span>
+    <p class="text-[14.5px] text-slate-300"><strong>Apply.</strong> The committed entry is pushed to the apply task, which decodes the append command (key + value), writes it to the partition's segmented <code>.log</code>, and signals the waiting producer with the assigned partition offset.</p>
+  </div>
+</div>
+
+<p class="text-[14px] text-slate-400 mt-4">
+  Per Raft §5.4.2, a freshly re-elected leader cannot directly commit entries from prior terms by counting replicas alone — <code>commit_index</code> stays at the last snapshot boundary until a new-term proposal lands, which then sweeps prior entries up to committed transitively.
+</p>
+
+<h2 id="transport"><span class="num">§</span>TCP transport</h2>
+<p>
+  The transport layer forms a full mesh of persistent TCP connections between all Raft peers. Every node both listens (for inbound peer connections) and dials (for outbound to each peer).
+</p>
+
+<h3>Wire protocol</h3>
+<div class="codeblock">
+  <div class="codeblock-bar">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="label">handshake</span>
+    <span class="lang">layout · BE</span>
+  </div>
+<pre><span class="c-fn">magic</span>      <span class="c-key">[u8; 4]</span>   <span class="c-str">"RAFT"</span> — connection type identifier
+<span class="c-fn">node_id</span>    <span class="c-key">u32 BE</span>    sender's Raft node ID</pre>
+</div>
+
+<p class="text-[14px] text-slate-400 mt-3">
+  After the handshake, each frame is:
+</p>
+<div class="codeblock">
+  <div class="codeblock-bar">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="label">frame</span>
+    <span class="lang">layout · BE</span>
+  </div>
+<pre><span class="c-fn">length</span>      <span class="c-key">u32 BE</span>    byte count of the encoded message body
+<span class="c-fn">body</span>        <span class="c-key">bytes</span>     <span class="c-com">Message::encode() output (max 1 MiB)</span></pre>
+</div>
+
+<h3>Reconnect policy</h3>
+<p>
+  On disconnect or dial failure, the transport sleeps for a fixed <code>reconnect_backoff</code> (2&nbsp;s) and retries. No exponential backoff in the current implementation.
+</p>
+
+<h3>Message routing</h3>
+<ul>
+  <li><strong>Outbound::SendTo(peer, msg)</strong> — unicast a message to a specific peer.</li>
+  <li><strong>Outbound::Broadcast(msg)</strong> — send to every connected peer.</li>
+  <li>Inbound messages (from accept) are pushed directly to the node's <code>inbound</code> channel.</li>
+</ul>
+
+<h2 id="snapshots"><span class="num">§</span>Snapshots & compaction</h2>
+<p>
+  Without snapshots, the persisted Raft log (<code>raft.json</code>) grows on every append — each rewrite serializes the entire log, so the cost scales linearly with log size. Snapshots cap this:
+</p>
+<ul>
+  <li><code>NodeHandle::take_snapshot(data)</code> captures a snapshot at the current <code>last_applied</code> index.</li>
+  <li>The application supplies opaque snapshot data (for RaftPartition, just the partition's <code>end_offset</code>).</li>
+  <li>The broker writes <code>raft.snapshot.json</code> and compacts the in-memory log — <code>base_index</code> and <code>base_term</code> advance past the snapshot point.</li>
+  <li>On restart: snapshot loads first, then the persisted log loads on top with its <code>base_index</code> set from the snapshot. <code>commit_index</code> and <code>last_applied</code> jump straight to the snapshot point.</li>
+  <li><code>RaftPartitionConfig::snapshot_after_applies</code> (default 1024) triggers automatic snapshots in the apply loop.</li>
+</ul>
+
+<p class="text-[14px] text-slate-400">
+  Application-driven trigger only — no automatic time/size-based snapshot threshold yet. The <code>InstallSnapshot</code> RPC for catching up far-behind followers over the wire is deferred.
+</p>
+
+<h2 id="limitations"><span class="num">§</span>Current limitations</h2>
+
+<div class="mt-6 space-y-3">
+  <div class="flex items-start gap-4">
+    <span class="shrink-0 w-7 h-7 rounded-md bg-rose-400/[0.08] ring-1 ring-rose-400/20 flex items-center justify-center font-mono text-[11px] text-rose-200">01</span>
+    <p class="text-[14.5px] text-slate-300"><strong>Multi-broker partition replication not wired.</strong> The Raft module works in isolation; the HTTP/binary produce paths still write to <code>Partition</code> directly. Replacing <code>Topic::partitions</code> with <code>RaftPartition</code> across all I/O paths is a multi-day broker rewrite.</p>
+  </div>
+  <div class="flex items-start gap-4">
+    <span class="shrink-0 w-7 h-7 rounded-md bg-rose-400/[0.08] ring-1 ring-rose-400/20 flex items-center justify-center font-mono text-[11px] text-rose-200">02</span>
+    <p class="text-[14.5px] text-slate-300"><strong>No leader routing in the produce path.</strong> The <code>ProposeReply::NotLeader</code> variant carries a leader hint, but callers must retry manually — the HTTP handler doesn't redirect yet.</p>
+  </div>
+  <div class="flex items-start gap-4">
+    <span class="shrink-0 w-7 h-7 rounded-md bg-rose-400/[0.08] ring-1 ring-rose-400/20 flex items-center justify-center font-mono text-[11px] text-rose-200">03</span>
+    <p class="text-[14.5px] text-slate-300"><strong>No InstallSnapshot RPC.</strong> Far-behind followers cannot catch up via snapshot transfer — they must replay the full log.</p>
+  </div>
+  <div class="flex items-start gap-4">
+    <span class="shrink-0 w-7 h-7 rounded-md bg-rose-400/[0.08] ring-1 ring-rose-400/20 flex items-center justify-center font-mono text-[11px] text-rose-200">04</span>
+    <p class="text-[14.5px] text-slate-300"><strong>No membership changes.</strong> The cluster membership is static — adding or removing nodes requires restarting all brokers with updated peer lists.</p>
+  </div>
+  <div class="flex items-start gap-4">
+    <span class="shrink-0 w-7 h-7 rounded-md bg-rose-400/[0.08] ring-1 ring-rose-400/20 flex items-center justify-center font-mono text-[11px] text-rose-200">05</span>
+    <p class="text-[14.5px] text-slate-300"><strong>No linearizable reads.</strong> Read-index or lease-based linearizable client reads are not implemented.</p>
+  </div>
+  <div class="flex items-start gap-4">
+    <span class="shrink-0 w-7 h-7 rounded-md bg-rose-400/[0.08] ring-1 ring-rose-400/20 flex items-center justify-center font-mono text-[11px] text-rose-200">06</span>
+    <p class="text-[14.5px] text-slate-300"><strong>Performance work deferred.</strong> No batching of AppendEntries, no pipelining of replication — each entry is replicated individually.</p>
+  </div>
+</div>
+
+<h2 id="what-works"><span class="num">§</span>What works today</h2>
+<div class="mt-6 flex items-start gap-3 p-4 rounded-xl bg-emerald-400/[0.06] ring-1 ring-emerald-400/20">
+  <span class="font-mono text-[10px] tracking-[0.2em] uppercase text-emerald-300 mt-0.5">Shipping</span>
+  <p class="text-[13.5px] leading-relaxed text-slate-200">
+    The core Raft protocol is implemented and tested — leader election, log replication, persistent storage, TCP transport, and the RaftPartition integration proof-of-concept all pass integration tests.
+  </p>
+</div>
+
+<ul>
+  <li><strong>State machine</strong> (<code>raft/state.rs</code>): pure, deterministic. Follower → Candidate → Leader transitions; per-term vote semantics; higher-term step-down; up-to-date check from §5.4.1.</li>
+  <li><strong>Log replication</strong>: leader tracks <code>next_index</code>/<code>match_index</code> per peer; AppendEntries ships real entries with prev-log-index/term consistency check; conflicting follower entries are truncated; commit advances when an entry of the current term is replicated to a majority (§5.4.2).</li>
+  <li><strong>Persistent store</strong> (<code>raft/log.rs</code>): <code>RaftStore</code> trait with JSON-file (atomic-rename + fsync) and in-memory implementations. <code>current_term</code>, <code>voted_for</code>, and the log are persisted before RPCs return.</li>
+  <li><strong>Node driver</strong> (<code>raft/node.rs</code>): tokio task with randomized election timeout (150-300&nbsp;ms default) + heartbeat tick (50&nbsp;ms when Leader). Exposes <code>propose(payload)</code> on the leader and a <code>committed</code> stream of applied entries.</li>
+  <li><strong>TCP transport</strong> (<code>raft/transport.rs</code>): per-peer persistent connection, magic-prefixed handshake, length-prefixed message frames, reconnect on drop.</li>
+  <li><strong>Integration tests</strong>: leader election (in-process + real TCP), 3-node propose-and-converge, propose-to-follower rejection, persistent-store-survives-restart.</li>
+</ul>
+
+<h2 id="source-map"><span class="num">§</span>Source map</h2>
+<div class="grid grid-cols-1 md:grid-cols-2 gap-2 mt-4 text-[13px]">
+  <div class="flex items-center gap-3 px-4 py-2.5 rounded-md bg-white/[0.025] ring-1 ring-white/[0.06]">
+    <span class="font-mono text-[10.5px] tracking-[0.16em] uppercase text-indigo-300/80">raft/state.rs</span>
+    <span class="ml-auto text-slate-400 text-[12.5px]">elections + log replication</span>
+  </div>
+  <div class="flex items-center gap-3 px-4 py-2.5 rounded-md bg-white/[0.025] ring-1 ring-white/[0.06]">
+    <span class="font-mono text-[10.5px] tracking-[0.16em] uppercase text-indigo-300/80">raft/node.rs</span>
+    <span class="ml-auto text-slate-400 text-[12.5px]">tokio driver + propose/commit</span>
+  </div>
+  <div class="flex items-center gap-3 px-4 py-2.5 rounded-md bg-white/[0.025] ring-1 ring-white/[0.06]">
+    <span class="font-mono text-[10.5px] tracking-[0.16em] uppercase text-indigo-300/80">raft/messages.rs</span>
+    <span class="ml-auto text-slate-400 text-[12.5px]">RPC wire types</span>
+  </div>
+  <div class="flex items-center gap-3 px-4 py-2.5 rounded-md bg-white/[0.025] ring-1 ring-white/[0.06]">
+    <span class="font-mono text-[10.5px] tracking-[0.16em] uppercase text-indigo-300/80">raft/log.rs</span>
+    <span class="ml-auto text-slate-400 text-[12.5px]">persistent store trait + impl</span>
+  </div>
+  <div class="flex items-center gap-3 px-4 py-2.5 rounded-md bg-white/[0.025] ring-1 ring-white/[0.06]">
+    <span class="font-mono text-[10.5px] tracking-[0.16em] uppercase text-indigo-300/80">raft/transport.rs</span>
+    <span class="ml-auto text-slate-400 text-[12.5px]">TCP mesh + framing</span>
+  </div>
+  <div class="flex items-center gap-3 px-4 py-2.5 rounded-md bg-white/[0.025] ring-1 ring-white/[0.06]">
+    <span class="font-mono text-[10.5px] tracking-[0.16em] uppercase text-indigo-300/80">raft_partition.rs</span>
+    <span class="ml-auto text-slate-400 text-[12.5px]">Partition→Raft POC</span>
+  </div>
+  <div class="flex items-center gap-3 px-4 py-2.5 rounded-md bg-white/[0.025] ring-1 ring-white/[0.06]">
+    <span class="font-mono text-[10.5px] tracking-[0.16em] uppercase text-indigo-300/80">config.rs</span>
+    <span class="ml-auto text-slate-400 text-[12.5px]">Raft cluster config fields</span>
+  </div>
+  <div class="flex items-center gap-3 px-4 py-2.5 rounded-md bg-white/[0.025] ring-1 ring-white/[0.06]">
+    <span class="font-mono text-[10.5px] tracking-[0.16em] uppercase text-indigo-300/80">topic.rs</span>
+    <span class="ml-auto text-slate-400 text-[12.5px]">Topic → RaftPartition wiring</span>
+  </div>
+</div>

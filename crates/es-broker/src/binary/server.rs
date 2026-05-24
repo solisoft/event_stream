@@ -183,7 +183,7 @@ async fn read_frame(
         Err(e) => return Err(e),
     }
     let total = u32::from_be_bytes(len_buf);
-    if total < 5 || total > MAX_FRAME_BYTES {
+    if !(5..=MAX_FRAME_BYTES).contains(&total) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("frame size {} out of bounds", total),
@@ -301,7 +301,9 @@ async fn dispatch(
                     .map_err(|e| format!("route: {}", e))?;
 
                 if let Some(pid) = &req.producer_id {
-                    let seq = r.sequence.unwrap();
+                    let seq = r
+                        .sequence
+                        .expect("sequence must be present when producer_id is set");
                     match broker
                         .producers
                         .check_and_advance(pid, &req.topic, partition_id, seq)
@@ -342,7 +344,14 @@ async fn dispatch(
                 if let Some(pid) = &req.producer_id {
                     broker
                         .producers
-                        .record_offset(pid, &req.topic, partition_id, r.sequence.unwrap(), offset)
+                        .record_offset(
+                            pid,
+                            &req.topic,
+                            partition_id,
+                            r.sequence
+                                .expect("sequence must be present when producer_id is set"),
+                            offset,
+                        )
                         .await;
                 }
                 total_appended += r.key.as_ref().map(|k| k.len() as u64).unwrap_or(0)

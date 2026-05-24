@@ -269,7 +269,7 @@ async fn read_frame(
         Err(e) => return Err(e.into()),
     }
     let total = u32::from_be_bytes(len_buf);
-    if total < 5 || total > 64 * 1024 * 1024 {
+    if !(5..=64 * 1024 * 1024).contains(&total) {
         return Err(anyhow!("invalid frame size {}", total));
     }
     let mut frame = vec![0u8; total as usize];

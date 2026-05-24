@@ -18,6 +18,8 @@ pub const TAG_REQUEST_VOTE: u8 = 0x01;
 pub const TAG_REQUEST_VOTE_RESP: u8 = 0x02;
 pub const TAG_APPEND_ENTRIES: u8 = 0x03;
 pub const TAG_APPEND_ENTRIES_RESP: u8 = 0x04;
+pub const TAG_INSTALL_SNAPSHOT: u8 = 0x05;
+pub const TAG_INSTALL_SNAPSHOT_RESP: u8 = 0x06;
 
 /// Node identifier. Hand-assigned via CLI in step 1; later a discovery service.
 pub type NodeId = u32;
@@ -66,6 +68,24 @@ pub struct AppendEntriesResp {
 }
 
 #[derive(Debug, Clone)]
+pub struct InstallSnapshot {
+    pub term: Term,
+    pub leader_id: NodeId,
+    pub last_index: LogIndex,
+    pub last_term: Term,
+    pub offset: u64,
+    pub done: bool,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InstallSnapshotResp {
+    pub term: Term,
+    pub success: bool,
+    pub responder_id: NodeId,
+}
+
+#[derive(Debug, Clone)]
 pub struct LogEntry {
     pub term: Term,
     pub index: LogIndex,
@@ -78,6 +98,8 @@ pub enum Message {
     RequestVoteResp(RequestVoteResp),
     AppendEntries(AppendEntries),
     AppendEntriesResp(AppendEntriesResp),
+    InstallSnapshot(InstallSnapshot),
+    InstallSnapshotResp(InstallSnapshotResp),
 }
 
 impl Message {
@@ -87,6 +109,8 @@ impl Message {
             Self::RequestVoteResp(m) => m.term,
             Self::AppendEntries(m) => m.term,
             Self::AppendEntriesResp(m) => m.term,
+            Self::InstallSnapshot(m) => m.term,
+            Self::InstallSnapshotResp(m) => m.term,
         }
     }
 
@@ -127,6 +151,23 @@ impl Message {
                 buf.push(if m.success { 1 } else { 0 });
                 buf.extend_from_slice(&m.responder_id.to_be_bytes());
                 buf.extend_from_slice(&m.match_index.to_be_bytes());
+            }
+            Self::InstallSnapshot(m) => {
+                buf.push(TAG_INSTALL_SNAPSHOT);
+                buf.extend_from_slice(&m.term.to_be_bytes());
+                buf.extend_from_slice(&m.leader_id.to_be_bytes());
+                buf.extend_from_slice(&m.last_index.to_be_bytes());
+                buf.extend_from_slice(&m.last_term.to_be_bytes());
+                buf.extend_from_slice(&m.offset.to_be_bytes());
+                buf.push(if m.done { 1 } else { 0 });
+                buf.extend_from_slice(&(m.data.len() as u32).to_be_bytes());
+                buf.extend_from_slice(&m.data);
+            }
+            Self::InstallSnapshotResp(m) => {
+                buf.push(TAG_INSTALL_SNAPSHOT_RESP);
+                buf.extend_from_slice(&m.term.to_be_bytes());
+                buf.push(if m.success { 1 } else { 0 });
+                buf.extend_from_slice(&m.responder_id.to_be_bytes());
             }
         }
         buf
@@ -179,6 +220,30 @@ impl Message {
                 success: r.u8()? != 0,
                 responder_id: r.u32()?,
                 match_index: r.u64()?,
+            })),
+            TAG_INSTALL_SNAPSHOT => {
+                let term = r.u64()?;
+                let leader_id = r.u32()?;
+                let last_index = r.u64()?;
+                let last_term = r.u64()?;
+                let offset = r.u64()?;
+                let done = r.u8()? != 0;
+                let data_len = r.u32()? as usize;
+                let data = r.bytes(data_len)?;
+                Ok(Self::InstallSnapshot(InstallSnapshot {
+                    term,
+                    leader_id,
+                    last_index,
+                    last_term,
+                    offset,
+                    done,
+                    data,
+                }))
+            }
+            TAG_INSTALL_SNAPSHOT_RESP => Ok(Self::InstallSnapshotResp(InstallSnapshotResp {
+                term: r.u64()?,
+                success: r.u8()? != 0,
+                responder_id: r.u32()?,
             })),
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,

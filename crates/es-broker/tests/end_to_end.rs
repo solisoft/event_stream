@@ -1522,7 +1522,7 @@ async fn boot_with_binary(
     if auth {
         cfg.auth_mode = AuthMode::Required;
     }
-    Ok(spawn(cfg).await?)
+    spawn(cfg).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1659,7 +1659,6 @@ async fn binary_concurrent_connections_stay_independent() -> Result<()> {
     let bin_addr = handle.binary_addr.unwrap();
     let mut tasks = Vec::new();
     for worker in 0..4u32 {
-        let bin_addr = bin_addr;
         tasks.push(tokio::spawn(async move {
             let mut client = BinaryClient::connect(bin_addr, "").await.unwrap();
             let mut offsets = Vec::new();
@@ -1689,8 +1688,8 @@ async fn binary_concurrent_connections_stay_independent() -> Result<()> {
     all.sort();
     // 4 workers × 25 records = 100 unique offsets.
     assert_eq!(all.len(), 100);
-    for i in 0..100 {
-        assert_eq!(all[i], i as u64);
+    for (i, v) in all.iter().enumerate().take(100) {
+        assert_eq!(*v, i as u64);
     }
 
     handle.shutdown().await?;
@@ -1778,8 +1777,8 @@ async fn pipelined_client_runs_many_concurrent_produces() -> Result<()> {
     // All 50 records must land on distinct, contiguous offsets — the broker's
     // per-connection frame loop preserves ordering of incoming frames.
     assert_eq!(offsets.len(), 50);
-    for i in 0..50 {
-        assert_eq!(offsets[i], i as u64, "non-contiguous offsets after pipelining");
+    for (i, v) in offsets.iter().enumerate().take(50) {
+        assert_eq!(*v, i as u64, "non-contiguous offsets after pipelining");
     }
 
     client.shutdown().await;
@@ -1981,7 +1980,7 @@ async fn leave_preserves_remaining_members_partitions_when_possible() -> Result<
 
     // After three members + four partitions, target_max = 2. Capture state.
     let a0 = fetch_assignment(&client, &base, "g", &a.member_id).await?;
-    let c0 = fetch_assignment(&client, &base, "g", &c.member_id).await?;
+    let _c0 = fetch_assignment(&client, &base, "g", &c.member_id).await?;
 
     // B leaves. Sticky rebalance: target_max becomes 2 still (4/2 = 2),
     // a and c keep what they had, b's partition goes to whichever has room.

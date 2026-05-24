@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title><%= title %></title>
+  <link rel="stylesheet" href="<%= public_path("css/application.css") %>">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300..700;1,9..144,300..600&family=Manrope:wght@300..800&family=JetBrains+Mono:wght@400;500&display=swap">
+
+  <style>
+    :root {
+      --ink-display: 'Fraunces', 'Iowan Old Style', 'Apple Garamond', Georgia, serif;
+      --ink-body:    'Manrope', ui-sans-serif, system-ui, sans-serif;
+      --ink-mono:    'JetBrains Mono', 'SF Mono', 'Menlo', monospace;
+    }
+    html, body { font-family: var(--ink-body); font-feature-settings: 'ss03', 'cv11'; }
+    .font-display { font-family: var(--ink-display); font-feature-settings: 'ss01'; }
+    .font-mono    { font-family: var(--ink-mono);   font-feature-settings: 'zero', 'ss02'; }
+
+    /* Selection */
+    ::selection { background: rgba(165, 180, 252, 0.25); color: #fff; }
+
+    /* Subtle film-grain background */
+    .grain {
+      background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 200 200'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 1  0 0 0 0 1  0 0 0 0 1  0 0 0 .06 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+    }
+
+    /* Hairline rules used between sections */
+    .rule-x { background-image: linear-gradient(to right, transparent, rgba(148,163,184,0.25) 20%, rgba(148,163,184,0.25) 80%, transparent); height: 1px; }
+
+    /* Article body typography */
+    article.body p           { color: rgb(203 213 225 / 0.92); line-height: 1.78; font-weight: 300; letter-spacing: -0.005em; }
+    article.body p + p       { margin-top: 1rem; }
+    article.body strong      { color: #fff; font-weight: 600; }
+    article.body em          { font-style: italic; color: rgb(226 232 240); }
+    article.body a           { color: #c7d2fe; text-decoration: underline; text-decoration-color: rgba(199,210,254,0.35); text-underline-offset: 4px; }
+    article.body a:hover     { text-decoration-color: #c7d2fe; }
+    article.body h2          { font-family: var(--ink-display); font-weight: 300; font-size: 2rem; line-height: 1.15; letter-spacing: -0.022em; color: #fff; margin-top: 4rem; margin-bottom: 0.75rem; scroll-margin-top: 6rem; }
+    article.body h2 .num     { font-family: var(--ink-display); font-style: italic; font-size: 0.7em; color: rgb(165 180 252 / 0.85); margin-right: 0.5rem; letter-spacing: -0.01em; }
+    article.body h2:hover .anchor { opacity: 1; transform: translateX(0); }
+    article.body h2 .anchor  { font-family: var(--ink-mono); font-size: 0.7em; font-weight: 400; color: rgb(165 180 252 / 0.6); margin-left: 0.5rem; opacity: 0; transform: translateX(-4px); transition: all .2s ease-out; }
+    article.body h3          { font-family: var(--ink-mono); font-size: 0.72rem; font-weight: 500; letter-spacing: 0.18em; text-transform: uppercase; color: rgb(165 180 252 / 0.9); margin-top: 2.25rem; margin-bottom: 0.65rem; }
+    article.body ul, article.body ol { margin: 0.75rem 0 1rem 0; }
+    article.body ul li, article.body ol li { color: rgb(203 213 225 / 0.92); line-height: 1.7; padding-left: 0.5rem; font-weight: 300; }
+    article.body ul { list-style: none; }
+    article.body ul li { position: relative; padding-left: 1.25rem; }
+    article.body ul li::before { content: ""; position: absolute; left: 0; top: 0.7em; width: 6px; height: 1px; background: rgb(165 180 252 / 0.6); }
+    article.body ol { list-style-position: outside; padding-left: 1.25rem; }
+    article.body ol li::marker { color: rgb(165 180 252 / 0.7); font-family: var(--ink-mono); font-size: 0.85em; }
+    article.body code:not(pre code) {
+      font-family: var(--ink-mono); font-size: 0.86em;
+      color: #ddd6fe; background: rgb(99 102 241 / 0.10);
+      padding: 0.12em 0.45em; border-radius: 4px;
+      box-shadow: inset 0 0 0 1px rgb(99 102 241 / 0.18);
+    }
+
+    /* Code blocks — terminal chrome */
+    .codeblock {
+      position: relative;
+      border-radius: 0.875rem;
+      background: linear-gradient(180deg, rgba(15,23,42,0.85), rgba(2,6,23,0.92));
+      box-shadow: inset 0 0 0 1px rgba(148,163,184,0.10), 0 12px 36px -18px rgba(99,102,241,0.18);
+      overflow: hidden;
+      margin: 1.25rem 0 1.5rem;
+    }
+    .codeblock-bar {
+      display: flex; align-items: center; gap: 0.5rem;
+      padding: 0.5rem 0.85rem;
+      border-bottom: 1px solid rgba(148,163,184,0.08);
+      background: rgba(15,23,42,0.55);
+    }
+    .codeblock-bar .dot { width: 9px; height: 9px; border-radius: 999px; }
+    .codeblock-bar .dot.r { background: #f87171; }
+    .codeblock-bar .dot.y { background: #fbbf24; }
+    .codeblock-bar .dot.g { background: #34d399; }
+    .codeblock-bar .label { margin-left: 0.5rem; font-family: var(--ink-mono); font-size: 0.7rem; color: rgb(148 163 184 / 0.7); letter-spacing: 0.04em; }
+    .codeblock-bar .lang { margin-left: auto; font-family: var(--ink-mono); font-size: 0.65rem; color: rgb(165 180 252 / 0.65); letter-spacing: 0.14em; text-transform: uppercase; }
+    .codeblock pre {
+      margin: 0;
+      padding: 1rem 1.1rem 1.1rem;
+      font-family: var(--ink-mono);
+      font-size: 0.82rem;
+      line-height: 1.7;
+      color: rgb(226 232 240 / 0.94);
+      overflow-x: auto;
+    }
+    .codeblock pre .c-com  { color: rgb(148 163 184 / 0.55); font-style: italic; }
+    .codeblock pre .c-key  { color: #c4b5fd; }
+    .codeblock pre .c-str  { color: #fde68a; }
+    .codeblock pre .c-num  { color: #5eead4; }
+    .codeblock pre .c-fn   { color: #a5b4fc; }
+    .codeblock pre .c-em   { color: #fff; }
+    .codeblock pre .c-add  { color: #6ee7b7; }
+    .codeblock pre .c-dim  { color: rgb(148 163 184 / 0.65); }
+
+    /* HTTP method chips */
+    .verb {
+      display: inline-block; font-family: var(--ink-mono); font-size: 0.66rem;
+      letter-spacing: 0.16em; padding: 0.18rem 0.45rem; border-radius: 0.3rem;
+      font-weight: 600; min-width: 3rem; text-align: center;
+    }
+    .verb.get    { color: #6ee7b7; background: rgba(16,185,129,0.08); box-shadow: inset 0 0 0 1px rgba(16,185,129,0.28); }
+    .verb.post   { color: #93c5fd; background: rgba(59,130,246,0.08); box-shadow: inset 0 0 0 1px rgba(59,130,246,0.28); }
+    .verb.put    { color: #fcd34d; background: rgba(245,158,11,0.08); box-shadow: inset 0 0 0 1px rgba(245,158,11,0.28); }
+    .verb.delete { color: #fda4af; background: rgba(244,63,94,0.08); box-shadow: inset 0 0 0 1px rgba(244,63,94,0.28); }
+
+    /* Sidebar */
+    .side-link { position: relative; }
+    .side-link::before {
+      content: ""; position: absolute; left: -0.7rem; top: 50%; transform: translateY(-50%);
+      width: 4px; height: 4px; border-radius: 999px;
+      background: rgb(165 180 252 / 0); transition: background .2s ease-out;
+    }
+    .side-link:hover::before { background: rgb(165 180 252 / 0.6); }
+    .side-link.active {
+      color: #fff;
+      background: linear-gradient(90deg, rgba(99,102,241,0.16), rgba(99,102,241,0));
+    }
+    .side-link.active::before { background: linear-gradient(180deg, #818cf8, #c084fc); width: 2px; height: 1.1rem; border-radius: 2px; }
+    .side-link.active .ch { color: #c7d2fe; }
+
+    /* Sticky table-of-contents (right rail) */
+    .toc a              { display: block; padding: 0.3rem 0; color: rgb(148 163 184 / 0.85); font-size: 0.83rem; line-height: 1.4; transition: color .15s; }
+    .toc a:hover        { color: #fff; }
+    .toc a.is-current   { color: #c7d2fe; }
+    .toc a.is-current::before { content: "● "; color: #818cf8; font-size: 0.6em; vertical-align: middle; margin-right: 0.25rem; }
+
+    /* Page-entrance animation */
+    .reveal { opacity: 0; transform: translateY(8px); animation: reveal .7s cubic-bezier(.22,.61,.36,1) forwards; }
+    .reveal.d1 { animation-delay: 0.05s; }
+    .reveal.d2 { animation-delay: 0.12s; }
+    .reveal.d3 { animation-delay: 0.20s; }
+    .reveal.d4 { animation-delay: 0.28s; }
+    @keyframes reveal { to { opacity: 1; transform: translateY(0); } }
+
+    /* Custom scrollbar */
+    ::-webkit-scrollbar              { width: 10px; height: 10px; }
+    ::-webkit-scrollbar-track        { background: transparent; }
+    ::-webkit-scrollbar-thumb        { background: rgba(148,163,184,0.18); border-radius: 999px; border: 2px solid transparent; background-clip: padding-box; }
+    ::-webkit-scrollbar-thumb:hover  { background: rgba(165,180,252,0.35); background-clip: padding-box; border: 2px solid transparent; }
+  </style>
+</head>
+<body class="min-h-full bg-slate-950 text-white antialiased">
+
+  <!-- Atmosphere -->
+  <div class="fixed inset-0 pointer-events-none -z-10">
+    <div class="absolute inset-0 bg-slate-950"></div>
+    <div class="absolute inset-0 bg-[radial-gradient(ellipse_70%_55%_at_85%_-10%,rgba(99,102,241,0.18),transparent_60%)]"></div>
+    <div class="absolute inset-0 bg-[radial-gradient(ellipse_60%_45%_at_5%_110%,rgba(168,85,247,0.10),transparent_65%)]"></div>
+    <div class="absolute inset-0 bg-[linear-gradient(rgba(255,255,255,0.022)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.022)_1px,transparent_1px)] bg-[size:80px_80px]"></div>
+    <div class="absolute inset-0 grain opacity-[0.35] mix-blend-screen"></div>
+  </div>
+
+  <!-- Top bar -->
+  <header class="sticky top-0 z-40 backdrop-blur-md border-b border-white/[0.06] bg-slate-950/65">
+    <div class="max-w-[1340px] mx-auto px-6 lg:px-10 h-14 flex items-center gap-5">
+      <a href="<%= root_path() %>" class="flex items-center gap-2.5 group">
+        <span class="inline-block w-2 h-2 rounded-full bg-emerald-400 shadow-[0_0_12px_rgba(52,211,153,0.6)]"></span>
+        <span class="font-display text-[15px] tracking-tight text-white">es<span class="font-display italic font-light text-slate-400">.docs</span></span>
+      </a>
+      <span class="hidden md:inline-block h-4 w-px bg-white/10"></span>
+      <span class="hidden md:inline-block text-[11px] font-mono tracking-[0.16em] text-slate-400/80 uppercase">
+        <% if section == "overview" %>§01 · Overview<% end %>
+        <% if section == "demo" %>§02 · Quickstart<% end %>
+        <% if section == "api" %>§03 · HTTP API<% end %>
+        <% if section == "cli" %>§04 · CLI<% end %>
+        <% if section == "storage" %>§05 · Storage<% end %>
+        <% if section == "cluster" %>§06 · Cluster<% end %>
+      </span>
+      <div class="ml-auto flex items-center gap-4">
+        <span class="hidden md:inline-block font-mono text-[10px] tracking-[0.15em] text-slate-500 uppercase">v0.1.0 · rust 1.95</span>
+        <a href="<%= root_path() %>" class="text-xs font-mono tracking-[0.15em] uppercase text-slate-400 hover:text-white transition">← Home</a>
+      </div>
+    </div>
+  </header>
+
+  <div class="max-w-[1340px] mx-auto px-6 lg:px-10 py-12 lg:py-16 grid grid-cols-1 lg:grid-cols-[220px_minmax(0,1fr)] xl:grid-cols-[220px_minmax(0,1fr)_220px] gap-x-12 lg:gap-x-14">
+
+    <!-- Left nav -->
+    <aside class="hidden lg:block">
+      <div class="sticky top-24">
+        <p class="font-mono text-[10px] tracking-[0.22em] uppercase text-slate-500 mb-3">Get started</p>
+        <ul class="space-y-0.5 mb-7">
+          <li>
+            <a href="<%= docs_path() %>" class="side-link <% if section == "overview" %>active<% end %> flex items-baseline gap-3 px-3 py-1.5 rounded-md text-[13.5px] text-slate-300 hover:text-white transition">
+              <span class="ch font-mono text-[10.5px] tracking-widest text-slate-500">01</span>
+              <span>Overview</span>
+            </a>
+          </li>
+          <li>
+            <a href="<%= docs_demo_path() %>" class="side-link <% if section == "demo" %>active<% end %> flex items-baseline gap-3 px-3 py-1.5 rounded-md text-[13.5px] text-slate-300 hover:text-white transition">
+              <span class="ch font-mono text-[10.5px] tracking-widest text-slate-500">02</span>
+              <span>Quickstart demo</span>
+            </a>
+          </li>
+        </ul>
+
+        <p class="font-mono text-[10px] tracking-[0.22em] uppercase text-slate-500 mb-3">Reference</p>
+        <ul class="space-y-0.5 mb-7">
+          <li>
+            <a href="<%= docs_api_path() %>" class="side-link <% if section == "api" %>active<% end %> flex items-baseline gap-3 px-3 py-1.5 rounded-md text-[13.5px] text-slate-300 hover:text-white transition">
+              <span class="ch font-mono text-[10.5px] tracking-widest text-slate-500">03</span>
+              <span>HTTP API</span>
+            </a>
+          </li>
+          <li>
+            <a href="<%= docs_cli_path() %>" class="side-link <% if section == "cli" %>active<% end %> flex items-baseline gap-3 px-3 py-1.5 rounded-md text-[13.5px] text-slate-300 hover:text-white transition">
+              <span class="ch font-mono text-[10.5px] tracking-widest text-slate-500">04</span>
+              <span>CLI reference</span>
+            </a>
+          </li>
+        </ul>
+
+        <p class="font-mono text-[10px] tracking-[0.22em] uppercase text-slate-500 mb-3">Internals</p>
+        <ul class="space-y-0.5 mb-7">
+          <li>
+            <a href="<%= docs_storage_path() %>" class="side-link <% if section == "storage" %>active<% end %> flex items-baseline gap-3 px-3 py-1.5 rounded-md text-[13.5px] text-slate-300 hover:text-white transition">
+              <span class="ch font-mono text-[10.5px] tracking-widest text-slate-500">05</span>
+              <span>Storage format</span>
+            </a>
+          </li>
+          <li>
+            <a href="<%= docs_cluster_path() %>" class="side-link <% if section == "cluster" %>active<% end %> flex items-baseline gap-3 px-3 py-1.5 rounded-md text-[13.5px] text-slate-300 hover:text-white transition">
+              <span class="ch font-mono text-[10.5px] tracking-widest text-slate-500">06</span>
+              <span>Cluster setup</span>
+            </a>
+          </li>
+        </ul>
+
+        <div class="mt-10 p-4 rounded-xl bg-white/[0.025] ring-1 ring-white/[0.06]">
+          <p class="font-mono text-[10px] tracking-[0.2em] uppercase text-indigo-300/80 mb-2">Workspace</p>
+          <ul class="space-y-1.5 font-mono text-[11.5px] text-slate-400/90">
+            <li>· crates/<span class="text-slate-200">es-broker</span></li>
+            <li>· crates/<span class="text-slate-200">es-cli</span></li>
+            <li>· crates/<span class="text-slate-200">es-protocol</span></li>
+          </ul>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Article -->
+    <article id="article" class="body min-w-0">
+      <%= yield %>
+
+      <div class="rule-x my-16"></div>
+      <footer class="flex flex-wrap items-center justify-between gap-4 pb-8 font-mono text-[11px] tracking-[0.12em] uppercase text-slate-500">
+        <span>End of
+          <% if section == "overview" %>§01 · Overview<% end %>
+          <% if section == "demo" %>§02 · Quickstart<% end %>
+          <% if section == "api" %>§03 · HTTP API<% end %>
+          <% if section == "cli" %>§04 · CLI<% end %>
+          <% if section == "storage" %>§05 · Storage<% end %>
+          <% if section == "cluster" %>§06 · Cluster<% end %>
+        </span>
+        <span class="text-slate-600">es / docs · built with soli</span>
+      </footer>
+    </article>
+
+    <!-- Right rail: on-this-page TOC -->
+    <aside class="hidden xl:block">
+      <div class="sticky top-24"
+           x-data="{ items: [], current: null }"
+           x-init="
+             const article = document.getElementById('article');
+             const slug = (s) => s.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'').slice(0,60);
+             const seen = new Set();
+             items = Array.from(article.querySelectorAll('h2')).map((h) => {
+               let id = h.id; if (!id) { id = slug(h.textContent); let n=1; while(seen.has(id)){id = slug(h.textContent)+'-'+(++n);} h.id = id; }
+               seen.add(id);
+               return { id, text: h.textContent };
+             });
+             const io = new IntersectionObserver((entries) => {
+               entries.forEach(e => { if (e.isIntersecting) current = e.target.id; });
+             }, { rootMargin: '-20% 0px -70% 0px', threshold: 0 });
+             article.querySelectorAll('h2').forEach(h => io.observe(h));
+           ">
+        <p class="font-mono text-[10px] tracking-[0.22em] uppercase text-slate-500 mb-3">On this page</p>
+        <nav class="toc border-l border-white/10 pl-4">
+          <template x-for="(item, i) in items" :key="item.id">
+            <a :href="'#' + item.id" :class="current === item.id ? 'is-current' : ''" x-text="item.text"></a>
+          </template>
+          <p x-show="items.length === 0" class="text-[12.5px] text-slate-500 italic">No subsections.</p>
+        </nav>
+
+        <div class="mt-10 p-4 rounded-xl bg-white/[0.025] ring-1 ring-white/[0.06]">
+          <p class="font-mono text-[10px] tracking-[0.2em] uppercase text-indigo-300/80 mb-2">Heads up</p>
+          <p class="text-[12.5px] leading-relaxed text-slate-400">This is a learning broker, not a production system. No replication, no transactions, no compaction.</p>
+        </div>
+      </div>
+    </aside>
+
+  </div>
+
+  <script defer src="<%= public_path("js/htmx.min.js") %>"></script>
+  <script defer src="<%= public_path("js/alpine.min.js") %>"></script>
+</body>
+</html>

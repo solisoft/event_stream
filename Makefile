@@ -1,4 +1,4 @@
-.PHONY: build run-broker demo test lint clean
+.PHONY: build run-broker demo test lint fmt check audit clean
 
 build:
 	cargo build --release
@@ -11,6 +11,17 @@ demo: build
 
 test:
 	cargo test --workspace
+
+fmt:
+	cargo fmt --all
+
+check:
+	cargo clippy --workspace --all-targets -- -D warnings
+
+lint: fmt check
+
+audit:
+	cargo deny check bans licenses sources
 
 clean:
 	rm -rf ./data

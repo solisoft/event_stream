@@ -82,6 +82,7 @@ impl Log {
         self.entries[s..e].to_vec()
     }
 
+    #[allow(clippy::explicit_counter_loop)]
     pub fn append_assign_indices(&mut self, mut entries: Vec<LogEntry>) {
         let mut next = self.last_index() + 1;
         for e in &mut entries {
@@ -108,6 +109,7 @@ impl Log {
         self.entries.truncate(keep);
     }
 
+    #[allow(clippy::explicit_counter_loop)]
     pub fn append_at(&mut self, start_index: LogIndex, mut new_entries: Vec<LogEntry>) {
         let mut idx = start_index;
         let mut skip = 0usize;

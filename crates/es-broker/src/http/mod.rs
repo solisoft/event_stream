@@ -6,20 +6,28 @@ pub mod consume;
 pub mod coord;
 pub mod error;
 pub mod groups;
+pub mod healthz;
 pub mod metrics;
 pub mod produce;
+pub mod schemas;
 pub mod topics;
 
 use std::sync::Arc;
 
 use axum::{Router, routing::{delete, get, post}};
+use tower_http::catch_panic::CatchPanicLayer;
+use tower_http::cors::CorsLayer;
+use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::broker::Broker;
 
 pub fn router(broker: Arc<Broker>) -> Router {
+    let max_body_bytes = broker.config.max_request_body_bytes;
+
     Router::new()
-        .route("/healthz", get(|| async { "ok" }))
+        .route("/healthz", get(healthz::healthz))
+        .route("/readyz", get(healthz::readyz))
         .route("/metrics", get(metrics::metrics))
         .route("/topics", get(topics::list).post(topics::create))
         .route("/topics/:name", get(topics::describe))
@@ -52,6 +60,14 @@ pub fn router(broker: Arc<Broker>) -> Router {
             "/admin/reset-offsets",
             post(admin_producers::reset_offsets),
         )
-        .layer(TraceLayer::new_for_http())
+        .route("/schemas", get(schemas::list).post(schemas::register))
+        .route("/schemas/:id", get(schemas::get))
+        .route("/subjects/:subject/versions/latest", get(schemas::latest_version))
+        .layer((
+            TraceLayer::new_for_http(),
+            CatchPanicLayer::new(),
+            RequestBodyLimitLayer::new(max_body_bytes),
+            CorsLayer::permissive(),
+        ))
         .with_state(broker)
 }

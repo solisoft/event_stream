@@ -11,6 +11,8 @@ use crate::config::Config;
 use crate::coord::GroupCoordinator;
 use crate::groups::GroupStore;
 use crate::producers::ProducerRegistry;
+use crate::schema::SchemaStore;
+use crate::tiered_storage::TieredStore;
 use crate::topic::{Topic, TopicConfig};
 use es_protocol::TopicConfigPatch;
 
@@ -21,6 +23,8 @@ pub struct Broker {
     pub keys: Arc<KeyStore>,
     pub producers: Arc<ProducerRegistry>,
     pub coordinator: Arc<GroupCoordinator>,
+    pub schemas: Arc<SchemaStore>,
+    pub tiered_store: Option<Arc<dyn TieredStore>>,
     pub shutdown: CancellationToken,
     background: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -53,6 +57,13 @@ impl Broker {
         let (keys, _bootstrap_secret) = KeyStore::open(config.data_dir.clone(), auth_required)?;
         let producers = ProducerRegistry::open(config.data_dir.clone())?;
         let coordinator = Arc::new(GroupCoordinator::new(config.coord_member_timeout));
+        let schemas = SchemaStore::open(config.data_dir.clone())?;
+        let tiered_store: Option<Arc<dyn TieredStore>> =
+            config.cold_storage_dir.as_ref().map(|dir| {
+                let store: Arc<dyn TieredStore> =
+                    Arc::new(crate::tiered_storage::LocalTieredStore::new(dir.clone()));
+                store
+            });
 
         Ok(Arc::new(Self {
             config,
@@ -61,6 +72,8 @@ impl Broker {
             keys,
             producers,
             coordinator,
+            schemas,
+            tiered_store,
             shutdown: CancellationToken::new(),
             background: Mutex::new(Vec::new()),
         }))

@@ -38,7 +38,7 @@ async fn render_metrics(broker: &Arc<Broker>) -> String {
                 out,
                 r#"es_partition_start_offset{{topic="{}",partition="{}"}} {}"#,
                 esc(name),
-                p.id,
+                p.id(),
                 p.start_offset()
             )
             .ok();
@@ -54,7 +54,7 @@ async fn render_metrics(broker: &Arc<Broker>) -> String {
                 out,
                 r#"es_partition_end_offset{{topic="{}",partition="{}"}} {}"#,
                 esc(name),
-                p.id,
+                p.id(),
                 p.end_offset()
             )
             .ok();
@@ -70,7 +70,7 @@ async fn render_metrics(broker: &Arc<Broker>) -> String {
                 out,
                 r#"es_partition_size_bytes{{topic="{}",partition="{}"}} {}"#,
                 esc(name),
-                p.id,
+                p.id(),
                 p.total_size_bytes()
             )
             .ok();
@@ -86,7 +86,7 @@ async fn render_metrics(broker: &Arc<Broker>) -> String {
                 out,
                 r#"es_partition_segment_count{{topic="{}",partition="{}"}} {}"#,
                 esc(name),
-                p.id,
+                p.id(),
                 p.segment_count()
             )
             .ok();
@@ -153,8 +153,8 @@ async fn render_metrics(broker: &Arc<Broker>) -> String {
                 out,
                 r#"es_retention_segments_deleted_total{{topic="{}",partition="{}"}} {}"#,
                 esc(name),
-                p.id,
-                p.retention_segments_deleted_total.load(Ordering::Relaxed)
+                p.id(),
+                p.retention_segments_deleted().load(Ordering::Relaxed)
             )
             .ok();
         }
@@ -168,8 +168,8 @@ async fn render_metrics(broker: &Arc<Broker>) -> String {
                 out,
                 r#"es_retention_bytes_reclaimed_total{{topic="{}",partition="{}"}} {}"#,
                 esc(name),
-                p.id,
-                p.retention_bytes_reclaimed_total.load(Ordering::Relaxed)
+                p.id(),
+                p.retention_bytes_reclaimed().load(Ordering::Relaxed)
             )
             .ok();
         }
@@ -183,8 +183,8 @@ async fn render_metrics(broker: &Arc<Broker>) -> String {
                 out,
                 r#"es_compaction_runs_total{{topic="{}",partition="{}"}} {}"#,
                 esc(name),
-                p.id,
-                p.compaction_runs_total.load(Ordering::Relaxed)
+                p.id(),
+                p.compaction_runs().load(Ordering::Relaxed)
             )
             .ok();
         }
@@ -198,8 +198,8 @@ async fn render_metrics(broker: &Arc<Broker>) -> String {
                 out,
                 r#"es_compaction_records_dropped_total{{topic="{}",partition="{}"}} {}"#,
                 esc(name),
-                p.id,
-                p.compaction_records_dropped_total.load(Ordering::Relaxed)
+                p.id(),
+                p.compaction_records_dropped().load(Ordering::Relaxed)
             )
             .ok();
         }

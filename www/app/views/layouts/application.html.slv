@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title><%= title %></title>
+
+    <link rel="stylesheet" href="<%= public_path("css/application.css") %>">
+
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300..700;1,9..144,300..600&family=Manrope:wght@300..800&family=JetBrains+Mono:wght@400;500&display=swap">
+
+    <style>
+        :root {
+            --ink-display: 'Fraunces', 'Iowan Old Style', 'Apple Garamond', Georgia, serif;
+            --ink-body:    'Manrope', ui-sans-serif, system-ui, sans-serif;
+            --ink-mono:    'JetBrains Mono', 'SF Mono', 'Menlo', monospace;
+        }
+        html, body { font-family: var(--ink-body); font-feature-settings: 'ss03', 'cv11'; }
+        .font-display { font-family: var(--ink-display); font-feature-settings: 'ss01'; }
+        .font-mono    { font-family: var(--ink-mono);   font-feature-settings: 'zero', 'ss02'; }
+        ::selection { background: rgba(165, 180, 252, 0.25); color: #fff; }
+        .grain { background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 200 200'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 1  0 0 0 0 1  0 0 0 0 1  0 0 0 .06 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>"); }
+        .rule-x { background-image: linear-gradient(to right, transparent, rgba(148,163,184,0.25) 20%, rgba(148,163,184,0.25) 80%, transparent); height: 1px; }
+        ::-webkit-scrollbar              { width: 10px; height: 10px; }
+        ::-webkit-scrollbar-track        { background: transparent; }
+        ::-webkit-scrollbar-thumb        { background: rgba(148,163,184,0.18); border-radius: 999px; border: 2px solid transparent; background-clip: padding-box; }
+        ::-webkit-scrollbar-thumb:hover  { background: rgba(165,180,252,0.35); background-clip: padding-box; border: 2px solid transparent; }
+    </style>
+</head>
+<body class="min-h-full bg-slate-950 text-white antialiased">
+    <%= yield %>
+
+    <script defer src="<%= public_path("js/htmx.min.js") %>"></script>
+    <script defer src="<%= public_path("js/alpine.min.js") %>"></script>
+</body>
+</html>

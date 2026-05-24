@@ -200,11 +200,9 @@ impl KeyStore {
         for pk in persisted.keys {
             let key_id = pk.key_id.clone();
             let mut hash_buf = [0u8; 32];
-            let bytes =
-                hex::decode_into(&pk.secret_sha256_hex, &mut hash_buf).with_context(|| {
-                    format!("bad secret_sha256_hex on key {}", pk.key_id)
-                })?;
-            let _ = bytes;
+            hex::decode_into(&pk.secret_sha256_hex, &mut hash_buf).with_context(|| {
+                format!("bad secret_sha256_hex on key {}", pk.key_id)
+            })?;
             let acls = pk
                 .acls
                 .iter()
@@ -342,7 +340,7 @@ impl KeyStore {
 
     pub fn list(&self) -> Vec<Arc<ApiKey>> {
         let mut out: Vec<Arc<ApiKey>> = self.keys.iter().map(|kv| kv.value().clone()).collect();
-        out.sort_by(|a, b| a.created_at_ms.cmp(&b.created_at_ms));
+        out.sort_by_key(|a| a.created_at_ms);
         out
     }
 

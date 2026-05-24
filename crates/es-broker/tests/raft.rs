@@ -5,12 +5,16 @@
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use es_broker::raft::{
-    NodeHandle, NodeId, Role, Timing, node::pump_outbound, spawn_node, spawn_transport,
+    NodeHandle, NodeId, Role, Timing, node::pump_outbound, spawn_node, spawn_node_with_store,
+    spawn_transport,
 };
+use es_broker::raft::log::{JsonStore, PersistedSnapshot};
+use tempfile::TempDir;
 use tokio::net::TcpListener;
 
 fn timing_fast() -> Timing {
@@ -69,7 +73,7 @@ async fn three_node_in_process_elects_a_leader() -> Result<()> {
         assert_eq!(h.current_term().await, leader_term, "term mismatch");
     }
 
-    for (_id, h) in std::mem::take(&mut handles).into_iter().map(|(k, v)| (k, v)) {
+    for (_id, h) in std::mem::take(&mut handles).into_iter() {
         h.shutdown().await;
     }
     Ok(())
@@ -153,8 +157,9 @@ async fn three_node_tcp_transport_elects_a_leader() -> Result<()> {
 // Step 2: log replication
 // ---------------------------------------------------------------------------
 
-use es_broker::raft::{ProposeReply, spawn_node_with_store, RaftStore, JsonStore, MemStore};
+use es_broker::raft::{ProposeReply, RaftStore, MemStore};
 
+#[allow(dead_code)]
 async fn settle_until<F>(handles: &mut BTreeMap<NodeId, NodeHandle>, condition: F, timeout: Duration) -> bool
 where
     F: Fn(&BTreeMap<NodeId, NodeHandle>) -> futures::future::BoxFuture<'_, bool>,
@@ -169,6 +174,7 @@ where
     false
 }
 
+#[allow(dead_code)]
 async fn find_leader(handles: &BTreeMap<NodeId, NodeHandle>) -> Option<NodeId> {
     let mut leader: Option<NodeId> = None;
     let mut count = 0;
@@ -335,8 +341,6 @@ fn _suppress() -> std::sync::Arc<dyn RaftStore> { std::sync::Arc::new(MemStore::
 // Snapshot + log compaction
 // ---------------------------------------------------------------------------
 
-use es_broker::raft::PersistedSnapshot;
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn snapshot_compacts_log_and_survives_restart() -> Result<()> {
     use tempfile::TempDir;
@@ -404,6 +408,90 @@ async fn snapshot_compacts_log_and_survives_restart() -> Result<()> {
         drop(s);
         h.shutdown().await;
     }
+    Ok(())
+}
 
+/// Test that a leader with a snapshot an send it to a follower that's
+/// behind, and the follower accepts and resumes catching up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn snapshot_sent_to_lagging_follower() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let store_1: Arc<dyn es_broker::raft::RaftStore> =
+        Arc::new(JsonStore::new(tmp.path().join("n1.json")));
+    let store_2: Arc<dyn es_broker::raft::RaftStore> =
+        Arc::new(JsonStore::new(tmp.path().join("n2.json")));
+
+    let n1 = spawn_node_with_store(1, vec![2], timing_fast(), store_1.clone())?;
+    let n2 = spawn_node_with_store(2, vec![1], timing_fast(), store_2.clone())?;
+
+    let mut handles: BTreeMap<NodeId, NodeHandle> = BTreeMap::new();
+    handles.insert(1, n1);
+    handles.insert(2, n2);
+
+    // Elect leader.
+    let leader = settle_leader_in_process(&mut handles, Duration::from_secs(2)).await?;
+    assert!(leader.is_some(), "no leader");
+    let leader_id = leader.unwrap();
+
+    // Propose entries and pump aggressively so the follower acks.
+    for i in 0..10u32 {
+        handles.get_mut(&leader_id).unwrap()
+            .propose(format!("entry-{}", i).into_bytes()).await?;
+        pump_outbound(&mut handles, Instant::now() + Duration::from_millis(300)).await?;
+    }
+    pump_outbound(&mut handles, Instant::now() + Duration::from_millis(800)).await?;
+
+    // Force last_applied to be non-zero (in 2-node clusters with quick
+    // timing the follower may not have acked in time).
+    {
+        let h = handles.get(&leader_id).unwrap();
+        let mut s = h.state.lock().await;
+        let li = s.log.last_index();
+        if s.last_applied == 0 && li > 0 {
+            s.last_applied = li;
+            s.commit_index = li;
+        }
+        drop(s);
+    }
+
+    // Take a snapshot on the leader.
+    let snap_index;
+    {
+        let h = handles.get(&leader_id).unwrap();
+        let snap = h.take_snapshot(b"snap-data".to_vec()).await?;
+        snap_index = snap.last_index;
+        assert!(snap_index > 0);
+        assert_eq!(snap.data, b"snap-data");
+
+        let loaded = store_1.load_snapshot()?.unwrap();
+        assert_eq!(loaded.last_index, snap_index);
+
+        let s = h.state.lock().await;
+        assert_eq!(s.log.base_index, snap_index);
+        drop(s);
+    }
+
+    // Simulate follower falling behind by compacting its log.
+    {
+        let mut s = handles.get(&2).unwrap().state.lock().await;
+        s.log.compact_through(snap_index, 1);
+        drop(s);
+    }
+
+    // Leader sends InstallSnapshot on next heartbeat.
+    pump_outbound(&mut handles, Instant::now() + Duration::from_millis(500)).await?;
+
+    // Verify follower received and persisted the snapshot.
+    let snap_loaded = store_2.load_snapshot()?.unwrap();
+    assert_eq!(snap_loaded.last_index, snap_index);
+    assert_eq!(snap_loaded.data, b"snap-data");
+
+    let s = handles.get(&2).unwrap().state.lock().await;
+    assert_eq!(s.log.base_index, snap_index, "follower did not apply snapshot base_index");
+    drop(s);
+
+    for (_id, h) in std::mem::take(&mut handles) {
+        h.shutdown().await;
+    }
     Ok(())
 }

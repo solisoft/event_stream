@@ -1,0 +1,741 @@
+<div class="reveal">
+  <p class="font-mono text-[11px] tracking-[0.28em] uppercase text-indigo-300/80 mb-5">§03 · HTTP API</p>
+  <h1 class="font-display text-[42px] md:text-[62px] leading-[1.0] tracking-[-0.025em] text-white font-light">
+    Endpoints,
+    <span class="font-display italic text-indigo-200/90 font-light">requests</span>,
+    responses.
+  </h1>
+</div>
+
+<p class="reveal d1 mt-7 text-[17px] leading-[1.7] text-slate-300 max-w-[58ch] font-light">
+  Every endpoint exchanges JSON. Errors come back as <code>{ "error": "..." }</code> with an appropriate 4xx/5xx status. Request bodies are capped at 10&nbsp;MiB (configurable). Panics in handlers are caught and converted to 500s — the broker stays up.
+</p>
+
+<div class="rule-x my-14"></div>
+
+<h2><span class="num">§</span>Complete walkthrough</h2>
+<p>Start the broker, create a topic, produce records, consume them back, commit an offset — all in one terminal.</p>
+
+<div class="codeblock mt-4">
+  <div class="codeblock-bar">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="label">full walkthrough</span>
+    <span class="lang">bash</span>
+  </div>
+<pre><span class="c-com"># Terminal 1 — start the broker</span>
+<span class="c-fn">$</span> cargo build --release
+<span class="c-fn">$</span> ./target/release/es-broker <span class="c-key">--bind</span> 127.0.0.1:9000
+
+<span class="c-com"># Terminal 2 — talk to it</span>
+<span class="c-fn">$</span> BROKER=<span class="c-str">http://127.0.0.1:9000</span>
+
+<span class="c-com"># Create a topic with 2 partitions</span>
+<span class="c-fn">$</span> curl -s -X <span class="c-key">POST</span> <span class="c-num">$BROKER</span>/topics <span class="c-key">\</span>
+    -H <span class="c-str">'content-type: application/json'</span> <span class="c-key">\</span>
+    -d <span class="c-str">'{"name":"orders","partitions":2}'</span>
+<span class="c-com">→ {"name":"orders","partitions":2,...}</span>
+
+<span class="c-com"># Produce a batch of records</span>
+<span class="c-fn">$</span> curl -s -X <span class="c-key">POST</span> <span class="c-num">$BROKER</span>/topics/orders/produce <span class="c-key">\</span>
+    -H <span class="c-str">'content-type: application/json'</span> <span class="c-key">\</span>
+    -d <span class="c-str">'{"records":[{"key":"user-1","value":"checkout"},{"key":"user-2","value":"signup"}]}'</span>
+<span class="c-com">→ {"results":[{"partition":0,"offset":0},{"partition":1,"offset":0}]}</span>
+
+<span class="c-com"># Consume from partition 0 starting at offset 0</span>
+<span class="c-fn">$</span> curl -s <span class="c-str">"$BROKER/topics/orders/consume?partition=0&offset=0"</span>
+<span class="c-com">→ {"records":[{"partition":0,"offset":0,"key":"user-1","value":"checkout",...}],...}</span>
+
+<span class="c-com"># Commit an offset for consumer group 'analytics'</span>
+<span class="c-fn">$</span> curl -s -X <span class="c-key">POST</span> <span class="c-num">$BROKER</span>/groups/analytics/commit <span class="c-key">\</span>
+    -H <span class="c-str">'content-type: application/json'</span> <span class="c-key">\</span>
+    -d <span class="c-str">'{"topic":"orders","partition":0,"offset":1}'</span>
+
+<span class="c-fn">$</span> curl -s <span class="c-num">$BROKER</span>/groups/analytics/offsets
+<span class="c-com">→ {"orders":{"0":1}}</span>
+
+<span class="c-com"># Check health and metrics</span>
+<span class="c-fn">$</span> curl -s <span class="c-num">$BROKER</span>/healthz
+<span class="c-com">→ {"status":"ok","topics_count":1}</span>
+<span class="c-fn">$</span> curl -s <span class="c-num">$BROKER</span>/readyz
+<span class="c-com">→ {"status":"ready","message":"accepting traffic"}</span>
+<span class="c-fn">$</span> curl -s <span class="c-num">$BROKER</span>/metrics | head
+<span class="c-com">→ es_topic_records_produced_total{topic="orders"} 2
+→ es_topic_bytes_produced_total{topic="orders"} 36</span></pre>
+</div>
+
+<div class="rule-x my-14"></div>
+
+<h2><span class="num">§</span>Authentication</h2>
+<p>
+  The broker boots with auth <strong>disabled by default</strong> (back-compat). Start the binary with
+  <code>--auth required</code> to enforce it. On first boot with auth required, a bootstrap admin key is generated and written to <code>&lt;data-dir&gt;/bootstrap.key</code> (mode <code>0600</code>); rotate it after first use.
+</p>
+<p>
+  Authenticated clients send the key as a bearer token. Both forms are accepted:
+</p>
+<div class="codeblock">
+  <div class="codeblock-bar">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="label">request headers</span>
+    <span class="lang">http</span>
+  </div>
+<pre>Authorization: Bearer esk_AbCdEf...
+<span class="c-com"># or equivalently</span>
+X-Es-Key: esk_AbCdEf...</pre>
+</div>
+<p class="text-[13.5px] text-slate-400">
+  Missing / bad header → <code>401 Unauthorized</code>. Valid key but insufficient ACL → <code>403 Forbidden</code>. Over rate limit → <code>429 Too Many Requests</code>. Health &amp; metrics endpoints (<code>/healthz</code>, <code>/readyz</code>, <code>/metrics</code>) are always reachable without auth.
+</p>
+
+<h3 class="mt-8">ACL grammar</h3>
+<p class="text-[13.5px] text-slate-300">
+  Each key has zero or more rules of the form <code>{action, topic_prefix}</code> where action is one of:
+</p>
+<ul class="text-[13.5px] text-slate-300 space-y-1 mb-3">
+  <li><strong>read</strong> — list / describe / consume / commit-offset on topics matching the prefix.</li>
+  <li><strong>write</strong> — read + produce.</li>
+  <li><strong>admin</strong> — everything (topic creation, config updates, key management, force-trigger). <code>admin:*</code> is broker-wide.</li>
+</ul>
+<p class="text-[13.5px] text-slate-300">
+  <code>topic_prefix</code> is a literal prefix match — <code>orders.</code> matches <code>orders.eu</code>, <code>orders.us</code>, but not <code>billing</code>. The special prefix <code>*</code> matches every topic.
+</p>
+
+<h3 class="mt-8">Key management</h3>
+<div class="space-y-2">
+  <div class="flex items-center gap-3 px-4 py-3 rounded-lg bg-white/[0.025] ring-1 ring-white/[0.06]">
+    <span class="verb post">POST</span>
+    <code class="font-mono text-[13px] text-slate-200">/admin/keys</code>
+    <span class="ml-auto text-[12.5px] text-slate-400">create a key; secret returned <strong>once</strong></span>
+  </div>
+  <div class="flex items-center gap-3 px-4 py-3 rounded-lg bg-white/[0.025] ring-1 ring-white/[0.06]">
+    <span class="verb get">GET</span>
+    <code class="font-mono text-[13px] text-slate-200">/admin/keys</code>
+    <span class="ml-auto text-[12.5px] text-slate-400">list keys (no secrets)</span>
+  </div>
+  <div class="flex items-center gap-3 px-4 py-3 rounded-lg bg-white/[0.025] ring-1 ring-white/[0.06]">
+    <span class="verb delete">DELETE</span>
+    <code class="font-mono text-[13px] text-slate-200">/admin/keys/:key_id</code>
+    <span class="ml-auto text-[12.5px] text-slate-400">revoke (key still listed, marked <code>disabled</code>)</span>
+  </div>
+</div>
+
+<div class="codeblock mt-6">
+  <div class="codeblock-bar">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="label">POST /admin/keys</span>
+    <span class="lang">json</span>
+  </div>
+<pre>{
+  <span class="c-str">"name"</span>: <span class="c-str">"orders-writer"</span>,
+  <span class="c-str">"acls"</span>: [
+    { <span class="c-str">"action"</span>: <span class="c-str">"write"</span>, <span class="c-str">"topic_prefix"</span>: <span class="c-str">"orders."</span> }
+  ],
+  <span class="c-str">"produce_bytes_per_sec"</span>: <span class="c-num">1048576</span>,
+  <span class="c-str">"consume_bytes_per_sec"</span>: <span class="c-num">10485760</span>
+}</pre>
+</div>
+
+<h2><span class="num">§</span>TLS</h2>
+<p>
+  Pass <code>--tls-cert /path/to/cert.pem</code> and <code>--tls-key /path/to/key.pem</code> to the broker.
+  Both PEM files. When set, the broker listens with TLS using <code>rustls</code>; otherwise plain HTTP (the default).
+  Use any sane chain — self-signed for testing, real CA-signed for production.
+</p>
+
+<h2><span class="num">§</span>Rate limiting</h2>
+<p>
+  Each key carries an optional <code>produce_bytes_per_sec</code> and <code>consume_bytes_per_sec</code>.
+  Limits are per-key token buckets with one-second refill. Produce is <strong>pre-checked</strong> against
+  the wire-bytes of the request — exceeding returns <code>429</code> before the records are appended.
+  Consume is <strong>post-charged</strong> after the read — exceeding the budget causes the <em>next</em>
+  consume request to be rejected, not the current one.
+</p>
+
+<h2><span class="num">§</span>Health &amp; metrics</h2>
+<div class="space-y-2">
+  <div class="flex items-center gap-3 px-4 py-3 rounded-lg bg-white/[0.025] ring-1 ring-white/[0.06]">
+    <span class="verb get">GET</span>
+    <code class="font-mono text-[13px] text-slate-200">/healthz</code>
+    <span class="ml-auto text-[12.5px] text-slate-400"><code class="text-emerald-300">{"status":"ok","topics_count":N}</code></span>
+  </div>
+  <div class="flex items-center gap-3 px-4 py-3 rounded-lg bg-white/[0.025] ring-1 ring-white/[0.06]">
+    <span class="verb get">GET</span>
+    <code class="font-mono text-[13px] text-slate-200">/readyz</code>
+    <span class="ml-auto text-[12.5px] text-slate-400"><code class="text-emerald-300">{"status":"ready","message":"accepting traffic"}</code></span>
+  </div>
+  <div class="flex items-center gap-3 px-4 py-3 rounded-lg bg-white/[0.025] ring-1 ring-white/[0.06]">
+    <span class="verb get">GET</span>
+    <code class="font-mono text-[13px] text-slate-200">/metrics</code>
+    <span class="ml-auto text-[12.5px] text-slate-400">Prometheus text exposition</span>
+  </div>
+</div>
+
+<p class="text-[13.5px] text-slate-400">
+  The <code>/metrics</code> endpoint emits standard <strong>Prometheus text exposition</strong> with <code>HELP</code>/<code>TYPE</code> headers. Scrape it from Prometheus, VictoriaMetrics, or any compatible agent. Series exposed:
+</p>
+<div class="grid grid-cols-1 md:grid-cols-2 gap-2 my-4 text-[13px]">
+  <div class="px-3 py-2 rounded-md bg-white/[0.02]"><code class="font-mono text-indigo-200">es_partition_start_offset</code><span class="text-slate-400 ml-2">gauge</span></div>
+  <div class="px-3 py-2 rounded-md bg-white/[0.02]"><code class="font-mono text-indigo-200">es_partition_end_offset</code><span class="text-slate-400 ml-2">gauge</span></div>
+  <div class="px-3 py-2 rounded-md bg-white/[0.02]"><code class="font-mono text-indigo-200">es_partition_size_bytes</code><span class="text-slate-400 ml-2">gauge</span></div>
+  <div class="px-3 py-2 rounded-md bg-white/[0.02]"><code class="font-mono text-indigo-200">es_partition_segment_count</code><span class="text-slate-400 ml-2">gauge</span></div>
+  <div class="px-3 py-2 rounded-md bg-white/[0.02]"><code class="font-mono text-indigo-200">es_topic_records_produced_total</code><span class="text-slate-400 ml-2">counter</span></div>
+  <div class="px-3 py-2 rounded-md bg-white/[0.02]"><code class="font-mono text-indigo-200">es_topic_bytes_produced_total</code><span class="text-slate-400 ml-2">counter</span></div>
+  <div class="px-3 py-2 rounded-md bg-white/[0.02]"><code class="font-mono text-indigo-200">es_topic_records_consumed_total</code><span class="text-slate-400 ml-2">counter</span></div>
+  <div class="px-3 py-2 rounded-md bg-white/[0.02]"><code class="font-mono text-indigo-200">es_topic_bytes_consumed_total</code><span class="text-slate-400 ml-2">counter</span></div>
+  <div class="px-3 py-2 rounded-md bg-white/[0.02]"><code class="font-mono text-indigo-200">es_group_committed_offset</code><span class="text-slate-400 ml-2">gauge</span></div>
+  <div class="px-3 py-2 rounded-md bg-white/[0.02]"><code class="font-mono text-indigo-200">es_group_lag</code><span class="text-slate-400 ml-2">gauge</span></div>
+  <div class="px-3 py-2 rounded-md bg-white/[0.02]"><code class="font-mono text-indigo-200">es_retention_segments_deleted_total</code><span class="text-slate-400 ml-2">counter</span></div>
+  <div class="px-3 py-2 rounded-md bg-white/[0.02]"><code class="font-mono text-indigo-200">es_retention_bytes_reclaimed_total</code><span class="text-slate-400 ml-2">counter</span></div>
+  <div class="px-3 py-2 rounded-md bg-white/[0.02]"><code class="font-mono text-indigo-200">es_compaction_runs_total</code><span class="text-slate-400 ml-2">counter</span></div>
+  <div class="px-3 py-2 rounded-md bg-white/[0.02]"><code class="font-mono text-indigo-200">es_compaction_records_dropped_total</code><span class="text-slate-400 ml-2">counter</span></div>
+</div>
+<p class="text-[13.5px] text-slate-400">
+  Topic-level series are labelled <code>{topic="..."}</code>; partition-level adds <code>{partition="N"}</code>; consumer-group series add <code>{group="..."}</code>.
+</p>
+
+<h2><span class="num">§</span>CORS &amp; request limits</h2>
+<p>
+  The broker responds with permissive CORS headers (all origins, methods, and headers) — suitable for internal services. Restrict via a reverse proxy for external exposure. Request bodies are capped at 10&nbsp;MiB by default (override with <code>--max-request-body-bytes</code>). A <code>CatchPanicLayer</code> converts any handler panic into a <code>500 Internal Server Error</code>, preventing a single bad request path from crashing the broker.
+</p>
+
+<h2><span class="num">§</span>Topics</h2>
+<div class="space-y-2">
+  <div class="flex items-center gap-3 px-4 py-3 rounded-lg bg-white/[0.025] ring-1 ring-white/[0.06]">
+    <span class="verb post">POST</span>
+    <code class="font-mono text-[13px] text-slate-200">/topics</code>
+    <span class="ml-auto text-[12.5px] text-slate-400">create a topic</span>
+  </div>
+  <div class="flex items-center gap-3 px-4 py-3 rounded-lg bg-white/[0.025] ring-1 ring-white/[0.06]">
+    <span class="verb get">GET</span>
+    <code class="font-mono text-[13px] text-slate-200">/topics</code>
+    <span class="ml-auto text-[12.5px] text-slate-400">list names</span>
+  </div>
+  <div class="flex items-center gap-3 px-4 py-3 rounded-lg bg-white/[0.025] ring-1 ring-white/[0.06]">
+    <span class="verb get">GET</span>
+    <code class="font-mono text-[13px] text-slate-200">/topics/:name</code>
+    <span class="ml-auto text-[12.5px] text-slate-400">describe partitions + offsets + config</span>
+  </div>
+  <div class="flex items-center gap-3 px-4 py-3 rounded-lg bg-white/[0.025] ring-1 ring-white/[0.06]">
+    <span class="verb get">GET</span>
+    <code class="font-mono text-[13px] text-slate-200">/topics/:name/config</code>
+    <span class="ml-auto text-[12.5px] text-slate-400">fetch resolved per-topic config</span>
+  </div>
+  <div class="flex items-center gap-3 px-4 py-3 rounded-lg bg-white/[0.025] ring-1 ring-white/[0.06]">
+    <span class="verb put">PUT</span>
+    <code class="font-mono text-[13px] text-slate-200">/topics/:name/config</code>
+    <span class="ml-auto text-[12.5px] text-slate-400">merge-patch update (omitted fields preserved)</span>
+  </div>
+</div>
+
+<h3 class="mt-8">Request — create</h3>
+<div class="codeblock">
+  <div class="codeblock-bar">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="label">POST /topics</span>
+    <span class="lang">json</span>
+  </div>
+<pre>{
+  <span class="c-str">"name"</span>: <span class="c-str">"orders"</span>,
+  <span class="c-str">"partitions"</span>: <span class="c-num">3</span>,
+  <span class="c-str">"config"</span>: {                         <span class="c-com">// optional; all fields optional</span>
+    <span class="c-str">"retention_ms"</span>:           <span class="c-num">86400000</span>,
+    <span class="c-str">"retention_bytes"</span>:        <span class="c-num">1073741824</span>,
+    <span class="c-str">"cleanup_policy"</span>:         <span class="c-str">"delete"</span>,
+    <span class="c-str">"segment_bytes"</span>:          <span class="c-num">67108864</span>,
+    <span class="c-str">"tombstone_retention_ms"</span>: <span class="c-num">86400000</span>
+  }
+}</pre>
+</div>
+
+<h3>Response — describe</h3>
+<div class="codeblock">
+  <div class="codeblock-bar">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="label">GET /topics/orders</span>
+    <span class="lang">json</span>
+  </div>
+<pre>{
+  <span class="c-str">"name"</span>: <span class="c-str">"orders"</span>,
+  <span class="c-str">"partitions"</span>: [
+    { <span class="c-str">"id"</span>: <span class="c-num">0</span>, <span class="c-str">"start_offset"</span>: <span class="c-num">0</span>, <span class="c-str">"end_offset"</span>: <span class="c-num">142</span>,
+      <span class="c-str">"segment_count"</span>: <span class="c-num">3</span>, <span class="c-str">"size_bytes"</span>: <span class="c-num">82456</span> }
+  ],
+  <span class="c-str">"config"</span>: {
+    <span class="c-str">"cleanup_policy"</span>: <span class="c-str">"delete"</span>,
+    <span class="c-str">"segment_bytes"</span>: <span class="c-num">67108864</span>,
+    <span class="c-str">"tombstone_retention_ms"</span>: <span class="c-num">86400000</span>,
+    <span class="c-str">"retention_ms"</span>: <span class="c-com">null</span>,
+    <span class="c-str">"retention_bytes"</span>: <span class="c-com">null</span>
+  }
+}</pre>
+</div>
+
+<h3>Update topic config (merge-patch)</h3>
+<div class="codeblock">
+  <div class="codeblock-bar">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="label">PUT /topics/orders/config</span>
+    <span class="lang">json</span>
+  </div>
+<pre>{
+  <span class="c-str">"retention_ms"</span>: <span class="c-num">3600000</span>,
+  <span class="c-str">"cleanup_policy"</span>: <span class="c-str">"compact,delete"</span>
+}</pre>
+</div>
+<p class="text-[13.5px] text-slate-400 mb-6">
+  Omitted fields are preserved. The response is the resolved config (all defaults filled in).
+  <code>segment_bytes</code> changes take effect on the next segment roll; cleanup-policy and retention changes are picked up by the next reaper / compactor pass.
+</p>
+
+<div class="flex items-start gap-3 p-4 rounded-xl bg-indigo-500/[0.06] ring-1 ring-indigo-400/20 mb-2">
+  <span class="font-mono text-[10px] tracking-[0.2em] uppercase text-indigo-300 mt-0.5">Cleanup</span>
+  <p class="text-[13.5px] leading-relaxed text-slate-200">
+    <strong>delete</strong>: drop sealed segments past <code>retention_ms</code> / <code>retention_bytes</code>.&nbsp;
+    <strong>compact</strong>: keep only the latest record per key in sealed segments; emit tombstones (empty values) until <code>tombstone_retention_ms</code>.&nbsp;
+    <strong>compact,delete</strong>: both. The active segment is never compacted or deleted.
+  </p>
+</div>
+
+<h2><span class="num">§</span>Produce</h2>
+<div class="space-y-2">
+  <div class="flex items-center gap-3 px-4 py-3 rounded-lg bg-white/[0.025] ring-1 ring-white/[0.06]">
+    <span class="verb post">POST</span>
+    <code class="font-mono text-[13px] text-slate-200">/topics/:name/produce</code>
+    <span class="ml-auto text-[12.5px] text-slate-400">append one or more records</span>
+  </div>
+</div>
+
+<p class="mt-5">
+  Partition selection follows a fixed precedence: an explicit <code>partition</code> wins; otherwise a non-null <code>key</code> is hashed with FNV-1a so the same key always lands on the same partition; otherwise round-robin.
+</p>
+
+<div class="codeblock">
+  <div class="codeblock-bar">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="label">POST /topics/orders/produce</span>
+    <span class="lang">json</span>
+  </div>
+<pre>{
+  <span class="c-str">"records"</span>: [
+    { <span class="c-str">"key"</span>: <span class="c-str">"k1"</span>, <span class="c-str">"value"</span>: <span class="c-str">"hello"</span> },
+    { <span class="c-str">"key"</span>: <span class="c-str">"k1"</span>, <span class="c-str">"value"</span>: <span class="c-str">"world"</span>, <span class="c-str">"partition"</span>: <span class="c-num">0</span> }
+  ]
+}</pre>
+</div>
+
+<h3>Response</h3>
+<div class="codeblock">
+  <div class="codeblock-bar">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="label">200 OK</span>
+    <span class="lang">json</span>
+  </div>
+<pre>{
+  <span class="c-str">"results"</span>: [
+    { <span class="c-str">"partition"</span>: <span class="c-num">0</span>, <span class="c-str">"offset"</span>: <span class="c-num">142</span> },
+    { <span class="c-str">"partition"</span>: <span class="c-num">0</span>, <span class="c-str">"offset"</span>: <span class="c-num">143</span> }
+  ]
+}</pre>
+</div>
+
+<h2><span class="num">§</span>Consume</h2>
+<div class="space-y-2">
+  <div class="flex items-center gap-3 px-4 py-3 rounded-lg bg-white/[0.025] ring-1 ring-white/[0.06]">
+    <span class="verb get">GET</span>
+    <code class="font-mono text-[13px] text-slate-200">/topics/:name/consume</code>
+    <span class="ml-auto text-[12.5px] text-slate-400">direct partition + offset read</span>
+  </div>
+  <div class="flex items-center gap-3 px-4 py-3 rounded-lg bg-white/[0.025] ring-1 ring-white/[0.06]">
+    <span class="verb get">GET</span>
+    <code class="font-mono text-[13px] text-slate-200">/groups/:group/consume</code>
+    <span class="ml-auto text-[12.5px] text-slate-400">resume from group's committed offset</span>
+  </div>
+</div>
+
+<h3 class="mt-8">Query parameters</h3>
+<div class="grid grid-cols-1 sm:grid-cols-2 gap-2 text-[13.5px]">
+  <div class="flex items-baseline gap-3 px-3 py-2 rounded-md bg-white/[0.02]"><code class="font-mono text-indigo-200">partition</code><span class="text-slate-400">required</span></div>
+  <div class="flex items-baseline gap-3 px-3 py-2 rounded-md bg-white/[0.02]"><code class="font-mono text-indigo-200">offset</code><span class="text-slate-400">required (direct endpoint)</span></div>
+  <div class="flex items-baseline gap-3 px-3 py-2 rounded-md bg-white/[0.02]"><code class="font-mono text-indigo-200">topic</code><span class="text-slate-400">required (group endpoint)</span></div>
+  <div class="flex items-baseline gap-3 px-3 py-2 rounded-md bg-white/[0.02]"><code class="font-mono text-indigo-200">max_records</code><span class="text-slate-400">default 100</span></div>
+  <div class="flex items-baseline gap-3 px-3 py-2 rounded-md bg-white/[0.02]"><code class="font-mono text-indigo-200">max_bytes</code><span class="text-slate-400">default 1 MiB</span></div>
+</div>
+
+<h3>Response</h3>
+<div class="codeblock">
+  <div class="codeblock-bar">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="label">200 OK</span>
+    <span class="lang">json</span>
+  </div>
+<pre>{
+  <span class="c-str">"records"</span>: [
+    {
+      <span class="c-str">"partition"</span>: <span class="c-num">0</span>,
+      <span class="c-str">"offset"</span>: <span class="c-num">142</span>,
+      <span class="c-str">"timestamp_ms"</span>: <span class="c-num">1763500000000</span>,
+      <span class="c-str">"key"</span>: <span class="c-str">"k1"</span>,
+      <span class="c-str">"value"</span>: <span class="c-str">"hello"</span>
+    }
+  ],
+  <span class="c-str">"next_offset"</span>:    <span class="c-num">143</span>,
+  <span class="c-str">"high_watermark"</span>: <span class="c-num">200</span>
+}</pre>
+</div>
+
+<div class="mt-6 flex items-start gap-3 p-4 rounded-xl bg-indigo-500/[0.06] ring-1 ring-indigo-400/20">
+  <span class="font-mono text-[10px] tracking-[0.2em] uppercase text-indigo-300 mt-0.5">Note</span>
+  <p class="text-[13.5px] leading-relaxed text-slate-200">
+    The group-aware consume endpoint <em>does not</em> auto-commit. The client commits explicitly via <code>POST /groups/:group/commit</code>. This keeps the offset model simple at-least-once.
+  </p>
+</div>
+
+<h2><span class="num">§</span>Consumer-group coordination</h2>
+<p>
+  A simple coordinator: members join with a list of topics they want to consume,
+  partitions are assigned round-robin across members, and a heartbeat keeps the
+  member alive. Missing a heartbeat past <code>coord_member_timeout</code> evicts
+  the member and triggers a rebalance (new generation, new assignment).
+</p>
+
+<div class="space-y-2 mb-6">
+  <div class="flex items-center gap-3 px-4 py-3 rounded-lg bg-white/[0.025] ring-1 ring-white/[0.06]">
+    <span class="verb post">POST</span>
+    <code class="font-mono text-[13px] text-slate-200">/groups/:group/join</code>
+    <span class="ml-auto text-[12.5px] text-slate-400">join + receive assignment</span>
+  </div>
+  <div class="flex items-center gap-3 px-4 py-3 rounded-lg bg-white/[0.025] ring-1 ring-white/[0.06]">
+    <span class="verb post">POST</span>
+    <code class="font-mono text-[13px] text-slate-200">/groups/:group/heartbeat</code>
+    <span class="ml-auto text-[12.5px] text-slate-400">keep-alive + check for rebalance</span>
+  </div>
+  <div class="flex items-center gap-3 px-4 py-3 rounded-lg bg-white/[0.025] ring-1 ring-white/[0.06]">
+    <span class="verb post">POST</span>
+    <code class="font-mono text-[13px] text-slate-200">/groups/:group/leave</code>
+    <span class="ml-auto text-[12.5px] text-slate-400">graceful exit; triggers rebalance</span>
+  </div>
+  <div class="flex items-center gap-3 px-4 py-3 rounded-lg bg-white/[0.025] ring-1 ring-white/[0.06]">
+    <span class="verb get">GET</span>
+    <code class="font-mono text-[13px] text-slate-200">/groups/:group/assignment</code>
+    <span class="ml-auto text-[12.5px] text-slate-400">re-fetch the current assignment</span>
+  </div>
+</div>
+
+<h3>Join body / response</h3>
+<div class="codeblock">
+  <div class="codeblock-bar">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="label">POST /groups/analytics/join</span>
+    <span class="lang">json</span>
+  </div>
+<pre>{ <span class="c-str">"topics"</span>: [<span class="c-str">"orders"</span>, <span class="c-str">"billing"</span>], <span class="c-str">"member_id"</span>: <span class="c-com">null</span> }
+<span class="c-com">// response:</span>
+{
+  <span class="c-str">"member_id"</span>:  <span class="c-str">"m_a1b2c3..."</span>,
+  <span class="c-str">"generation"</span>: <span class="c-num">3</span>,
+  <span class="c-str">"assignment"</span>: [
+    { <span class="c-str">"topic"</span>: <span class="c-str">"orders"</span>,  <span class="c-str">"partition"</span>: <span class="c-num">0</span> },
+    { <span class="c-str">"topic"</span>: <span class="c-str">"billing"</span>, <span class="c-str">"partition"</span>: <span class="c-num">1</span> }
+  ]
+}</pre>
+</div>
+
+<h3>Heartbeat protocol</h3>
+<p class="text-[14px] text-slate-300">
+  Send <code>{ "member_id", "generation" }</code>. Three outcomes:
+</p>
+<ul class="text-[13.5px] text-slate-300 space-y-1 mb-4">
+  <li><code>{ "status": "ok", "generation": N }</code> &mdash; you're alive, no rebalance.</li>
+  <li><code>{ "status": "rebalance_required", "current_generation": N }</code> &mdash; re-fetch the assignment.</li>
+  <li><code>{ "status": "unknown_member", "current_generation": N }</code> &mdash; you were evicted (timeout or explicit leave); rejoin.</li>
+</ul>
+
+<p class="text-[13.5px] text-slate-400">
+  Assignment is <strong>sticky</strong>: a rebalance preserves each surviving member's previous <code>(topic, partition)</code> tuples wherever possible, up to <code>ceil(N/M)</code> per member. Only orphan partitions (whose previous owner left or who exceed the new fair share) move. Members get even loads (<code>floor(N/M)</code> or <code>ceil(N/M)</code> each) and avoid the churn of a full reshuffle. Identity carries an ACL: a member must have <code>read</code> on every topic in its subscription list.
+</p>
+
+<h2><span class="num">§</span>Consumer groups (offsets)</h2>
+<div class="space-y-2">
+  <div class="flex items-center gap-3 px-4 py-3 rounded-lg bg-white/[0.025] ring-1 ring-white/[0.06]">
+    <span class="verb post">POST</span>
+    <code class="font-mono text-[13px] text-slate-200">/groups/:group/commit</code>
+    <span class="ml-auto text-[12.5px] text-slate-400">persist a committed offset</span>
+  </div>
+  <div class="flex items-center gap-3 px-4 py-3 rounded-lg bg-white/[0.025] ring-1 ring-white/[0.06]">
+    <span class="verb get">GET</span>
+    <code class="font-mono text-[13px] text-slate-200">/groups/:group/offsets</code>
+    <span class="ml-auto text-[12.5px] text-slate-400">inspect a group's committed offsets</span>
+  </div>
+</div>
+
+<h3 class="mt-8">Commit body</h3>
+<div class="codeblock">
+  <div class="codeblock-bar">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="label">POST /groups/analytics/commit</span>
+    <span class="lang">json</span>
+  </div>
+<pre>{
+  <span class="c-str">"topic"</span>:     <span class="c-str">"orders"</span>,
+  <span class="c-str">"partition"</span>: <span class="c-num">0</span>,
+  <span class="c-str">"offset"</span>:    <span class="c-num">143</span>
+}</pre>
+</div>
+
+<p class="text-[14px] text-slate-400">
+  The commit writes the group's JSON file via <em>tmp + fsync + atomic rename</em>, so a broker crash mid-write can never observe a half-written file.
+</p>
+
+<h2><span class="num">§</span>Idempotent producer</h2>
+<p>
+  Set <code>producer_id</code> on the produce request and supply a monotonic <code>sequence</code> on each record. The broker tracks <code>last_seen_sequence</code> per <code>(producer_id, topic, partition)</code> and:
+</p>
+<ul>
+  <li><strong>seq == last_seen + 1</strong> &mdash; append.</li>
+  <li><strong>seq == last_seen</strong> &mdash; recognized retry. The original offset is returned with <code>duplicate: true</code> and the record is not re-appended.</li>
+  <li><strong>seq &gt; last_seen + 1</strong> &mdash; <code>400</code> sequence gap.</li>
+  <li><strong>seq &lt; last_seen</strong> &mdash; <code>400</code> sequence too low.</li>
+</ul>
+<p class="text-[13.5px] text-slate-400">
+  Producer state is periodically flushed to <code>data/producers.json</code> (configurable; defaults to every 2&nbsp;s) and reloaded on boot. To start a clean slate, <code>DELETE /admin/producers/:id</code> drops the in-memory + on-disk state for that producer.
+</p>
+
+<div class="codeblock">
+  <div class="codeblock-bar">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="label">POST /topics/orders/produce</span>
+    <span class="lang">json</span>
+  </div>
+<pre>{
+  <span class="c-str">"producer_id"</span>: <span class="c-str">"checkout-svc-1"</span>,
+  <span class="c-str">"records"</span>: [
+    { <span class="c-str">"key"</span>: <span class="c-str">"abc"</span>, <span class="c-str">"value"</span>: <span class="c-str">"..."</span>, <span class="c-str">"partition"</span>: <span class="c-num">0</span>, <span class="c-str">"sequence"</span>: <span class="c-num">42</span> },
+    { <span class="c-str">"key"</span>: <span class="c-str">"abc"</span>, <span class="c-str">"value"</span>: <span class="c-str">"..."</span>, <span class="c-str">"partition"</span>: <span class="c-num">0</span>, <span class="c-str">"sequence"</span>: <span class="c-num">43</span> }
+  ]
+}</pre>
+</div>
+
+<h2><span class="num">§</span>Admin (operations)</h2>
+<div class="space-y-2">
+  <div class="flex items-center gap-3 px-4 py-3 rounded-lg bg-white/[0.025] ring-1 ring-white/[0.06]">
+    <span class="verb post">POST</span>
+    <code class="font-mono text-[13px] text-slate-200">/admin/run-retention</code>
+    <span class="ml-auto text-[12.5px] text-slate-400">run one retention pass synchronously</span>
+  </div>
+  <div class="flex items-center gap-3 px-4 py-3 rounded-lg bg-white/[0.025] ring-1 ring-white/[0.06]">
+    <span class="verb post">POST</span>
+    <code class="font-mono text-[13px] text-slate-200">/admin/run-compaction</code>
+    <span class="ml-auto text-[12.5px] text-slate-400">run one compaction pass synchronously</span>
+  </div>
+  <div class="flex items-center gap-3 px-4 py-3 rounded-lg bg-white/[0.025] ring-1 ring-white/[0.06]">
+    <span class="verb get">GET</span>
+    <code class="font-mono text-[13px] text-slate-200">/admin/producers</code>
+    <span class="ml-auto text-[12.5px] text-slate-400">list registered idempotent producers</span>
+  </div>
+  <div class="flex items-center gap-3 px-4 py-3 rounded-lg bg-white/[0.025] ring-1 ring-white/[0.06]">
+    <span class="verb delete">DELETE</span>
+    <code class="font-mono text-[13px] text-slate-200">/admin/producers/:producer_id</code>
+    <span class="ml-auto text-[12.5px] text-slate-400">drop a producer's tracked state</span>
+  </div>
+  <div class="flex items-center gap-3 px-4 py-3 rounded-lg bg-white/[0.025] ring-1 ring-white/[0.06]">
+    <span class="verb post">POST</span>
+    <code class="font-mono text-[13px] text-slate-200">/admin/reset-offsets</code>
+    <span class="ml-auto text-[12.5px] text-slate-400">rewind every group on a topic to its start_offset</span>
+  </div>
+</div>
+<p class="text-[13.5px] text-slate-400">
+  Both endpoints return <code>204</code> when the pass has finished — useful for tests, demos, and ops scripts that need deterministic behavior instead of waiting for the next background tick. The pass still respects <code>segment_delete_grace</code>, so call duration depends on that knob.
+</p>
+
+<h2><span class="num">§</span>Schema registry</h2>
+<p>
+  Register JSON Schemas for your record values, enforce backward-compatibility,
+  and look up schemas by ID or subject at consume time.
+</p>
+
+<div class="space-y-2 mb-4">
+  <div class="flex items-center gap-3 px-4 py-3 rounded-lg bg-white/[0.025] ring-1 ring-white/[0.06]">
+    <span class="verb post">POST</span>
+    <code class="font-mono text-[13px] text-slate-200">/schemas</code>
+    <span class="ml-auto text-[12.5px] text-slate-400">register; returns <code>{"id": N}</code></span>
+  </div>
+  <div class="flex items-center gap-3 px-4 py-3 rounded-lg bg-white/[0.025] ring-1 ring-white/[0.06]">
+    <span class="verb get">GET</span>
+    <code class="font-mono text-[13px] text-slate-200">/schemas</code>
+    <span class="ml-auto text-[12.5px] text-slate-400">list all registered schemas</span>
+  </div>
+  <div class="flex items-center gap-3 px-4 py-3 rounded-lg bg-white/[0.025] ring-1 ring-white/[0.06]">
+    <span class="verb get">GET</span>
+    <code class="font-mono text-[13px] text-slate-200">/schemas/:id</code>
+    <span class="ml-auto text-[12.5px] text-slate-400">fetch schema by ID</span>
+  </div>
+  <div class="flex items-center gap-3 px-4 py-3 rounded-lg bg-white/[0.025] ring-1 ring-white/[0.06]">
+    <span class="verb get">GET</span>
+    <code class="font-mono text-[13px] text-slate-200">/subjects/:subject/versions/latest</code>
+    <span class="ml-auto text-[12.5px] text-slate-400">latest version for a subject</span>
+  </div>
+</div>
+
+<h3>Usage</h3>
+<div class="codeblock">
+  <div class="codeblock-bar">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="label">schema workflow</span>
+    <span class="lang">bash</span>
+  </div>
+<pre><span class="c-com"># Register a schema for user records</span>
+<span class="c-fn">$</span> curl -s -X <span class="c-key">POST</span> <span class="c-num">$BROKER</span>/schemas <span class="c-key">\</span>
+    -H <span class="c-str">'content-type: application/json'</span> <span class="c-key">\</span>
+    -d <span class="c-str">'{"subject":"user-value","type":"json_schema","schema":"{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"age\":{\"type\":\"integer\"}},\"required\":[\"name\"]}"}'</span>
+<span class="c-com">→ {"id":1}</span>
+
+<span class="c-com"># Fetch it back at consume time to decode the value</span>
+<span class="c-fn">$</span> curl -s <span class="c-num">$BROKER</span>/schemas/1
+<span class="c-com">→ {"id":1,"subject":"user-value","type":"json_schema","schema":"{...}",...}</span>
+
+<span class="c-com"># Add an optional email field (compatible upgrade)</span>
+<span class="c-fn">$</span> curl -s -X <span class="c-key">POST</span> <span class="c-num">$BROKER</span>/schemas <span class="c-key">\</span>
+    -H <span class="c-str">'content-type: application/json'</span> <span class="c-key">\</span>
+    -d <span class="c-str">'{"subject":"user-value","type":"json_schema","schema":"{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"age\":{\"type\":\"integer\"},\"email\":{\"type\":\"string\"}},\"required\":[\"name\"]}"}'</span>
+<span class="c-com">→ {"id":2}</span>
+
+<span class="c-com"># Adding a required field is backward-incompatible — rejected with 400</span>
+<span class="c-fn">$</span> curl -s -X <span class="c-key">POST</span> <span class="c-num">$BROKER</span>/schemas <span class="c-key">\</span>
+    -H <span class="c-str">'content-type: application/json'</span> <span class="c-key">\</span>
+    -d <span class="c-str">'{"subject":"user-value","type":"json_schema","schema":"{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\",\"phone\"]}"}'</span>
+<span class="c-com">→ 400 { "error": "backward-incompatible: new schema adds required field 'phone'" }</span></pre>
+</div>
+
+<h2><span class="num">§</span>Binary protocol</h2>
+<p>
+  Set <code>--bind-binary 127.0.0.1:9001</code> on the broker to expose a second listener that speaks a length-prefixed binary protocol on a long-lived TCP connection. It bypasses JSON and UTF-8 conversion entirely — keys and values are carried as native <code>Vec&lt;u8&gt;</code> — and reuses the same auth, ACL, rate-limit, and idempotency state as the HTTP API.
+</p>
+
+<h3 class="mt-8">Handshake</h3>
+<div class="codeblock">
+  <div class="codeblock-bar">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="label">handshake</span>
+    <span class="lang">bytes · BE</span>
+  </div>
+<pre><span class="c-com">client →</span>
+  <span class="c-fn">magic</span>           [u8; 4]    <span class="c-com">"ES01"</span>
+  <span class="c-fn">features</span>        u32        <span class="c-com">requested feature bits (see table)</span>
+  <span class="c-fn">token_len</span>       u32
+  <span class="c-fn">token</span>           [u8; token_len]
+
+<span class="c-com">server →</span>
+  <span class="c-fn">magic</span>           [u8; 4]
+  <span class="c-fn">status</span>          u8         <span class="c-com">0=ok, 1=bad_magic, 2=auth_failed, 3=auth_required, ...</span>
+  <span class="c-fn">features</span>        u32        <span class="c-com">accepted subset (& with client request)</span>
+  <span class="c-fn">msg_len</span>         u32
+  <span class="c-fn">msg</span>             [u8; msg_len]</pre>
+</div>
+
+<h3>Feature bits</h3>
+<div class="grid grid-cols-1 md:grid-cols-2 gap-2 my-3 text-[13px]">
+  <div class="px-3 py-2 rounded-md bg-white/[0.02] font-mono text-slate-200">0x0000_0001  gzip</div>
+  <div class="px-3 py-2 rounded-md bg-white/[0.02] font-mono text-slate-500">future bits reserved</div>
+</div>
+<p class="text-[13.5px] text-slate-400">
+  When <code>gzip</code> is negotiated, the <em>payload</em> portion of each frame (everything after <code>request_id</code> + <code>opcode</code>) is gzip-encoded. The header bytes stay uncompressed so the server can frame-parse without paying the decompress on undersized payloads. Clients that fail to negotiate fall back transparently to uncompressed frames.
+</p>
+
+<h3>Request / response frame</h3>
+<div class="codeblock">
+  <div class="codeblock-bar">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="label">frame</span>
+    <span class="lang">bytes · BE</span>
+  </div>
+<pre><span class="c-fn">length</span>          u32        <span class="c-com"># bytes after this field</span>
+<span class="c-fn">request_id</span>      u32        <span class="c-com"># mirrored on the matching response</span>
+<span class="c-fn">opcode</span>          u8         <span class="c-com"># see opcode table</span>
+<span class="c-fn">payload</span>         [u8; ...]</pre>
+</div>
+
+<h3>Opcode table</h3>
+<div class="grid grid-cols-1 md:grid-cols-2 gap-2 my-3 text-[13px]">
+  <div class="px-3 py-2 rounded-md bg-white/[0.02] font-mono text-slate-200">0x01  Produce</div>
+  <div class="px-3 py-2 rounded-md bg-white/[0.02] font-mono text-slate-200">0x81  ProduceOk</div>
+  <div class="px-3 py-2 rounded-md bg-white/[0.02] font-mono text-slate-200">0x02  Consume</div>
+  <div class="px-3 py-2 rounded-md bg-white/[0.02] font-mono text-slate-200">0x82  ConsumeOk</div>
+  <div class="px-3 py-2 rounded-md bg-white/[0.02] font-mono text-slate-200">0x03  Ping</div>
+  <div class="px-3 py-2 rounded-md bg-white/[0.02] font-mono text-slate-200">0x83  PingOk</div>
+  <div class="px-3 py-2 rounded-md bg-white/[0.02] font-mono text-slate-200 col-span-2">0xFF  Error · payload is a UTF-8 error message</div>
+</div>
+
+<h3>Produce payload</h3>
+<div class="codeblock">
+  <div class="codeblock-bar">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="label">opcode 0x01</span>
+    <span class="lang">bytes · BE</span>
+  </div>
+<pre><span class="c-fn">topic_len</span>       u16
+<span class="c-fn">topic</span>           [u8; topic_len]
+<span class="c-fn">producer_id</span>     i32 length-prefix (-1 = unset) + bytes
+<span class="c-fn">record_count</span>    u32
+<span class="c-com">for each record:</span>
+  <span class="c-fn">key_len</span>         i32 (-1 = null)
+  <span class="c-fn">key</span>             [u8; key_len]
+  <span class="c-fn">value_len</span>       u32
+  <span class="c-fn">value</span>           [u8; value_len]
+  <span class="c-fn">partition</span>       i32 (-1 = auto)
+  <span class="c-fn">sequence</span>        i64 (i64::MIN = unset)</pre>
+</div>
+
+<p class="text-[13.5px] text-slate-400">
+  Response opcode <code>0x81</code> payload: <code>result_count: u32</code> followed by one
+  <code>(partition: u32, offset: u64, duplicate: u8)</code> tuple per record.
+</p>
+
+<h3>Consume payload</h3>
+<div class="codeblock">
+  <div class="codeblock-bar">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="label">opcode 0x02</span>
+    <span class="lang">bytes · BE</span>
+  </div>
+<pre><span class="c-fn">topic_len</span>       u16
+<span class="c-fn">topic</span>           [u8; topic_len]
+<span class="c-fn">partition</span>       u32
+<span class="c-fn">offset</span>          u64
+<span class="c-fn">max_records</span>     u32
+<span class="c-fn">max_bytes</span>       u32</pre>
+</div>
+<p class="text-[13.5px] text-slate-400">
+  Response opcode <code>0x82</code> payload: <code>next_offset: u64</code>, <code>high_watermark: u64</code>,
+  <code>record_count: u32</code>, then for each record:
+  <code>partition: u32</code>, <code>offset: u64</code>, <code>timestamp_ms: i64</code>,
+  <code>key_len: i32</code>, <code>key</code>, <code>value_len: u32</code>, <code>value</code>.
+</p>
+
+<div class="mt-6 flex items-start gap-3 p-4 rounded-xl bg-emerald-400/[0.06] ring-1 ring-emerald-400/20">
+  <span class="font-mono text-[10px] tracking-[0.2em] uppercase text-emerald-300 mt-0.5">Note</span>
+  <p class="text-[13.5px] leading-relaxed text-slate-200">
+    The Rust client lives at <code>es_broker::binary::BinaryClient</code>. The CLI stays
+    on HTTP — the binary protocol is intended for embedded use by services that
+    want the throughput. See <a href="<%= docs_storage_path() %>#throughput" class="text-emerald-200">measured bench numbers</a> for the actual delta.
+  </p>
+</div>
+
+<h2><span class="num">§</span>Talking to the API with curl</h2>
+<div class="codeblock">
+  <div class="codeblock-bar">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="label">smoke.sh</span>
+    <span class="lang">bash</span>
+  </div>
+<pre><span class="c-com"># create + list</span>
+<span class="c-fn">$</span> curl -s -X <span class="c-key">POST</span> localhost:9876/topics <span class="c-key">\</span>
+       -H <span class="c-str">'content-type: application/json'</span> <span class="c-key">\</span>
+       -d <span class="c-str">'{"name":"orders","partitions":2}'</span>
+<span class="c-fn">$</span> curl -s localhost:9876/topics
+
+<span class="c-com"># produce + consume</span>
+<span class="c-fn">$</span> curl -s -X <span class="c-key">POST</span> localhost:9876/topics/orders/produce <span class="c-key">\</span>
+       -H <span class="c-str">'content-type: application/json'</span> <span class="c-key">\</span>
+       -d <span class="c-str">'{"records":[{"key":"k1","value":"hi"}]}'</span>
+<span class="c-fn">$</span> curl -s <span class="c-str">'localhost:9876/topics/orders/consume?partition=0&offset=0'</span></pre>
+</div>

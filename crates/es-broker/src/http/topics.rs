@@ -65,7 +65,7 @@ pub async fn describe(
         .partitions
         .iter()
         .map(|p| PartitionInfo {
-            id: p.id,
+            id: p.id(),
             start_offset: p.start_offset(),
             end_offset: p.end_offset(),
             segment_count: p.segment_count(),

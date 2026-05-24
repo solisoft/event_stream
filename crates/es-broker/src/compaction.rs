@@ -59,15 +59,15 @@ pub async fn run_pass(broker: &Arc<Broker>, grace: Duration, cancel: &Cancellati
             if cancel.is_cancelled() {
                 return;
             }
-            match compact_partition(partition, &config, grace, cancel).await {
+            match compact_partition(partition.inner(), &config, grace, cancel).await {
                 Ok(Some(report)) => {
-                    partition.compaction_runs_total.fetch_add(1, Ordering::Relaxed);
+                    partition.compaction_runs().fetch_add(1, Ordering::Relaxed);
                     partition
-                        .compaction_records_dropped_total
+                        .compaction_records_dropped()
                         .fetch_add(report.records_dropped as u64, Ordering::Relaxed);
                     tracing::info!(
                         topic = %name,
-                        partition = partition.id,
+                        partition = partition.id(),
                         kept = report.records_kept,
                         dropped = report.records_dropped,
                         sealed_merged = report.sealed_merged,
@@ -76,7 +76,7 @@ pub async fn run_pass(broker: &Arc<Broker>, grace: Duration, cancel: &Cancellati
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    tracing::warn!(topic = %name, partition = partition.id, error = %e, "compactor: pass failed");
+                    tracing::warn!(topic = %name, partition = partition.id(), error = %e, "compactor: pass failed");
                 }
             }
         }
@@ -210,9 +210,7 @@ async fn compact_partition(
         ));
 
         // New snapshot: replace the sealed range with [new_seg], keep the active.
-        let mut new_vec: Vec<Arc<Segment>> = Vec::with_capacity(2);
-        new_vec.push(new_seg);
-        new_vec.push(cur.last().unwrap().clone());
+        let new_vec: Vec<Arc<Segment>> = vec![new_seg, cur.last().unwrap().clone()];
         partition.segments.store(Arc::new(new_vec));
 
         CompactionReport {
@@ -238,6 +236,7 @@ async fn compact_partition(
     Ok(Some(report))
 }
 
+#[allow(clippy::type_complexity)]
 fn write_compacted_segment(
     log_path: &Path,
     index_path: &Path,

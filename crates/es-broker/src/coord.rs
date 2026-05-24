@@ -32,21 +32,11 @@ pub struct Member {
     pub last_heartbeat: Instant,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct GroupState {
     pub generation: u64,
     pub members: BTreeMap<String, Member>,
     pub assignment: BTreeMap<String, Vec<(String, u32)>>, // member_id -> [(topic, partition)]
-}
-
-impl Default for GroupState {
-    fn default() -> Self {
-        Self {
-            generation: 0,
-            members: BTreeMap::new(),
-            assignment: BTreeMap::new(),
-        }
-    }
 }
 
 pub struct GroupCoordinator {
@@ -273,7 +263,7 @@ fn recompute_assignment(broker: &Arc<Broker>, state: &mut GroupState) {
         for t in &m.topics {
             if let Some(topic) = broker.topic(t) {
                 for p in &topic.partitions {
-                    all_partitions.insert((t.clone(), p.id));
+                    all_partitions.insert((t.clone(), p.id()));
                 }
             }
         }

@@ -7,11 +7,14 @@ pub mod coord;
 pub mod groups;
 pub mod http;
 pub mod partition;
+pub mod partition_handle;
 pub mod producers;
 pub mod raft;
 pub mod raft_partition;
 pub mod retention;
+pub mod schema;
 pub mod storage;
+pub mod tiered_storage;
 pub mod topic;
 
 use std::net::SocketAddr;
@@ -32,6 +35,7 @@ pub struct BrokerHandle {
     pub broker: Arc<Broker>,
     pub scheme: &'static str,
     shutdown: Option<oneshot::Sender<()>>,
+    shutdown_timeout: std::time::Duration,
     tls_handle: Option<axum_server::Handle>,
     join: Option<JoinHandle<Result<()>>>,
     binary_join: Option<JoinHandle<Result<()>>>,
@@ -47,20 +51,34 @@ impl BrokerHandle {
     }
 
     pub async fn shutdown(mut self) -> Result<()> {
+        // Signal listeners to stop accepting new connections.
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.send(());
         }
+        // Tell TLS server to drain (stop accepting, wait for in-flight).
         if let Some(h) = self.tls_handle.take() {
             h.graceful_shutdown(Some(std::time::Duration::from_secs(2)));
         }
         // The binary listener watches the broker's cancellation token.
         self.broker.shutdown.cancel();
-        if let Some(join) = self.join.take() {
-            let _ = join.await;
-        }
-        if let Some(join) = self.binary_join.take() {
-            let _ = join.await;
-        }
+
+        // Wait for HTTP and binary listeners with a timeout.
+        let timeout = self.shutdown_timeout;
+        let http_done = async {
+            if let Some(join) = self.join.take() {
+                let _ = join.await;
+            }
+        };
+        let binary_done = async {
+            if let Some(join) = self.binary_join.take() {
+                let _ = join.await;
+            }
+        };
+        let _ = tokio::time::timeout(timeout, async {
+            tokio::join!(http_done, binary_done);
+        })
+        .await;
+
         self.broker.shutdown_background().await;
         Ok(())
     }
@@ -90,8 +108,16 @@ pub async fn spawn(config: Config) -> Result<BrokerHandle> {
         config.tls_cert_path.is_some() && config.tls_key_path.is_some();
 
     let (addr, tls_handle, join, shutdown_tx, scheme) = if tls_enabled {
-        let cert_path = config.tls_cert_path.clone().unwrap();
-        let key_path = config.tls_key_path.clone().unwrap();
+        let cert_path = config
+            .tls_cert_path
+            .as_ref()
+            .context("tls_cert_path is None but tls_enabled is true")?
+            .clone();
+        let key_path = config
+            .tls_key_path
+            .as_ref()
+            .context("tls_key_path is None but tls_enabled is true")?
+            .clone();
         let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path)
             .await
             .with_context(|| format!("load tls cert={:?} key={:?}", cert_path, key_path))?;
@@ -143,6 +169,7 @@ pub async fn spawn(config: Config) -> Result<BrokerHandle> {
         broker,
         scheme,
         shutdown: Some(shutdown_tx),
+        shutdown_timeout: config.shutdown_timeout,
         tls_handle,
         join: Some(join),
         binary_join,

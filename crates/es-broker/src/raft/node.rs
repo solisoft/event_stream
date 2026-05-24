@@ -13,7 +13,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::log::{PersistedSnapshot, RaftStore};
-use super::messages::{LogEntry, LogIndex, Message, NodeId};
+use super::messages::{InstallSnapshot, LogEntry, LogIndex, Message, NodeId};
 use super::state::{Action, ProposeOutcome, RaftState, Role};
 
 #[derive(Debug, Clone, Copy)]
@@ -173,6 +173,16 @@ pub fn spawn_node_with_store(
 
                 msg = inbound_rx.recv() => {
                     let Some(msg) = msg else { break; };
+                    if let Message::InstallSnapshot(ref is) = msg {
+                        let snap = PersistedSnapshot {
+                            last_index: is.last_index,
+                            last_term: is.last_term,
+                            data: is.data.clone(),
+                        };
+                        if let Err(e) = store.save_snapshot(&snap) {
+                            tracing::error!(error = %e, "raft: failed to save received snapshot");
+                        }
+                    }
                     let actions = {
                         let mut s = state_for_task.lock().await;
                         s.on_message(msg)
@@ -281,6 +291,37 @@ async fn apply_and_persist(
             }
             Action::Apply(entry) => {
                 let _ = committed.send(entry);
+            }
+            Action::SendSnapshot(peer) => {
+                let (term, my_id, base_index) = {
+                    let s = state.lock().await;
+                    (s.current_term, s.me, s.log.base_index)
+                };
+                match store.load_snapshot() {
+                    Ok(Some(snap)) => {
+                        let msg = Message::InstallSnapshot(InstallSnapshot {
+                            term,
+                            leader_id: my_id,
+                            last_index: snap.last_index,
+                            last_term: snap.last_term,
+                            offset: 0,
+                            done: true,
+                            data: snap.data,
+                        });
+                        let _ = outbound.send(Outbound::SendTo(peer, msg));
+                    }
+                    Ok(None) => {
+                        let mut s = state.lock().await;
+                        s.next_index.insert(peer, base_index + 1);
+                        tracing::warn!(
+                            peer = peer,
+                            "raft: SendSnapshot but no snapshot available"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "raft: failed to load snapshot");
+                    }
+                }
             }
         }
     }

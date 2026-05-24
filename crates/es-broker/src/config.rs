@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -10,55 +11,35 @@ pub struct Config {
     pub data_dir: PathBuf,
     pub bind: SocketAddr,
 
-    /// Broker-wide default segment size (overridable per-topic).
     pub segment_bytes: u64,
-
-    /// How often the reaper inspects partitions for retention enforcement.
     pub retention_check_interval: Duration,
-
-    /// How often the compactor inspects partitions for compaction work.
     pub compaction_check_interval: Duration,
-
-    /// Grace period between dropping a segment from the in-memory snapshot and
-    /// unlinking the underlying files. Lets in-flight readers finish.
     pub segment_delete_grace: Duration,
-
-    /// Default tombstone retention for compacted topics that don't override it.
     pub default_tombstone_retention_ms: u64,
-
-    /// Defaults applied to topics created without an explicit config.
     pub default_retention_ms: Option<u64>,
     pub default_retention_bytes: Option<u64>,
     pub default_cleanup_policy: CleanupPolicy,
-
-    /// If `Required`, every non-public request must present a valid bearer token.
-    /// If `Disabled`, the auth middleware passes through (back-compat default).
     pub auth_mode: AuthMode,
-
-    /// TLS material. When both are set, the server listens with TLS.
     pub tls_cert_path: Option<PathBuf>,
     pub tls_key_path: Option<PathBuf>,
-
-    /// How often the producer-state flusher persists registered sequences to disk.
     pub producer_flush_interval: Duration,
-
-    /// Optional TCP listen address for the binary protocol. When unset, only
-    /// the HTTP listener is started.
     pub bind_binary: Option<SocketAddr>,
-
-    /// How many appended records to buffer before forcing an `fsync`. `1` is
-    /// the safest setting (every record is durable before the producer is
-    /// acked) but caps throughput at the disk's fsync rate. Higher values
-    /// trade up to N un-acked records on a crash for proportionally higher
-    /// throughput. Page-cache visibility (other readers in the same broker)
-    /// is independent of this — that always happens on every append.
     pub flush_every_records: u32,
-
-    /// A consumer-group member that hasn't sent a heartbeat within this window
-    /// is evicted, triggering a rebalance for that group.
     pub coord_member_timeout: Duration,
-    /// How often the coordinator sweeps for stale members.
     pub coord_expire_interval: Duration,
+    pub max_request_body_bytes: usize,
+    pub shutdown_timeout: Duration,
+
+    /// Raft cluster configuration. When set, topics are created with Raft-backed
+    /// partitions. `raft_bind` is the TCP address this broker listens on for
+    /// Raft RPCs. `raft_peer_addrs` maps peer node IDs to their Raft addresses.
+    pub raft_node_id: Option<u32>,
+    pub raft_bind: Option<SocketAddr>,
+    pub raft_peer_addrs: BTreeMap<u32, SocketAddr>,
+
+    /// Cold-storage directory for tiered storage. When set, sealed segments are
+    /// offloaded here instead of being deleted by retention.
+    pub cold_storage_dir: Option<PathBuf>,
 }
 
 impl Config {
@@ -70,7 +51,7 @@ impl Config {
             retention_check_interval: Duration::from_secs(30),
             compaction_check_interval: Duration::from_secs(60),
             segment_delete_grace: Duration::from_secs(60),
-            default_tombstone_retention_ms: 24 * 60 * 60 * 1000, // 24h
+            default_tombstone_retention_ms: 24 * 60 * 60 * 1000,
             default_retention_ms: None,
             default_retention_bytes: None,
             default_cleanup_policy: CleanupPolicy::Delete,
@@ -82,6 +63,12 @@ impl Config {
             flush_every_records: 1,
             coord_member_timeout: Duration::from_secs(15),
             coord_expire_interval: Duration::from_secs(2),
+            max_request_body_bytes: 10 * 1024 * 1024,
+            shutdown_timeout: Duration::from_secs(30),
+            raft_node_id: None,
+            raft_bind: None,
+            raft_peer_addrs: BTreeMap::new(),
+            cold_storage_dir: None,
         }
     }
 }

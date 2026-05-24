@@ -62,6 +62,7 @@ struct PersistedRegistry {
     producers: Vec<PersistedProducer>,
 }
 
+#[allow(clippy::type_complexity)]
 pub struct ProducerRegistry {
     file_path: PathBuf,
     /// `producer_id` -> `(topic, partition) -> PartitionState`.
