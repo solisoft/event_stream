@@ -5,6 +5,7 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use serde::Serialize;
 
 use es_protocol::{
     CreateTopicRequest, DescribeTopicResponse, ListTopicsResponse, PartitionInfo, TopicConfigDto,
@@ -107,4 +108,27 @@ pub async fn update_config(
     }
     let resolved = broker.update_topic_config(&name, &patch)?;
     Ok(Json(resolved.to_dto()))
+}
+
+#[derive(Serialize)]
+pub struct DeleteTopicResponse {
+    name: String,
+    partitions: u32,
+}
+
+pub async fn delete_topic(
+    State(broker): State<Arc<Broker>>,
+    AuthedKey(key): AuthedKey,
+    Path(name): Path<String>,
+) -> AppResult<Json<DeleteTopicResponse>> {
+    if !key.is_admin() {
+        return Err(AppError::forbidden("delete topic requires admin grant"));
+    }
+    let topic = broker
+        .delete_topic(&name)
+        .map_err(|e| AppError::not_found(format!("{}", e)))?;
+    Ok(Json(DeleteTopicResponse {
+        name: topic.name.clone(),
+        partitions: topic.partitions.len() as u32,
+    }))
 }

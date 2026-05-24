@@ -143,6 +143,10 @@ enum TopicCmd {
         #[arg(long)]
         name: String,
     },
+    Delete {
+        #[arg(long)]
+        name: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -394,6 +398,18 @@ async fn main() -> Result<()> {
                 let resp: TopicConfigDto =
                     get_json(&client, &format!("{}/topics/{}/config", base, name)).await?;
                 print_config(&resp);
+            }
+            TopicCmd::Delete { name } => {
+                let resp = client
+                    .delete(format!("{}/topics/{}", base, name))
+                    .send()
+                    .await?;
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(anyhow!("delete topic failed: {} {}", status, body));
+                }
+                println!("deleted topic '{}'", name);
             }
         },
         Cmd::Produce {

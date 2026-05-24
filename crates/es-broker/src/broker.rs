@@ -159,6 +159,17 @@ impl Broker {
         names.sort();
         names
     }
+
+    pub fn delete_topic(&self, name: &str) -> Result<Arc<Topic>> {
+        let topic = self
+            .topic(name)
+            .ok_or_else(|| anyhow!("topic '{}' not found", name))?;
+        self.topics.remove(name);
+        if let Err(e) = std::fs::remove_dir_all(topics_root(&self.config.data_dir).join(name)) {
+            tracing::warn!(topic = %name, error = %e, "failed to clean up topic directory");
+        }
+        Ok(topic)
+    }
 }
 
 pub fn topics_root(data_dir: &std::path::Path) -> PathBuf {

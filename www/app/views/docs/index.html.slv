@@ -102,19 +102,20 @@
 </div>
 
 <h2 class="mt-12"><span class="num">§</span>What <em>isn't</em> here</h2>
-<p>Deliberate omissions — some are performance optimizations, others need a cluster story:</p>
+<p>Deliberate omissions — Kafka features that don't fit a single-broker, read-in-an-afternoon design:</p>
 <ul>
-  <li>Sendfile / zero-copy fetch path for large consumers (tokio::io::copy uses splice on Linux for most cases)</li>
-  <li>Cross-partition transactions (idempotent producer is supported)</li>
-  <li>Cooperative / incremental rebalance (current sticky rebalance is single-pass)</li>
-  <li>Linearizable reads (read-index or read-leases)</li>
-  <li>Full S3/GCS tiered storage backend (trait is pluggable; local backend shipped)</li>
+  <li><strong>Cross-partition transactions</strong> — requires transaction coordinator, epochs, fencing</li>
+  <li><strong>Linearizable reads</strong> — needs read-index or leases; at-least-once is the standard for event streams</li>
+  <li><strong>S3/GCS tiered storage backend</strong> — <code>TieredStore</code> trait is pluggable; local backend shipped</li>
+  <li><strong>Consumer offset internal topic</strong> (<code>__consumer_offsets</code>) — file-based atomic writes instead</li>
+  <li><strong>Disk compression</strong> — segments stored uncompressed; gzip available at the protocol layer</li>
+  <li><strong>Message headers</strong> — records carry key + value only</li>
 </ul>
 
 <div class="flex items-start gap-3 p-4 rounded-xl bg-emerald-400/[0.06] ring-1 ring-emerald-400/20 mt-6">
   <span class="font-mono text-[10px] tracking-[0.2em] uppercase text-emerald-300 mt-0.5">Shipped</span>
   <p class="text-[13.5px] leading-relaxed text-slate-200">
-    CRC-framed segmented log, time/size retention + log compaction, Prometheus /metrics (14 series), TLS, bearer-token auth + ACLs + per-key rate limits, idempotent producer, binary protocol with gzip handshake + pipelining, <strong>Raft consensus</strong> (leader election, log replication, InstallSnapshot, membership changes), <strong>RaftPartition</strong> with TCP transport, consumer-group coordinator with sticky assignment, /healthz + /readyz, SIGTERM + drain shutdown, CORS + body limits + panic recovery, <strong>schema registry</strong> with backward-compatibility checks, <strong>tiered storage</strong> with cold offload, <strong>CI pipeline</strong> (fmt, clippy, test, cargo-deny).
+    CRC-framed segmented log, time/size retention + log compaction, topic deletion, Prometheus /metrics (14 series), TLS, bearer-token auth + ACLs + per-key rate limits, idempotent producer, binary protocol with gzip + pipelining, zero-copy consume encoding, <strong>Raft consensus</strong> (leader election, log replication, InstallSnapshot, membership changes), <strong>RaftPartition</strong> with TCP transport + multi-node replication, consumer-group coordinator with sticky assignment, /healthz + /readyz, SIGTERM + drain shutdown, CORS + body limits + panic recovery, <strong>schema registry</strong> with backward-compatibility + CLI, <strong>tiered storage</strong> with cold offload + admin API + CLI, <strong>CI pipeline</strong> (fmt, clippy, test, cargo-deny, cross-compile, Docker).
   </p>
 </div>
 

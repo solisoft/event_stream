@@ -225,6 +225,11 @@ X-Es-Key: esk_AbCdEf...</pre>
     <code class="font-mono text-[13px] text-slate-200">/topics/:name/config</code>
     <span class="ml-auto text-[12.5px] text-slate-400">merge-patch update (omitted fields preserved)</span>
   </div>
+  <div class="flex items-center gap-3 px-4 py-3 rounded-lg bg-white/[0.025] ring-1 ring-white/[0.06]">
+    <span class="verb delete">DELETE</span>
+    <code class="font-mono text-[13px] text-slate-200">/topics/:name</code>
+    <span class="ml-auto text-[12.5px] text-slate-400">delete a topic and its data</span>
+  </div>
 </div>
 
 <h3 class="mt-8">Request — create</h3>

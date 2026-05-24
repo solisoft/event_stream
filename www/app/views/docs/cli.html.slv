@@ -92,6 +92,9 @@
 <span class="c-com"># Merge-patch update; omitted flags preserve the current value.</span>
 <span class="c-fn">$</span> es topic alter <span class="c-key">--name</span> orders <span class="c-key">--retention-ms</span> <span class="c-num">3600000</span>
 
+<span class="c-com"># Delete a topic (requires admin ACL)</span>
+<span class="c-fn">$</span> es topic delete <span class="c-key">--name</span> orders
+
 <span class="c-fn">$</span> es topic list
 <span class="c-fn">$</span> es topic describe    <span class="c-key">--name</span> orders   <span class="c-com"># includes config + per-partition size_bytes</span>
 <span class="c-fn">$</span> es topic show-config <span class="c-key">--name</span> orders</pre>
