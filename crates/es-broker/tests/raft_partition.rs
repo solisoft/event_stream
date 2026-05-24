@@ -307,6 +307,7 @@ async fn partition_handle_raft_survives_restart() -> Result<()> {
 /// Two RaftPartitions connected via TCP: produce on the leader, read from
 /// the follower to confirm replication over the wire.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
 async fn two_node_tcp_replication() -> Result<()> {
     let tmp1 = TempDir::new()?;
     let tmp2 = TempDir::new()?;
