@@ -92,6 +92,14 @@ enum Cmd {
         #[arg(long)]
         topic: String,
     },
+    Schema {
+        #[command(subcommand)]
+        sub: SchemaCmd,
+    },
+    Tiered {
+        #[command(subcommand)]
+        sub: TieredCmd,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -208,6 +216,44 @@ enum KeyCmd {
     Revoke {
         #[arg(long)]
         id: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SchemaCmd {
+    /// Register a new schema. Returns the schema ID.
+    Register {
+        #[arg(long)]
+        subject: String,
+        /// Schema type: json_schema, avro, or protobuf.
+        #[arg(long, default_value = "json_schema")]
+        r#type: String,
+        /// Path to a JSON file containing the schema definition, or inline JSON.
+        #[arg(long)]
+        schema: String,
+    },
+    /// Get a schema by ID.
+    Get {
+        #[arg(long)]
+        id: u32,
+    },
+    /// List all registered schemas.
+    List,
+    /// Get the latest schema version for a subject.
+    Latest {
+        #[arg(long)]
+        subject: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum TieredCmd {
+    /// List remote segments for a topic partition.
+    List {
+        #[arg(long)]
+        topic: String,
+        #[arg(long)]
+        partition: u32,
     },
 }
 
@@ -669,6 +715,62 @@ async fn main() -> Result<()> {
                 resp.entries_reset, resp.groups_affected
             );
         }
+        Cmd::Schema { sub } => match sub {
+            SchemaCmd::Register {
+                subject,
+                r#type,
+                schema,
+            } => {
+                let schema_str = if schema.starts_with('{') || schema.starts_with('[') {
+                    schema
+                } else {
+                    std::fs::read_to_string(&schema)
+                        .with_context(|| format!("read schema file {}", schema))?
+                };
+                let body = serde_json::json!({
+                    "subject": subject,
+                    "type": r#type,
+                    "schema": schema_str,
+                });
+                let resp: serde_json::Value =
+                    post_json(&client, &format!("{}/schemas", base), &body).await?;
+                println!("id: {}", resp["id"]);
+            }
+            SchemaCmd::Get { id } => {
+                let resp: serde_json::Value =
+                    get_json(&client, &format!("{}/schemas/{}", base, id)).await?;
+                println!("{}", serde_json::to_string_pretty(&resp)?);
+            }
+            SchemaCmd::List => {
+                let resp: serde_json::Value =
+                    get_json(&client, &format!("{}/schemas", base)).await?;
+                println!("{}", serde_json::to_string_pretty(&resp)?);
+            }
+            SchemaCmd::Latest { subject } => {
+                let resp: serde_json::Value = get_json(
+                    &client,
+                    &format!("{}/subjects/{}/versions/latest", base, subject),
+                )
+                .await?;
+                println!("{}", serde_json::to_string_pretty(&resp)?);
+            }
+        },
+        Cmd::Tiered { sub } => match sub {
+            TieredCmd::List { topic, partition } => {
+                let resp: serde_json::Value = get_json(
+                    &client,
+                    &format!("{}/admin/tiered/{}/{}", base, topic, partition),
+                )
+                .await?;
+                if let Some(segments) = resp["segments"].as_array() {
+                    for s in segments {
+                        println!("{}", s);
+                    }
+                } else {
+                    println!("{}", serde_json::to_string_pretty(&resp)?);
+                }
+            }
+        },
     }
     Ok(())
 }

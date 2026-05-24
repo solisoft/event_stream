@@ -8,9 +8,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
 use es_protocol::wire::{
-    decode_consume_request, decode_produce_request, encode_consume_response,
-    encode_produce_response, HandshakeStatus, Opcode, WireConsumeResponse, WireProduceResult,
-    WireRecord, FEATURE_GZIP, WIRE_MAGIC,
+    decode_consume_request, decode_produce_request,
+    encode_produce_response, HandshakeStatus, Opcode, WireProduceResult,
+    FEATURE_GZIP, WIRE_MAGIC,
 };
 
 use crate::auth::{AclAction, ApiKey, AuthMode};
@@ -254,6 +254,28 @@ fn compress(input: &[u8]) -> std::io::Result<Vec<u8>> {
     enc.finish()
 }
 
+/// Encode a consume response directly from storage records, avoiding the
+/// intermediate WireRecord allocation and key/value clones.
+fn encode_consume_from_records(
+    partition: u32,
+    next_offset: u64,
+    high_watermark: u64,
+    records: &[crate::storage::record::Record],
+) -> Vec<u8> {
+    let mut b = es_protocol::wire::WireBuf::new();
+    b.put_u64(next_offset);
+    b.put_u64(high_watermark);
+    b.put_u32(records.len() as u32);
+    for r in records {
+        b.put_u32(partition);
+        b.put_u64(r.offset);
+        b.put_i64(r.timestamp_ms);
+        b.put_opt_bytes_i32(r.key.as_deref());
+        b.put_value(&r.value);
+    }
+    b.bytes
+}
+
 fn decompress(input: &[u8]) -> std::io::Result<Vec<u8>> {
     use flate2::read::GzDecoder;
     use std::io::Read;
@@ -421,21 +443,7 @@ async fn dispatch(
                 .bytes_consumed_total
                 .fetch_add(consumed_bytes, Ordering::Relaxed);
 
-            let wire_records: Vec<WireRecord> = records
-                .into_iter()
-                .map(|r| WireRecord {
-                    partition: req.partition,
-                    offset: r.offset,
-                    timestamp_ms: r.timestamp_ms,
-                    key: r.key,
-                    value: r.value,
-                })
-                .collect();
-            let body = encode_consume_response(&WireConsumeResponse {
-                records: wire_records,
-                next_offset,
-                high_watermark,
-            });
+            let body = encode_consume_from_records(req.partition, next_offset, high_watermark, &records);
             Ok((Opcode::ConsumeOk, body))
         }
         // Server response codes should never arrive on the request side.

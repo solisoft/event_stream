@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod admin_keys;
 pub mod admin_producers;
+pub mod admin_tiered;
 pub mod auth_ext;
 pub mod consume;
 pub mod coord;
@@ -66,6 +67,7 @@ pub fn router(broker: Arc<Broker>) -> Router {
             "/subjects/:subject/versions/latest",
             get(schemas::latest_version),
         )
+        .route("/admin/tiered/:topic/:partition", get(admin_tiered::list_remote))
         .layer((
             TraceLayer::new_for_http(),
             CatchPanicLayer::new(),
