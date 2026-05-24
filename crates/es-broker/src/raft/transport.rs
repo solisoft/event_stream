@@ -97,7 +97,15 @@ pub async fn spawn_transport(
         let cancel = cancel.clone();
         let my_id = node_id;
         tokio::spawn(async move {
-            dial_loop(my_id, peer_id, peer_addr, peer_rx, reconnect_backoff, cancel).await;
+            dial_loop(
+                my_id,
+                peer_id,
+                peer_addr,
+                peer_rx,
+                reconnect_backoff,
+                cancel,
+            )
+            .await;
         });
     }
 

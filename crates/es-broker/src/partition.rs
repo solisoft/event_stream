@@ -1,6 +1,6 @@
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -8,7 +8,7 @@ use arc_swap::ArcSwap;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::storage::record::{Record, encode_record, record_disk_size};
+use crate::storage::record::{encode_record, record_disk_size, Record};
 use crate::storage::recover::recover_partition;
 use crate::storage::segment::{Segment, SegmentAppender};
 use es_protocol::RecordDto;
@@ -95,11 +95,7 @@ impl Partition {
         self.segments.load_full()
     }
 
-    pub async fn append(
-        &self,
-        key: Option<&[u8]>,
-        value: &[u8],
-    ) -> Result<u64> {
+    pub async fn append(&self, key: Option<&[u8]>, value: &[u8]) -> Result<u64> {
         let timestamp_ms = now_ms();
         let mut appender = self.appender.lock().await;
         let offset = self.next_offset.load(Ordering::Acquire);
@@ -140,7 +136,11 @@ impl Partition {
             active
                 .size_bytes
                 .store(appender.size_bytes, Ordering::Release);
-            active.index.write().unwrap().push(offset - active.base_offset, file_pos);
+            active
+                .index
+                .write()
+                .unwrap()
+                .push(offset - active.base_offset, file_pos);
             active.observe_timestamp(timestamp_ms);
         }
 
@@ -251,10 +251,7 @@ impl Partition {
             break;
         }
 
-        let next_offset = out
-            .last()
-            .map(|r| r.offset + 1)
-            .unwrap_or(effective_next);
+        let next_offset = out.last().map(|r| r.offset + 1).unwrap_or(effective_next);
         Ok((out, next_offset, hwm))
     }
 
@@ -359,4 +356,3 @@ fn now_ms() -> i64 {
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
 }
-

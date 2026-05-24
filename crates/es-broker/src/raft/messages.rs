@@ -203,7 +203,11 @@ impl Message {
                     let index = r.u64()?;
                     let len = r.u32()? as usize;
                     let payload = r.bytes(len)?;
-                    entries.push(LogEntry { term, index, payload });
+                    entries.push(LogEntry {
+                        term,
+                        index,
+                        payload,
+                    });
                 }
                 let leader_commit = r.u64()?;
                 Ok(Self::AppendEntries(AppendEntries {
@@ -328,8 +332,16 @@ mod tests {
             prev_log_index: 5,
             prev_log_term: 2,
             entries: vec![
-                LogEntry { term: 3, index: 6, payload: vec![0xAB, 0xCD] },
-                LogEntry { term: 3, index: 7, payload: vec![] },
+                LogEntry {
+                    term: 3,
+                    index: 6,
+                    payload: vec![0xAB, 0xCD],
+                },
+                LogEntry {
+                    term: 3,
+                    index: 7,
+                    payload: vec![],
+                },
             ],
             leader_commit: 5,
         });

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use es_broker::{Config, spawn};
+use es_broker::{spawn, Config};
 use tempfile::TempDir;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -36,10 +36,7 @@ async fn schema_register_fetch_and_list() -> Result<()> {
     let body: serde_json::Value = res.json().await?;
     assert_eq!(body["id"].as_u64().unwrap(), 1);
 
-    let res = client
-        .get(format!("{}/schemas/1", base))
-        .send()
-        .await?;
+    let res = client.get(format!("{}/schemas/1", base)).send().await?;
     assert_eq!(res.status(), 200);
 
     let res = client.get(format!("{}/schemas", base)).send().await?;

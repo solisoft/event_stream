@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 
 /// Pluggable cold-storage backend for offloading sealed segments.
 pub trait TieredStore: Send + Sync {
@@ -67,8 +67,7 @@ impl TieredStore for LocalTieredStore {
         index_path: &Path,
     ) -> Result<u64> {
         let dir = self.segment_dir(topic, partition_id);
-        fs::create_dir_all(&dir)
-            .with_context(|| format!("create cold dir {:?}", dir))?;
+        fs::create_dir_all(&dir).with_context(|| format!("create cold dir {:?}", dir))?;
 
         let dest_log = dir.join(Self::log_name(base_offset));
         let dest_idx = dir.join(Self::index_name(base_offset));
@@ -77,9 +76,7 @@ impl TieredStore for LocalTieredStore {
             .with_context(|| format!("offload log {:?} → {:?}", log_path, dest_log))?;
         fs::copy(index_path, &dest_idx)
             .with_context(|| format!("offload index {:?} → {:?}", index_path, dest_idx))?;
-        let idx_size = fs::metadata(&dest_idx)
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let idx_size = fs::metadata(&dest_idx).map(|m| m.len()).unwrap_or(0);
 
         Ok(log_size + idx_size)
     }

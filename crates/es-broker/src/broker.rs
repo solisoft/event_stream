@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use dashmap::DashMap;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -178,7 +178,9 @@ fn spawn_coord_expire(broker: Arc<Broker>, interval: std::time::Duration) -> Joi
                 _ = cancel.cancelled() => break,
                 _ = tokio::time::sleep(interval) => {}
             }
-            let Some(b) = weak.upgrade() else { break; };
+            let Some(b) = weak.upgrade() else {
+                break;
+            };
             b.coordinator.expire_stale(&b).await;
         }
         tracing::info!("coord: expire task stopped");

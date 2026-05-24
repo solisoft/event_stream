@@ -264,8 +264,12 @@ impl<'a> WireReader<'a> {
     pub fn get_str(&mut self) -> io::Result<String> {
         let n = self.get_u16()? as usize;
         let raw = self.get_bytes(n)?;
-        String::from_utf8(raw)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("non-utf8 string: {}", e)))
+        String::from_utf8(raw).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("non-utf8 string: {}", e),
+            )
+        })
     }
     pub fn get_opt_bytes_i32(&mut self) -> io::Result<Option<Vec<u8>>> {
         let len = self.get_i32()?;

@@ -173,8 +173,7 @@ pub fn read_record<R: Read + Seek>(reader: &mut R) -> Result<Record, RecordDecod
 /// Total on-disk size of a record with the given key/value lengths (including
 /// record_len prefix and CRC trailer).
 pub fn record_disk_size(key_len: Option<usize>, value_len: usize) -> usize {
-    let body =
-        HEADER_LEN + key_len.unwrap_or(0) + VALUE_LEN_FIELD + value_len + CRC_LEN;
+    let body = HEADER_LEN + key_len.unwrap_or(0) + VALUE_LEN_FIELD + value_len + CRC_LEN;
     RECORD_LEN_FIELD + body
 }
 

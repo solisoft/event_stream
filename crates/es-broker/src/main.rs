@@ -4,11 +4,11 @@ use std::time::Duration;
 
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
-use tokio::signal::unix::{SignalKind, signal};
+use tokio::signal::unix::{signal, SignalKind};
 use tracing_subscriber::EnvFilter;
 
-use es_broker::{Config, spawn};
 use es_broker::auth::AuthMode;
+use es_broker::{spawn, Config};
 
 #[derive(Parser, Debug)]
 #[command(name = "es-broker", about = "Basic event-streaming broker")]
@@ -94,7 +94,9 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
 
     // Log panics with backtrace instead of letting them go to stderr silently.

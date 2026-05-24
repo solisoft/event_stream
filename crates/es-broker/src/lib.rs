@@ -104,8 +104,7 @@ pub async fn spawn(config: Config) -> Result<BrokerHandle> {
     broker.start_background();
     let app = http::router(broker.clone());
 
-    let tls_enabled =
-        config.tls_cert_path.is_some() && config.tls_key_path.is_some();
+    let tls_enabled = config.tls_cert_path.is_some() && config.tls_key_path.is_some();
 
     let (addr, tls_handle, join, shutdown_tx, scheme) = if tls_enabled {
         let cert_path = config
@@ -118,9 +117,10 @@ pub async fn spawn(config: Config) -> Result<BrokerHandle> {
             .as_ref()
             .context("tls_key_path is None but tls_enabled is true")?
             .clone();
-        let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path)
-            .await
-            .with_context(|| format!("load tls cert={:?} key={:?}", cert_path, key_path))?;
+        let tls_config =
+            axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path)
+                .await
+                .with_context(|| format!("load tls cert={:?} key={:?}", cert_path, key_path))?;
 
         let listener = std::net::TcpListener::bind(config.bind)?;
         let addr = listener.local_addr()?;
@@ -155,9 +155,10 @@ pub async fn spawn(config: Config) -> Result<BrokerHandle> {
         let bin_addr = listener.local_addr()?;
         let broker_for_binary = broker.clone();
         let cancel = broker.shutdown.clone();
-        let join = tokio::spawn(async move {
-            binary::serve_binary(broker_for_binary, listener, cancel).await
-        });
+        let join =
+            tokio::spawn(
+                async move { binary::serve_binary(broker_for_binary, listener, cancel).await },
+            );
         (Some(bin_addr), Some(join))
     } else {
         (None, None)

@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use anyhow::Result;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -8,9 +8,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
 use es_protocol::wire::{
-    FEATURE_GZIP, HandshakeStatus, Opcode, WireConsumeResponse, WireProduceResult, WireRecord,
-    WIRE_MAGIC, decode_consume_request, decode_produce_request, encode_consume_response,
-    encode_produce_response,
+    decode_consume_request, decode_produce_request, encode_consume_response,
+    encode_produce_response, HandshakeStatus, Opcode, WireConsumeResponse, WireProduceResult,
+    WireRecord, FEATURE_GZIP, WIRE_MAGIC,
 };
 
 use crate::auth::{AclAction, ApiKey, AuthMode};
@@ -78,7 +78,12 @@ async fn handle_connection(
     sock.read_exact(&mut buf4).await?;
     let token_len = u32::from_be_bytes(buf4);
     if token_len > 1024 {
-        write_handshake_status(&mut sock, HandshakeStatus::AuthFailed, "auth token too long").await?;
+        write_handshake_status(
+            &mut sock,
+            HandshakeStatus::AuthFailed,
+            "auth token too long",
+        )
+        .await?;
         return Ok(());
     }
     let mut token_bytes = vec![0u8; token_len as usize];
@@ -104,13 +109,19 @@ async fn handle_connection(
         }),
         AuthMode::Required => {
             if token.is_empty() {
-                write_handshake_status(&mut sock, HandshakeStatus::AuthRequired, "auth token required").await?;
+                write_handshake_status(
+                    &mut sock,
+                    HandshakeStatus::AuthRequired,
+                    "auth token required",
+                )
+                .await?;
                 return Ok(());
             }
             match broker.keys.authenticate(&token) {
                 Some(k) => k,
                 None => {
-                    write_handshake_status(&mut sock, HandshakeStatus::AuthFailed, "invalid token").await?;
+                    write_handshake_status(&mut sock, HandshakeStatus::AuthFailed, "invalid token")
+                        .await?;
                     return Ok(());
                 }
             }
@@ -167,7 +178,8 @@ async fn write_handshake_status(
     sock.write_all(&[status as u8]).await?;
     sock.write_all(&0u32.to_be_bytes()).await?; // no features yet
     let msg_bytes = msg.as_bytes();
-    sock.write_all(&(msg_bytes.len() as u32).to_be_bytes()).await?;
+    sock.write_all(&(msg_bytes.len() as u32).to_be_bytes())
+        .await?;
     sock.write_all(msg_bytes).await?;
     Ok(())
 }
@@ -231,10 +243,13 @@ async fn write_frame(
 }
 
 fn compress(input: &[u8]) -> std::io::Result<Vec<u8>> {
-    use flate2::Compression;
     use flate2::write::GzEncoder;
+    use flate2::Compression;
     use std::io::Write;
-    let mut enc = GzEncoder::new(Vec::with_capacity(input.len() / 2 + 32), Compression::default());
+    let mut enc = GzEncoder::new(
+        Vec::with_capacity(input.len() / 2 + 32),
+        Compression::default(),
+    );
     enc.write_all(input)?;
     enc.finish()
 }
@@ -273,10 +288,7 @@ async fn dispatch(
                 .iter()
                 .map(|r| r.key.as_ref().map(|k| k.len() as u64).unwrap_or(0) + r.value.len() as u64)
                 .sum();
-            if let Err(retry_after) = broker
-                .keys
-                .check_produce(&key.key_id, request_bytes as u32)
-            {
+            if let Err(retry_after) = broker.keys.check_produce(&key.key_id, request_bytes as u32) {
                 return Err(format!("rate_limited: retry in {:.1}s", retry_after));
             }
 
@@ -354,8 +366,8 @@ async fn dispatch(
                         )
                         .await;
                 }
-                total_appended += r.key.as_ref().map(|k| k.len() as u64).unwrap_or(0)
-                    + r.value.len() as u64;
+                total_appended +=
+                    r.key.as_ref().map(|k| k.len() as u64).unwrap_or(0) + r.value.len() as u64;
                 records_appended += 1;
                 results.push(WireProduceResult {
                     partition: partition_id,

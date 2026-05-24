@@ -43,7 +43,11 @@ impl SparseIndex {
         }
     }
 
-    pub fn write_entry(file: &mut File, relative_offset: u64, file_position: u64) -> io::Result<()> {
+    pub fn write_entry(
+        file: &mut File,
+        relative_offset: u64,
+        file_position: u64,
+    ) -> io::Result<()> {
         let mut buf = [0u8; INDEX_ENTRY_LEN];
         buf[0..8].copy_from_slice(&relative_offset.to_be_bytes());
         buf[8..16].copy_from_slice(&file_position.to_be_bytes());

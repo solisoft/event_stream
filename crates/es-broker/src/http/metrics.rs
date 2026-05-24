@@ -1,10 +1,10 @@
 use std::fmt::Write;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use axum::{
     extract::State,
-    http::{HeaderMap, HeaderValue, header},
+    http::{header, HeaderMap, HeaderValue},
     response::IntoResponse,
 };
 
@@ -32,7 +32,9 @@ async fn render_metrics(broker: &Arc<Broker>) -> String {
     out.push_str("# TYPE es_partition_start_offset gauge\n");
     let topic_names = broker.list_topics();
     for name in &topic_names {
-        let Some(topic) = broker.topic(name) else { continue };
+        let Some(topic) = broker.topic(name) else {
+            continue;
+        };
         for p in &topic.partitions {
             writeln!(
                 out,
@@ -48,7 +50,9 @@ async fn render_metrics(broker: &Arc<Broker>) -> String {
     out.push_str("# HELP es_partition_end_offset High watermark (offset of the next record to be produced).\n");
     out.push_str("# TYPE es_partition_end_offset gauge\n");
     for name in &topic_names {
-        let Some(topic) = broker.topic(name) else { continue };
+        let Some(topic) = broker.topic(name) else {
+            continue;
+        };
         for p in &topic.partitions {
             writeln!(
                 out,
@@ -61,10 +65,14 @@ async fn render_metrics(broker: &Arc<Broker>) -> String {
         }
     }
 
-    out.push_str("# HELP es_partition_size_bytes On-disk size of the partition across all segments.\n");
+    out.push_str(
+        "# HELP es_partition_size_bytes On-disk size of the partition across all segments.\n",
+    );
     out.push_str("# TYPE es_partition_size_bytes gauge\n");
     for name in &topic_names {
-        let Some(topic) = broker.topic(name) else { continue };
+        let Some(topic) = broker.topic(name) else {
+            continue;
+        };
         for p in &topic.partitions {
             writeln!(
                 out,
@@ -77,10 +85,14 @@ async fn render_metrics(broker: &Arc<Broker>) -> String {
         }
     }
 
-    out.push_str("# HELP es_partition_segment_count Number of segments currently in the partition.\n");
+    out.push_str(
+        "# HELP es_partition_segment_count Number of segments currently in the partition.\n",
+    );
     out.push_str("# TYPE es_partition_segment_count gauge\n");
     for name in &topic_names {
-        let Some(topic) = broker.topic(name) else { continue };
+        let Some(topic) = broker.topic(name) else {
+            continue;
+        };
         for p in &topic.partitions {
             writeln!(
                 out,
@@ -97,7 +109,9 @@ async fn render_metrics(broker: &Arc<Broker>) -> String {
     out.push_str("# HELP es_topic_records_produced_total Records appended via produce.\n");
     out.push_str("# TYPE es_topic_records_produced_total counter\n");
     for name in &topic_names {
-        let Some(topic) = broker.topic(name) else { continue };
+        let Some(topic) = broker.topic(name) else {
+            continue;
+        };
         writeln!(
             out,
             r#"es_topic_records_produced_total{{topic="{}"}} {}"#,
@@ -109,7 +123,9 @@ async fn render_metrics(broker: &Arc<Broker>) -> String {
     out.push_str("# HELP es_topic_bytes_produced_total Bytes of key+value appended via produce.\n");
     out.push_str("# TYPE es_topic_bytes_produced_total counter\n");
     for name in &topic_names {
-        let Some(topic) = broker.topic(name) else { continue };
+        let Some(topic) = broker.topic(name) else {
+            continue;
+        };
         writeln!(
             out,
             r#"es_topic_bytes_produced_total{{topic="{}"}} {}"#,
@@ -121,7 +137,9 @@ async fn render_metrics(broker: &Arc<Broker>) -> String {
     out.push_str("# HELP es_topic_records_consumed_total Records served via consume.\n");
     out.push_str("# TYPE es_topic_records_consumed_total counter\n");
     for name in &topic_names {
-        let Some(topic) = broker.topic(name) else { continue };
+        let Some(topic) = broker.topic(name) else {
+            continue;
+        };
         writeln!(
             out,
             r#"es_topic_records_consumed_total{{topic="{}"}} {}"#,
@@ -133,7 +151,9 @@ async fn render_metrics(broker: &Arc<Broker>) -> String {
     out.push_str("# HELP es_topic_bytes_consumed_total Bytes of key+value served via consume.\n");
     out.push_str("# TYPE es_topic_bytes_consumed_total counter\n");
     for name in &topic_names {
-        let Some(topic) = broker.topic(name) else { continue };
+        let Some(topic) = broker.topic(name) else {
+            continue;
+        };
         writeln!(
             out,
             r#"es_topic_bytes_consumed_total{{topic="{}"}} {}"#,
@@ -147,7 +167,9 @@ async fn render_metrics(broker: &Arc<Broker>) -> String {
     out.push_str("# HELP es_retention_segments_deleted_total Segments deleted by the reaper.\n");
     out.push_str("# TYPE es_retention_segments_deleted_total counter\n");
     for name in &topic_names {
-        let Some(topic) = broker.topic(name) else { continue };
+        let Some(topic) = broker.topic(name) else {
+            continue;
+        };
         for p in &topic.partitions {
             writeln!(
                 out,
@@ -162,7 +184,9 @@ async fn render_metrics(broker: &Arc<Broker>) -> String {
     out.push_str("# HELP es_retention_bytes_reclaimed_total Bytes reclaimed by the reaper.\n");
     out.push_str("# TYPE es_retention_bytes_reclaimed_total counter\n");
     for name in &topic_names {
-        let Some(topic) = broker.topic(name) else { continue };
+        let Some(topic) = broker.topic(name) else {
+            continue;
+        };
         for p in &topic.partitions {
             writeln!(
                 out,
@@ -177,7 +201,9 @@ async fn render_metrics(broker: &Arc<Broker>) -> String {
     out.push_str("# HELP es_compaction_runs_total Compaction passes completed.\n");
     out.push_str("# TYPE es_compaction_runs_total counter\n");
     for name in &topic_names {
-        let Some(topic) = broker.topic(name) else { continue };
+        let Some(topic) = broker.topic(name) else {
+            continue;
+        };
         for p in &topic.partitions {
             writeln!(
                 out,
@@ -192,7 +218,9 @@ async fn render_metrics(broker: &Arc<Broker>) -> String {
     out.push_str("# HELP es_compaction_records_dropped_total Records discarded by compaction (dupes + expired tombstones).\n");
     out.push_str("# TYPE es_compaction_records_dropped_total counter\n");
     for name in &topic_names {
-        let Some(topic) = broker.topic(name) else { continue };
+        let Some(topic) = broker.topic(name) else {
+            continue;
+        };
         for p in &topic.partitions {
             writeln!(
                 out,
@@ -210,15 +238,13 @@ async fn render_metrics(broker: &Arc<Broker>) -> String {
     out.push_str("# TYPE es_group_committed_offset gauge\n");
     out.push_str("# HELP es_group_lag Records between the committed offset and the partition's high watermark.\n");
     out.push_str("# TYPE es_group_lag gauge\n");
-    let group_names: Vec<String> = broker
-        .groups
-        .iter_group_names()
-        .into_iter()
-        .collect();
+    let group_names: Vec<String> = broker.groups.iter_group_names().into_iter().collect();
     for g in &group_names {
         let snapshot = broker.groups.snapshot(g).await;
         for (topic_name, parts) in snapshot {
-            let Some(topic) = broker.topic(&topic_name) else { continue };
+            let Some(topic) = broker.topic(&topic_name) else {
+                continue;
+            };
             for (pid, committed) in parts {
                 let p = match topic.partitions.get(pid as usize) {
                     Some(p) => p,

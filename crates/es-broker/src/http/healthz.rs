@@ -1,10 +1,6 @@
 use std::sync::Arc;
 
-use axum::{
-    Json,
-    extract::State,
-    http::StatusCode,
-};
+use axum::{extract::State, http::StatusCode, Json};
 use serde::Serialize;
 
 use crate::broker::Broker;

@@ -1,15 +1,15 @@
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use es_protocol::{
-    AclActionDto, AclRuleDto, AssignmentResponse, CleanupPolicyDto, CommitRequest,
-    ConsumeResponse, CreateKeyRequest, CreateKeyResponse, CreateTopicRequest,
-    DescribeTopicResponse, GroupOffsetsResponse, HeartbeatRequest, HeartbeatResponse,
-    JoinGroupRequest, JoinGroupResponse, LeaveGroupRequest, ListKeysResponse,
-    ListProducersResponse, ListTopicsResponse, ProduceRecord, ProduceRequest, ProduceResponse,
-    ResetOffsetsRequest, ResetOffsetsResponse, TopicConfigDto, TopicConfigPatch, TopicSummary,
+    AclActionDto, AclRuleDto, AssignmentResponse, CleanupPolicyDto, CommitRequest, ConsumeResponse,
+    CreateKeyRequest, CreateKeyResponse, CreateTopicRequest, DescribeTopicResponse,
+    GroupOffsetsResponse, HeartbeatRequest, HeartbeatResponse, JoinGroupRequest, JoinGroupResponse,
+    LeaveGroupRequest, ListKeysResponse, ListProducersResponse, ListTopicsResponse, ProduceRecord,
+    ProduceRequest, ProduceResponse, ResetOffsetsRequest, ResetOffsetsResponse, TopicConfigDto,
+    TopicConfigPatch, TopicSummary,
 };
 
 #[derive(Parser, Debug)]
@@ -294,8 +294,12 @@ async fn main() -> Result<()> {
                     partitions,
                     config: if any_set { Some(patch) } else { None },
                 };
-                let resp: TopicSummary = post_json(&client, &format!("{}/topics", base), &body).await?;
-                println!("created topic '{}' with {} partition(s)", resp.name, resp.partitions);
+                let resp: TopicSummary =
+                    post_json(&client, &format!("{}/topics", base), &body).await?;
+                println!(
+                    "created topic '{}' with {} partition(s)",
+                    resp.name, resp.partitions
+                );
             }
             TopicCmd::Alter {
                 name,
@@ -312,17 +316,14 @@ async fn main() -> Result<()> {
                     segment_bytes,
                     tombstone_retention_ms,
                 );
-                let resp: TopicConfigDto = put_json(
-                    &client,
-                    &format!("{}/topics/{}/config", base, name),
-                    &patch,
-                )
-                .await?;
+                let resp: TopicConfigDto =
+                    put_json(&client, &format!("{}/topics/{}/config", base, name), &patch).await?;
                 println!("updated topic '{}' config:", name);
                 print_config(&resp);
             }
             TopicCmd::List => {
-                let resp: ListTopicsResponse = get_json(&client, &format!("{}/topics", base)).await?;
+                let resp: ListTopicsResponse =
+                    get_json(&client, &format!("{}/topics", base)).await?;
                 if resp.topics.is_empty() {
                     println!("(no topics)");
                 } else {
@@ -370,8 +371,8 @@ async fn main() -> Result<()> {
                     sequence: next_seq,
                 }]
             } else if let Some(path) = from_file {
-                let file = std::fs::File::open(&path)
-                    .with_context(|| format!("open {:?}", path))?;
+                let file =
+                    std::fs::File::open(&path).with_context(|| format!("open {:?}", path))?;
                 BufReader::new(file)
                     .lines()
                     .map_while(|l| l.ok())
@@ -397,8 +398,12 @@ async fn main() -> Result<()> {
                 records,
                 producer_id,
             };
-            let resp: ProduceResponse =
-                post_json(&client, &format!("{}/topics/{}/produce", base, topic), &body).await?;
+            let resp: ProduceResponse = post_json(
+                &client,
+                &format!("{}/topics/{}/produce", base, topic),
+                &body,
+            )
+            .await?;
             for r in resp.results {
                 let marker = if r.duplicate { " (duplicate)" } else { "" };
                 println!("partition={} offset={}{}", r.partition, r.offset, marker);
@@ -505,15 +510,21 @@ async fn main() -> Result<()> {
                     member_id,
                     generation,
                 };
-                let resp: HeartbeatResponse =
-                    post_json(&client, &format!("{}/groups/{}/heartbeat", base, name), &body)
-                        .await?;
+                let resp: HeartbeatResponse = post_json(
+                    &client,
+                    &format!("{}/groups/{}/heartbeat", base, name),
+                    &body,
+                )
+                .await?;
                 match resp {
                     HeartbeatResponse::Ok { generation } => {
                         println!("ok (generation {})", generation)
                     }
                     HeartbeatResponse::RebalanceRequired { current_generation } => {
-                        println!("rebalance required (current_generation {})", current_generation)
+                        println!(
+                            "rebalance required (current_generation {})",
+                            current_generation
+                        )
                     }
                     HeartbeatResponse::UnknownMember { current_generation } => println!(
                         "unknown member (current_generation {}); rejoin required",
@@ -695,7 +706,10 @@ fn build_client(auth: Option<&str>) -> Result<reqwest::Client> {
         .map_err(|e| anyhow!("reqwest client build failed: {}", e))
 }
 
-async fn get_json<T: serde::de::DeserializeOwned>(client: &reqwest::Client, url: &str) -> Result<T> {
+async fn get_json<T: serde::de::DeserializeOwned>(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<T> {
     let resp = client.get(url).send().await?;
     if !resp.status().is_success() {
         let status = resp.status();

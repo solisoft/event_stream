@@ -3,13 +3,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use base64::Engine;
 use dashmap::DashMap;
 use governor::{
-    Quota, RateLimiter,
     clock::DefaultClock,
     state::{InMemoryState, NotKeyed},
+    Quota, RateLimiter,
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -131,9 +131,9 @@ impl ApiKey {
         if self.disabled {
             return false;
         }
-        self.acls
-            .iter()
-            .any(|r| r.action == AclAction::Admin && (r.topic_prefix == "*" || r.topic_prefix.is_empty()))
+        self.acls.iter().any(|r| {
+            r.action == AclAction::Admin && (r.topic_prefix == "*" || r.topic_prefix.is_empty())
+        })
     }
 }
 
@@ -200,9 +200,8 @@ impl KeyStore {
         for pk in persisted.keys {
             let key_id = pk.key_id.clone();
             let mut hash_buf = [0u8; 32];
-            hex::decode_into(&pk.secret_sha256_hex, &mut hash_buf).with_context(|| {
-                format!("bad secret_sha256_hex on key {}", pk.key_id)
-            })?;
+            hex::decode_into(&pk.secret_sha256_hex, &mut hash_buf)
+                .with_context(|| format!("bad secret_sha256_hex on key {}", pk.key_id))?;
             let acls = pk
                 .acls
                 .iter()
@@ -374,16 +373,28 @@ impl KeyStore {
     /// for this key. Returns Ok if allowed (and consumes the tokens), Err with
     /// a retry hint in seconds if denied.
     pub fn check_produce(&self, key_id: &str, n_bytes: u32) -> Result<(), f64> {
-        check_against(self.limiters.get(key_id).and_then(|l| l.value().produce.clone()), n_bytes)
+        check_against(
+            self.limiters
+                .get(key_id)
+                .and_then(|l| l.value().produce.clone()),
+            n_bytes,
+        )
     }
 
     pub fn check_consume(&self, key_id: &str, n_bytes: u32) -> Result<(), f64> {
-        check_against(self.limiters.get(key_id).and_then(|l| l.value().consume.clone()), n_bytes)
+        check_against(
+            self.limiters
+                .get(key_id)
+                .and_then(|l| l.value().consume.clone()),
+            n_bytes,
+        )
     }
 }
 
 fn check_against(limiter: Option<Arc<Limiter>>, n: u32) -> Result<(), f64> {
-    let Some(limiter) = limiter else { return Ok(()) };
+    let Some(limiter) = limiter else {
+        return Ok(());
+    };
     let weight = match NonZeroU32::new(n.max(1)) {
         Some(w) => w,
         None => return Ok(()),
@@ -441,10 +452,14 @@ fn now_ms() -> i64 {
 
 // Tiny inline hex decoder so we don't pull in another dep.
 mod hex {
-    use anyhow::{Result, anyhow};
+    use anyhow::{anyhow, Result};
     pub fn decode_into(hex: &str, out: &mut [u8]) -> Result<()> {
         if hex.len() != out.len() * 2 {
-            return Err(anyhow!("hex length {} mismatched output {}", hex.len(), out.len() * 2));
+            return Err(anyhow!(
+                "hex length {} mismatched output {}",
+                hex.len(),
+                out.len() * 2
+            ));
         }
         let bytes = hex.as_bytes();
         for i in 0..out.len() {

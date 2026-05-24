@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -24,8 +24,8 @@ use tokio_util::sync::CancellationToken;
 use crate::partition::Partition;
 use crate::raft::state::RaftState;
 use crate::raft::{
-    JsonStore, LogIndex, NodeHandle, NodeId, Outbound, ProposeReply, RaftStore, Timing,
-    spawn_node_with_store, transport::Transport,
+    spawn_node_with_store, transport::Transport, JsonStore, LogIndex, NodeHandle, NodeId, Outbound,
+    ProposeReply, RaftStore, Timing,
 };
 use tokio::sync::Mutex as TokioMutex;
 
@@ -129,12 +129,8 @@ impl RaftPartition {
             flush_every_records,
         )?;
         let store: Arc<dyn RaftStore> = Arc::new(JsonStore::new(config.raft_store_path));
-        let mut raft = spawn_node_with_store(
-            config.node_id,
-            config.peers,
-            config.timing,
-            store.clone(),
-        )?;
+        let mut raft =
+            spawn_node_with_store(config.node_id, config.peers, config.timing, store.clone())?;
         let raft_state = raft.state.clone();
 
         // Take the outbound channel now so transport can use it later.
@@ -237,7 +233,9 @@ impl RaftPartition {
         match rx.await {
             Ok(Ok(result)) => Ok(result.offset),
             Ok(Err(e)) => Err(anyhow!(e)),
-            Err(_) => Err(anyhow!("raft apply task exited before this entry was applied")),
+            Err(_) => Err(anyhow!(
+                "raft apply task exited before this entry was applied"
+            )),
         }
     }
 

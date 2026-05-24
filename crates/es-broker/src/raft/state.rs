@@ -234,7 +234,11 @@ impl RaftState {
             Message::InstallSnapshotResp(isr) => self.handle_install_snapshot_resp(isr),
         };
 
-        if stepped_down && !actions.iter().any(|a| matches!(a, Action::ResetElectionTimer)) {
+        if stepped_down
+            && !actions
+                .iter()
+                .any(|a| matches!(a, Action::ResetElectionTimer))
+        {
             actions.insert(0, Action::ResetElectionTimer);
         }
 
@@ -374,8 +378,7 @@ impl RaftState {
             let our_last_index = self.log.last_index();
             let up_to_date = (rv.last_log_term > our_last_term)
                 || (rv.last_log_term == our_last_term && rv.last_log_index >= our_last_index);
-            let can_vote =
-                self.voted_for.is_none() || self.voted_for == Some(rv.candidate_id);
+            let can_vote = self.voted_for.is_none() || self.voted_for == Some(rv.candidate_id);
             if up_to_date && can_vote {
                 grant = true;
                 if self.voted_for != Some(rv.candidate_id) {
@@ -479,11 +482,7 @@ impl RaftState {
             self.recompute_commit_index();
         } else {
             // Back off and retry next heartbeat. Floor at 1 to keep send valid.
-            let cur = self
-                .next_index
-                .get(&aer.responder_id)
-                .copied()
-                .unwrap_or(1);
+            let cur = self.next_index.get(&aer.responder_id).copied().unwrap_or(1);
             self.next_index
                 .insert(aer.responder_id, cur.saturating_sub(1).max(1));
         }
@@ -643,13 +642,22 @@ mod tests {
             leader_id: 1,
             prev_log_index: 5,
             prev_log_term: 1,
-            entries: vec![LogEntry { term: 1, index: 6, payload: vec![] }],
+            entries: vec![LogEntry {
+                term: 1,
+                index: 6,
+                payload: vec![],
+            }],
             leader_commit: 0,
         }));
-        let rejected = actions.iter().any(|a| matches!(
-            a,
-            Action::SendTo(_, Message::AppendEntriesResp(AppendEntriesResp { success: false, .. }))
-        ));
+        let rejected = actions.iter().any(|a| {
+            matches!(
+                a,
+                Action::SendTo(
+                    _,
+                    Message::AppendEntriesResp(AppendEntriesResp { success: false, .. })
+                )
+            )
+        });
         assert!(rejected, "follower should reject mismatched prev");
         assert_eq!(s.log.last_index(), 0);
     }

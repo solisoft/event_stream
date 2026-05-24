@@ -1,9 +1,9 @@
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 
@@ -42,9 +42,7 @@ impl SchemaStore {
                     .with_context(|| format!("parse schemas {:?}", path))?;
                 (persisted.next_id, persisted.schemas)
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                (1, Vec::new())
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (1, Vec::new()),
             Err(e) => return Err(e.into()),
         };
 

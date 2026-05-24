@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use rand::Rng;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -313,10 +313,7 @@ async fn apply_and_persist(
                     Ok(None) => {
                         let mut s = state.lock().await;
                         s.next_index.insert(peer, base_index + 1);
-                        tracing::warn!(
-                            peer = peer,
-                            "raft: SendSnapshot but no snapshot available"
-                        );
+                        tracing::warn!(peer = peer, "raft: SendSnapshot but no snapshot available");
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "raft: failed to load snapshot");
@@ -345,11 +342,10 @@ pub async fn pump_outbound(
     deadline: std::time::Instant,
 ) -> Result<()> {
     use std::time::Instant;
-    let inbound_for: std::collections::BTreeMap<NodeId, mpsc::UnboundedSender<Message>> =
-        handles
-            .iter()
-            .map(|(k, v)| (*k, v.inbound.clone()))
-            .collect();
+    let inbound_for: std::collections::BTreeMap<NodeId, mpsc::UnboundedSender<Message>> = handles
+        .iter()
+        .map(|(k, v)| (*k, v.inbound.clone()))
+        .collect();
 
     loop {
         let mut delivered_any = false;

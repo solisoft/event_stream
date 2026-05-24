@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::task::JoinHandle;
@@ -81,11 +81,7 @@ async fn offload_victims(
 }
 
 pub async fn run_pass(broker: &Arc<Broker>, grace: Duration, cancel: &CancellationToken) {
-    let topic_names: Vec<String> = broker
-        .topics
-        .iter()
-        .map(|kv| kv.key().clone())
-        .collect();
+    let topic_names: Vec<String> = broker.topics.iter().map(|kv| kv.key().clone()).collect();
     for name in topic_names {
         let topic = match broker.topic(&name) {
             Some(t) => t,
@@ -109,7 +105,10 @@ pub async fn run_pass(broker: &Arc<Broker>, grace: Duration, cancel: &Cancellati
             // Offload to cold storage before deleting (if configured).
             offload_victims(broker, &name, partition.id(), &victims).await;
             let victim_count = victims.len() as u64;
-            match partition.drop_sealed_segments(&victims, grace, cancel).await {
+            match partition
+                .drop_sealed_segments(&victims, grace, cancel)
+                .await
+            {
                 Err(e) => {
                     tracing::warn!(topic = %name, partition = partition.id(), error = %e, "reaper: drop failed");
                 }

@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use axum::{
     extract::{Path, State},
@@ -37,10 +37,7 @@ pub async fn produce(
         .iter()
         .map(|r| r.key.as_ref().map(|k| k.len() as u64).unwrap_or(0) + r.value.len() as u64)
         .sum();
-    if let Err(retry_after) = broker
-        .keys
-        .check_produce(&key.key_id, request_bytes as u32)
-    {
+    if let Err(retry_after) = broker.keys.check_produce(&key.key_id, request_bytes as u32) {
         return Err(AppError::too_many_requests(format!(
             "produce rate limit exceeded; retry in {:.1}s",
             retry_after
@@ -114,8 +111,8 @@ pub async fn produce(
                 .record_offset(pid, &topic_name, partition_id, r.sequence.unwrap(), offset)
                 .await;
         }
-        total_bytes_appended += key_bytes.as_ref().map(|k| k.len() as u64).unwrap_or(0)
-            + value_bytes.len() as u64;
+        total_bytes_appended +=
+            key_bytes.as_ref().map(|k| k.len() as u64).unwrap_or(0) + value_bytes.len() as u64;
         records_appended += 1;
         results.push(ProduceResult {
             partition: partition_id,

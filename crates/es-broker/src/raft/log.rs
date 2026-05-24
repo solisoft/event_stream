@@ -33,11 +33,17 @@ pub struct Log {
 
 impl Log {
     pub fn last_index(&self) -> LogIndex {
-        self.entries.last().map(|e| e.index).unwrap_or(self.base_index)
+        self.entries
+            .last()
+            .map(|e| e.index)
+            .unwrap_or(self.base_index)
     }
 
     pub fn last_term(&self) -> Term {
-        self.entries.last().map(|e| e.term).unwrap_or(self.base_term)
+        self.entries
+            .last()
+            .map(|e| e.term)
+            .unwrap_or(self.base_term)
     }
 
     /// Term at `index`. `Some(0)` for index 0 (Raft sentinel). `None` if the
@@ -310,7 +316,10 @@ impl RaftStore for JsonStore {
     fn save_snapshot(&self, snap: &PersistedSnapshot) -> Result<()> {
         let _guard = self.write_lock.lock().unwrap();
         let path = self.snapshot_path();
-        let parent = path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+        let parent = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
         std::fs::create_dir_all(&parent)?;
         let tmp = path.with_extension("json.tmp");
         let bytes = serde_json::to_vec(snap)?;

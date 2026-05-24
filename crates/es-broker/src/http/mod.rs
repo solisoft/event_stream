@@ -14,7 +14,10 @@ pub mod topics;
 
 use std::sync::Arc;
 
-use axum::{Router, routing::{delete, get, post}};
+use axum::{
+    routing::{delete, get, post},
+    Router,
+};
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
@@ -46,23 +49,23 @@ pub fn router(broker: Arc<Broker>) -> Router {
         .route("/groups/:group/assignment", get(coord::assignment))
         .route("/admin/run-retention", post(admin::run_retention))
         .route("/admin/run-compaction", post(admin::run_compaction))
-        .route("/admin/keys", get(admin_keys::list).post(admin_keys::create))
-        .route("/admin/keys/:key_id", delete(admin_keys::revoke))
         .route(
-            "/admin/producers",
-            get(admin_producers::list),
+            "/admin/keys",
+            get(admin_keys::list).post(admin_keys::create),
         )
+        .route("/admin/keys/:key_id", delete(admin_keys::revoke))
+        .route("/admin/producers", get(admin_producers::list))
         .route(
             "/admin/producers/:producer_id",
             delete(admin_producers::revoke),
         )
-        .route(
-            "/admin/reset-offsets",
-            post(admin_producers::reset_offsets),
-        )
+        .route("/admin/reset-offsets", post(admin_producers::reset_offsets))
         .route("/schemas", get(schemas::list).post(schemas::register))
         .route("/schemas/:id", get(schemas::get))
-        .route("/subjects/:subject/versions/latest", get(schemas::latest_version))
+        .route(
+            "/subjects/:subject/versions/latest",
+            get(schemas::latest_version),
+        )
         .layer((
             TraceLayer::new_for_http(),
             CatchPanicLayer::new(),

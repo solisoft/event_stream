@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use axum::{
-    Json,
     extract::{Path, State},
+    Json,
 };
 use serde::{Deserialize, Serialize};
 
@@ -75,9 +75,7 @@ pub async fn get(
     Ok(Json(SchemaResponse::from(entry.as_ref())))
 }
 
-pub async fn list(
-    State(broker): State<Arc<Broker>>,
-) -> Json<Vec<SchemaResponse>> {
+pub async fn list(State(broker): State<Arc<Broker>>) -> Json<Vec<SchemaResponse>> {
     let schemas: Vec<SchemaResponse> = broker
         .schemas
         .list()

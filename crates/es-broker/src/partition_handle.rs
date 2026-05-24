@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -103,7 +103,9 @@ impl PartitionHandle {
     ) -> Result<(Vec<Record>, u64, u64)> {
         match self {
             Self::Plain(p) => p.read_records_raw(target_offset, max_records, max_bytes),
-            Self::Raft(p) => p.partition().read_records_raw(target_offset, max_records, max_bytes),
+            Self::Raft(p) => p
+                .partition()
+                .read_records_raw(target_offset, max_records, max_bytes),
         }
     }
 
@@ -115,7 +117,9 @@ impl PartitionHandle {
     ) -> Result<(Vec<RecordDto>, u64, u64)> {
         match self {
             Self::Plain(p) => p.read_records(target_offset, max_records, max_bytes),
-            Self::Raft(p) => p.partition().read_records(target_offset, max_records, max_bytes),
+            Self::Raft(p) => p
+                .partition()
+                .read_records(target_offset, max_records, max_bytes),
         }
     }
 
@@ -127,7 +131,11 @@ impl PartitionHandle {
     ) -> Result<u64> {
         match self {
             Self::Plain(p) => p.drop_sealed_segments(victim_bases, grace, cancel).await,
-            Self::Raft(p) => p.partition().drop_sealed_segments(victim_bases, grace, cancel).await,
+            Self::Raft(p) => {
+                p.partition()
+                    .drop_sealed_segments(victim_bases, grace, cancel)
+                    .await
+            }
         }
     }
 

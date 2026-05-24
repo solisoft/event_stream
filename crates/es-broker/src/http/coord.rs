@@ -109,11 +109,9 @@ pub async fn assignment(
             generation,
             assignment: to_tp(assignment),
         })),
-        AssignmentReply::UnknownMember { current_generation } => {
-            Err(AppError::not_found(format!(
-                "member not in group (current generation {})",
-                current_generation
-            )))
-        }
+        AssignmentReply::UnknownMember { current_generation } => Err(AppError::not_found(format!(
+            "member not in group (current generation {})",
+            current_generation
+        ))),
     }
 }

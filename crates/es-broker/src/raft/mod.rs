@@ -28,6 +28,6 @@ pub mod transport;
 
 pub use log::{JsonStore, Log, MemStore, PersistedRaft, PersistedSnapshot, RaftStore};
 pub use messages::{LogEntry, LogIndex, Message, NodeId, Term};
-pub use node::{NodeHandle, Outbound, ProposeReply, Timing, spawn_node, spawn_node_with_store};
+pub use node::{spawn_node, spawn_node_with_store, NodeHandle, Outbound, ProposeReply, Timing};
 pub use state::{Action, RaftState, Role};
-pub use transport::{Transport, spawn_transport};
+pub use transport::{spawn_transport, Transport};

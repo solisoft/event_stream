@@ -1,10 +1,10 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -80,8 +80,8 @@ impl ProducerRegistry {
             dirty: AtomicBool::new(false),
         };
         if let Ok(bytes) = std::fs::read(&file_path) {
-            let persisted: PersistedRegistry = serde_json::from_slice(&bytes)
-                .with_context(|| format!("parse {:?}", file_path))?;
+            let persisted: PersistedRegistry =
+                serde_json::from_slice(&bytes).with_context(|| format!("parse {:?}", file_path))?;
             for p in persisted.producers {
                 let mut parts: BTreeMap<(String, u32), PartitionState> = BTreeMap::new();
                 for q in p.partitions {
@@ -101,10 +101,7 @@ impl ProducerRegistry {
         Ok(Arc::new(store))
     }
 
-    fn slot(
-        &self,
-        producer_id: &str,
-    ) -> Arc<Mutex<BTreeMap<(String, u32), PartitionState>>> {
+    fn slot(&self, producer_id: &str) -> Arc<Mutex<BTreeMap<(String, u32), PartitionState>>> {
         if let Some(slot) = self.state.get(producer_id) {
             return slot.clone();
         }

@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use es_broker::binary::{BinaryClient, ClientOptions};
-use es_broker::{Config, spawn};
+use es_broker::{spawn, Config};
 use es_protocol::wire::WireProduceRecord;
 use es_protocol::CreateTopicRequest;
 use reqwest::Client as HttpClient;
@@ -19,11 +19,7 @@ fn ephemeral() -> SocketAddr {
 }
 
 async fn boot(tmp: &TempDir) -> Result<es_broker::BrokerHandle> {
-    let mut cfg = Config::new(
-        tmp.path().to_path_buf(),
-        ephemeral(),
-        1 << 24,
-    );
+    let mut cfg = Config::new(tmp.path().to_path_buf(), ephemeral(), 1 << 24);
     cfg.bind_binary = Some(ephemeral());
     cfg.flush_every_records = BATCH as u32;
     spawn(cfg).await
@@ -56,8 +52,14 @@ async fn bench_throughput() -> Result<()> {
     for npart in &[1u32, 4u32] {
         let name = format!("p{}", npart);
         http.post(format!("{}/topics", base))
-            .json(&CreateTopicRequest { name: name.clone(), partitions: *npart, config: None })
-            .send().await?.error_for_status()?;
+            .json(&CreateTopicRequest {
+                name: name.clone(),
+                partitions: *npart,
+                config: None,
+            })
+            .send()
+            .await?
+            .error_for_status()?;
 
         let batches_per_task = TOTAL_RECORDS / BATCH / CONCURRENCY;
         let start = Instant::now();
@@ -66,27 +68,38 @@ async fn bench_throughput() -> Result<()> {
             let topic = name.clone();
             let v = val_bytes.to_vec();
             let addr = bin_addr;
-            let npart = *npart;
+            let _npart = *npart;
             tasks.push(tokio::spawn(async move {
-                let mut client = BinaryClient::connect_with(addr, "", ClientOptions { gzip: false }).await?;
+                let mut client =
+                    BinaryClient::connect_with(addr, "", ClientOptions { gzip: false }).await?;
                 for b in 0..batches_per_task {
-                    let records: Vec<WireProduceRecord> = (0..BATCH).map(|i| WireProduceRecord {
-                        key: Some(format!("k{}", t * batches_per_task * BATCH + b * BATCH + i).into_bytes()),
-                        value: v.clone(),
-                        partition: None,
-                        sequence: None,
-                    }).collect();
+                    let records: Vec<WireProduceRecord> = (0..BATCH)
+                        .map(|i| WireProduceRecord {
+                            key: Some(
+                                format!("k{}", t * batches_per_task * BATCH + b * BATCH + i)
+                                    .into_bytes(),
+                            ),
+                            value: v.clone(),
+                            partition: None,
+                            sequence: None,
+                        })
+                        .collect();
                     client.produce(&topic, None, records).await?;
                 }
                 Ok::<_, anyhow::Error>(())
             }));
         }
-        for t in tasks { t.await??; }
+        for t in tasks {
+            t.await??;
+        }
         let elapsed = start.elapsed().as_secs_f64();
 
         println!(
             "binary / {} conns / {}p : {:>8.2} MB/s  {:>8.2} k rec/s",
-            CONCURRENCY, npart, mbps(TOTAL_RECORDS * VALUE_BYTES, elapsed), krecps(TOTAL_RECORDS, elapsed)
+            CONCURRENCY,
+            npart,
+            mbps(TOTAL_RECORDS * VALUE_BYTES, elapsed),
+            krecps(TOTAL_RECORDS, elapsed)
         );
     }
 

@@ -2,19 +2,19 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::broker::Broker;
 use crate::partition::Partition;
 use crate::storage::index::SparseIndex;
-use crate::storage::record::{Record, RecordDecodeError, encode_record, read_record};
-use crate::storage::segment::{Segment, segment_index_name, segment_log_name};
+use crate::storage::record::{encode_record, read_record, Record, RecordDecodeError};
+use crate::storage::segment::{segment_index_name, segment_log_name, Segment};
 use crate::topic::TopicConfig;
 
 pub fn spawn_compactor(
@@ -41,11 +41,7 @@ pub fn spawn_compactor(
 }
 
 pub async fn run_pass(broker: &Arc<Broker>, grace: Duration, cancel: &CancellationToken) {
-    let topic_names: Vec<String> = broker
-        .topics
-        .iter()
-        .map(|kv| kv.key().clone())
-        .collect();
+    let topic_names: Vec<String> = broker.topics.iter().map(|kv| kv.key().clone()).collect();
     for name in topic_names {
         let topic = match broker.topic(&name) {
             Some(t) => t,
@@ -275,13 +271,23 @@ fn write_compacted_segment(
     let mut buf = Vec::new();
     for r in records {
         buf.clear();
-        encode_record(&mut buf, r.offset, r.timestamp_ms, r.key.as_deref(), &r.value);
+        encode_record(
+            &mut buf,
+            r.offset,
+            r.timestamp_ms,
+            r.key.as_deref(),
+            &r.value,
+        );
         let file_pos = size_bytes;
         log.write_all(&buf)?;
         size_bytes += buf.len() as u64;
         index_entries.push((r.offset - base_offset, file_pos));
-        if r.timestamp_ms < min_ts { min_ts = r.timestamp_ms; }
-        if r.timestamp_ms > max_ts { max_ts = r.timestamp_ms; }
+        if r.timestamp_ms < min_ts {
+            min_ts = r.timestamp_ms;
+        }
+        if r.timestamp_ms > max_ts {
+            max_ts = r.timestamp_ms;
+        }
     }
     log.flush()?;
     log.get_ref().sync_all()?;
@@ -297,4 +303,3 @@ fn now_ms() -> i64 {
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
 }
-

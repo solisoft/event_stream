@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use dashmap::DashMap;
 use rand::RngCore;
 use tokio::sync::Mutex;
@@ -57,10 +57,7 @@ impl GroupCoordinator {
             return s.clone();
         }
         let new = Arc::new(Mutex::new(GroupState::default()));
-        self.state
-            .entry(group.to_string())
-            .or_insert(new)
-            .clone()
+        self.state.entry(group.to_string()).or_insert(new).clone()
     }
 
     /// Returns every group name currently tracked. Used by the background
@@ -283,7 +280,9 @@ fn recompute_assignment(broker: &Arc<Broker>, state: &mut GroupState) {
     // Pass 1 — sticky. Iterate previous owners in sorted order so the choice
     // is deterministic when two members both have a claim.
     for (prev_owner, prev_parts) in &previous {
-        let Some(member) = state.members.get(prev_owner) else { continue };
+        let Some(member) = state.members.get(prev_owner) else {
+            continue;
+        };
         let bucket = current.get_mut(prev_owner).unwrap();
         for tp in prev_parts {
             if !all_partitions.contains(tp) {

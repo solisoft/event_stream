@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 use super::index::SparseIndex;
-use super::record::{RecordDecodeError, read_record};
+use super::record::{read_record, RecordDecodeError};
 use super::segment::{Segment, SegmentAppender};
 
 pub struct RecoveredPartition {
@@ -92,7 +92,9 @@ pub fn recover_partition(dir: &Path) -> io::Result<RecoveredPartition> {
         SegmentAppender::open_existing(
             dir,
             active_base,
-            segments[active_idx].size_bytes.load(std::sync::atomic::Ordering::Acquire),
+            segments[active_idx]
+                .size_bytes
+                .load(std::sync::atomic::Ordering::Acquire),
             (segments[active_idx].index.read().unwrap().len() as u64) * 16,
         )?
     } else {
@@ -200,8 +202,12 @@ fn scan_segment(log_path: &PathBuf, base_offset: u64) -> io::Result<SegmentScan>
                 entries.push((rel, pos_before));
                 next_offset = r.offset + 1;
                 last_good_pos = file.stream_position()?;
-                if r.timestamp_ms < min_ts { min_ts = r.timestamp_ms; }
-                if r.timestamp_ms > max_ts { max_ts = r.timestamp_ms; }
+                if r.timestamp_ms < min_ts {
+                    min_ts = r.timestamp_ms;
+                }
+                if r.timestamp_ms > max_ts {
+                    max_ts = r.timestamp_ms;
+                }
             }
             Err(RecordDecodeError::Eof) => {
                 if file_size > last_good_pos {

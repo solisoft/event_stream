@@ -2,14 +2,14 @@
 
 use std::net::SocketAddr;
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use es_protocol::wire::{
-    FEATURE_GZIP, HandshakeStatus, Opcode, WireConsumeRequest, WireConsumeResponse,
-    WireProduceRecord, WireProduceRequest, WireProduceResult, WIRE_MAGIC, decode_consume_response,
-    decode_produce_response, encode_consume_request, encode_produce_request,
+    decode_consume_response, decode_produce_response, encode_consume_request,
+    encode_produce_request, HandshakeStatus, Opcode, WireConsumeRequest, WireConsumeResponse,
+    WireProduceRecord, WireProduceRequest, WireProduceResult, FEATURE_GZIP, WIRE_MAGIC,
 };
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -32,11 +32,7 @@ impl BinaryClient {
 
     /// Open a TCP connection and run the handshake with the given options.
     /// `token` may be empty when the broker has auth disabled.
-    pub async fn connect_with(
-        addr: SocketAddr,
-        token: &str,
-        opts: ClientOptions,
-    ) -> Result<Self> {
+    pub async fn connect_with(addr: SocketAddr, token: &str, opts: ClientOptions) -> Result<Self> {
         let mut sock = TcpStream::connect(addr).await?;
         sock.set_nodelay(true).ok();
 
@@ -121,8 +117,8 @@ impl BinaryClient {
         let mut frame = vec![0u8; total];
         self.sock.read_exact(&mut frame).await?;
         let request_id = u32::from_be_bytes(frame[0..4].try_into().unwrap());
-        let opcode = Opcode::from_u8(frame[4])
-            .ok_or_else(|| anyhow!("unknown opcode {:#x}", frame[4]))?;
+        let opcode =
+            Opcode::from_u8(frame[4]).ok_or_else(|| anyhow!("unknown opcode {:#x}", frame[4]))?;
         let payload = if self.gzip {
             decompress(&frame[5..])?
         } else {
@@ -201,10 +197,13 @@ impl BinaryClient {
 }
 
 fn compress(input: &[u8]) -> std::io::Result<Vec<u8>> {
-    use flate2::Compression;
     use flate2::write::GzEncoder;
+    use flate2::Compression;
     use std::io::Write;
-    let mut enc = GzEncoder::new(Vec::with_capacity(input.len() / 2 + 32), Compression::default());
+    let mut enc = GzEncoder::new(
+        Vec::with_capacity(input.len() / 2 + 32),
+        Compression::default(),
+    );
     enc.write_all(input)?;
     enc.finish()
 }

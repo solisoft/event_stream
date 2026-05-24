@@ -18,10 +18,7 @@ pub struct AuthedKey(pub Arc<ApiKey>);
 impl FromRequestParts<Arc<Broker>> for AuthedKey {
     type Rejection = AppError;
 
-    async fn from_request_parts(
-        parts: &mut Parts,
-        broker: &Arc<Broker>,
-    ) -> Result<Self, AppError> {
+    async fn from_request_parts(parts: &mut Parts, broker: &Arc<Broker>) -> Result<Self, AppError> {
         match broker.config.auth_mode {
             AuthMode::Disabled => Ok(AuthedKey(Arc::new(anon_admin()))),
             AuthMode::Required => {

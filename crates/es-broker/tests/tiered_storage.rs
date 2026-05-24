@@ -1,5 +1,5 @@
 use anyhow::Result;
-use es_broker::{Config, spawn};
+use es_broker::{spawn, Config};
 use tempfile::TempDir;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

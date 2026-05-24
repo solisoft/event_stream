@@ -1,10 +1,10 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 
@@ -116,7 +116,9 @@ impl PersistedTopicConfig {
         Self {
             retention_ms: patch.retention_ms,
             retention_bytes: patch.retention_bytes,
-            cleanup_policy: patch.cleanup_policy.map(|p| CleanupPolicy::from_dto(p).as_str().to_string()),
+            cleanup_policy: patch
+                .cleanup_policy
+                .map(|p| CleanupPolicy::from_dto(p).as_str().to_string()),
             segment_bytes: patch.segment_bytes,
             tombstone_retention_ms: patch.tombstone_retention_ms,
             raft: None,
@@ -124,11 +126,21 @@ impl PersistedTopicConfig {
     }
 
     fn merge_patch(&mut self, patch: &TopicConfigPatch) {
-        if let Some(v) = patch.retention_ms { self.retention_ms = Some(v); }
-        if let Some(v) = patch.retention_bytes { self.retention_bytes = Some(v); }
-        if let Some(p) = patch.cleanup_policy { self.cleanup_policy = Some(CleanupPolicy::from_dto(p).as_str().to_string()); }
-        if let Some(v) = patch.segment_bytes { self.segment_bytes = Some(v); }
-        if let Some(v) = patch.tombstone_retention_ms { self.tombstone_retention_ms = Some(v); }
+        if let Some(v) = patch.retention_ms {
+            self.retention_ms = Some(v);
+        }
+        if let Some(v) = patch.retention_bytes {
+            self.retention_bytes = Some(v);
+        }
+        if let Some(p) = patch.cleanup_policy {
+            self.cleanup_policy = Some(CleanupPolicy::from_dto(p).as_str().to_string());
+        }
+        if let Some(v) = patch.segment_bytes {
+            self.segment_bytes = Some(v);
+        }
+        if let Some(v) = patch.tombstone_retention_ms {
+            self.tombstone_retention_ms = Some(v);
+        }
     }
 
     fn resolve_raft(&self, data_dir: &Path) -> Option<RaftConfig> {
@@ -195,7 +207,8 @@ impl Topic {
         validate_name(name)?;
 
         let topic_dir = root.join(name);
-        std::fs::create_dir_all(&topic_dir).with_context(|| format!("create dir {:?}", topic_dir))?;
+        std::fs::create_dir_all(&topic_dir)
+            .with_context(|| format!("create dir {:?}", topic_dir))?;
 
         let meta_path = topic_dir.join("topic.json");
         if meta_path.exists() {
@@ -249,9 +262,7 @@ impl Topic {
                     peer_addrs: raft_cfg
                         .peer_addrs
                         .iter()
-                        .map(|(id, addr)| {
-                            (*id, SocketAddr::new(addr.ip(), addr.port() + i as u16))
-                        })
+                        .map(|(id, addr)| (*id, SocketAddr::new(addr.ip(), addr.port() + i as u16)))
                         .collect(),
                 };
                 if let Err(e) = p.connect_transport(tcfg).await {

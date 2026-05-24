@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::RwLock;
 
 use super::index::SparseIndex;
-use super::record::{Record, RecordDecodeError, read_record};
+use super::record::{read_record, Record, RecordDecodeError};
 
 pub fn segment_log_name(base_offset: u64) -> String {
     format!("{:020}.log", base_offset)
@@ -73,7 +73,10 @@ impl Segment {
         let mut cur_min = self.min_timestamp_ms.load(Ordering::Relaxed);
         while ts < cur_min {
             match self.min_timestamp_ms.compare_exchange_weak(
-                cur_min, ts, Ordering::Relaxed, Ordering::Relaxed,
+                cur_min,
+                ts,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
             ) {
                 Ok(_) => break,
                 Err(actual) => cur_min = actual,
@@ -82,7 +85,10 @@ impl Segment {
         let mut cur_max = self.max_timestamp_ms.load(Ordering::Relaxed);
         while ts > cur_max {
             match self.max_timestamp_ms.compare_exchange_weak(
-                cur_max, ts, Ordering::Relaxed, Ordering::Relaxed,
+                cur_max,
+                ts,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
             ) {
                 Ok(_) => break,
                 Err(actual) => cur_max = actual,
@@ -162,7 +168,11 @@ impl Segment {
             if r.offset < target_offset {
                 continue;
             }
-            let approx_bytes = 4 + 8 + 8 + 4 + r.key.as_ref().map(|k| k.len()).unwrap_or(0)
+            let approx_bytes = 4
+                + 8
+                + 8
+                + 4
+                + r.key.as_ref().map(|k| k.len()).unwrap_or(0)
                 + 4
                 + r.value.len()
                 + 4;
@@ -228,7 +238,10 @@ impl SegmentAppender {
         let mut log = log;
         log.seek(SeekFrom::End(0))?;
 
-        let index = OpenOptions::new().read(true).write(true).open(&index_path)?;
+        let index = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&index_path)?;
         index.set_len(truncate_index_to)?;
         let mut index = index;
         index.seek(SeekFrom::End(0))?;

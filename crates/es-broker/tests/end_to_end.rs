@@ -4,13 +4,12 @@ use std::time::Duration;
 
 use anyhow::Result;
 use es_broker::auth::AuthMode;
-use es_broker::{Config, spawn};
+use es_broker::{spawn, Config};
 use es_protocol::{
-    AclActionDto, AclRuleDto, CleanupPolicyDto, CommitRequest, ConsumeResponse,
-    CreateKeyRequest, CreateKeyResponse, CreateTopicRequest, DescribeTopicResponse,
-    GroupOffsetsResponse, ListProducersResponse, ListTopicsResponse, ProduceRecord,
-    ProduceRequest, ProduceResponse, ResetOffsetsRequest, ResetOffsetsResponse,
-    TopicConfigDto, TopicConfigPatch,
+    AclActionDto, AclRuleDto, CleanupPolicyDto, CommitRequest, ConsumeResponse, CreateKeyRequest,
+    CreateKeyResponse, CreateTopicRequest, DescribeTopicResponse, GroupOffsetsResponse,
+    ListProducersResponse, ListTopicsResponse, ProduceRecord, ProduceRequest, ProduceResponse,
+    ResetOffsetsRequest, ResetOffsetsResponse, TopicConfigDto, TopicConfigPatch,
 };
 use reqwest::Client;
 use tempfile::TempDir;
@@ -28,10 +27,7 @@ async fn boot(tmp: &TempDir, segment_bytes: u64) -> Result<(String, es_broker::B
 
 /// Boot with aggressive background-task intervals so retention/compaction
 /// trigger inside test deadlines.
-async fn boot_fast(
-    tmp: &TempDir,
-    segment_bytes: u64,
-) -> Result<(String, es_broker::BrokerHandle)> {
+async fn boot_fast(tmp: &TempDir, segment_bytes: u64) -> Result<(String, es_broker::BrokerHandle)> {
     let data_dir: PathBuf = tmp.path().to_path_buf();
     let mut cfg = Config::new(data_dir, ephemeral_bind(), segment_bytes);
     cfg.retention_check_interval = Duration::from_millis(150);
@@ -51,7 +47,11 @@ async fn create_topic(client: &Client, base: &str, name: &str, partitions: u32) 
         })
         .send()
         .await?;
-    assert!(resp.status().is_success(), "create topic failed: {}", resp.status());
+    assert!(
+        resp.status().is_success(),
+        "create topic failed: {}",
+        resp.status()
+    );
     Ok(())
 }
 
@@ -63,9 +63,10 @@ async fn produce(
 ) -> Result<ProduceResponse> {
     let resp: ProduceResponse = client
         .post(format!("{}/topics/{}/produce", base, topic))
-        .json(&ProduceRequest { records,
- producer_id: None,
-})
+        .json(&ProduceRequest {
+            records,
+            producer_id: None,
+        })
         .send()
         .await?
         .error_for_status()?
@@ -276,9 +277,7 @@ async fn recovers_from_torn_write() -> Result<()> {
     let part_dir = tmp.path().join("topics").join("t").join("0");
     let mut entries: Vec<_> = std::fs::read_dir(&part_dir)?
         .filter_map(Result::ok)
-        .filter(|e| {
-            e.path().extension().and_then(|s| s.to_str()) == Some("log")
-        })
+        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("log"))
         .collect();
     entries.sort_by_key(|e| e.path());
     let active = entries.last().unwrap().path();
@@ -299,7 +298,10 @@ async fn recovers_from_torn_write() -> Result<()> {
         .await?
         .json()
         .await?;
-    assert_eq!(desc.partitions[0].end_offset, 10, "torn-write tail should be truncated");
+    assert_eq!(
+        desc.partitions[0].end_offset, 10,
+        "torn-write tail should be truncated"
+    );
 
     // Final size on disk should match the pre-corruption length.
     assert_eq!(std::fs::metadata(&active)?.len(), pre_len);
@@ -339,7 +341,11 @@ async fn create_topic_with_config(
         })
         .send()
         .await?;
-    assert!(resp.status().is_success(), "create topic failed: {}", resp.status());
+    assert!(
+        resp.status().is_success(),
+        "create topic failed: {}",
+        resp.status()
+    );
     Ok(())
 }
 
@@ -817,7 +823,9 @@ async fn admin_run_retention_forces_deletion() -> Result<()> {
         .await?;
     let line = body
         .lines()
-        .find(|l| l.starts_with(r#"es_retention_segments_deleted_total{topic="force",partition="0"}"#))
+        .find(|l| {
+            l.starts_with(r#"es_retention_segments_deleted_total{topic="force",partition="0"}"#)
+        })
         .expect("retention deleted counter missing");
     let deleted: u64 = line.rsplit(' ').next().unwrap().parse().unwrap();
     assert!(deleted > 0);
@@ -996,7 +1004,10 @@ async fn acls_deny_write_without_grant() -> Result<()> {
 
     // Read is allowed.
     let cons = reader
-        .get(format!("{}/topics/orders/consume?partition=0&offset=0", base))
+        .get(format!(
+            "{}/topics/orders/consume?partition=0&offset=0",
+            base
+        ))
         .send()
         .await?;
     assert_eq!(cons.status().as_u16(), 200);
@@ -1084,7 +1095,11 @@ async fn topic_prefix_acl_isolates_topics() -> Result<()> {
             })
             .send()
             .await?;
-        assert!(r.status().is_success(), "write to {} should be allowed", name);
+        assert!(
+            r.status().is_success(),
+            "write to {} should be allowed",
+            name
+        );
     }
     let r = scoped
         .post(format!("{}/topics/billing/produce", base))
@@ -1099,7 +1114,11 @@ async fn topic_prefix_acl_isolates_topics() -> Result<()> {
         })
         .send()
         .await?;
-    assert_eq!(r.status().as_u16(), 403, "write to billing should be denied");
+    assert_eq!(
+        r.status().as_u16(),
+        403,
+        "write to billing should be denied"
+    );
 
     handle.shutdown().await?;
     Ok(())
@@ -1261,8 +1280,8 @@ async fn idempotent_dedupes_on_replay() -> Result<()> {
     assert!(!first.results[0].duplicate);
 
     // Replay seq=0 → must return offset 0 marked duplicate, no new append.
-    let replay = produce_idempotent(&client, &base, "t", "p1", vec![make_rec(0, "v0-retry")])
-        .await?;
+    let replay =
+        produce_idempotent(&client, &base, "t", "p1", vec![make_rec(0, "v0-retry")]).await?;
     let replay: ProduceResponse = replay.json().await?;
     assert_eq!(replay.results[0].offset, 0);
     assert!(replay.results[0].duplicate);
@@ -1374,7 +1393,10 @@ async fn producer_state_survives_restart() -> Result<()> {
     )
     .await?;
     let body: ProduceResponse = replay.json().await?;
-    assert!(body.results[0].duplicate, "post-restart replay should dedupe");
+    assert!(
+        body.results[0].duplicate,
+        "post-restart replay should dedupe"
+    );
     assert_eq!(body.results[0].offset, 1);
 
     handle2.shutdown().await?;
@@ -1513,10 +1535,7 @@ async fn admin_reset_offsets_rewinds_groups() -> Result<()> {
 use es_broker::binary::BinaryClient;
 use es_protocol::wire::WireProduceRecord;
 
-async fn boot_with_binary(
-    tmp: &TempDir,
-    auth: bool,
-) -> Result<es_broker::BrokerHandle> {
+async fn boot_with_binary(tmp: &TempDir, auth: bool) -> Result<es_broker::BrokerHandle> {
     let mut cfg = Config::new(tmp.path().to_path_buf(), ephemeral_bind(), 1 << 20);
     cfg.bind_binary = Some("127.0.0.1:0".parse().unwrap());
     if auth {
@@ -1706,14 +1725,11 @@ async fn binary_gzip_roundtrip_preserves_bytes() -> Result<()> {
     create_topic(&http, &base, "gz", 1).await?;
 
     let bin_addr = handle.binary_addr.unwrap();
-    let mut client =
-        BinaryClient::connect_with(bin_addr, "", ClientOptions { gzip: true }).await?;
+    let mut client = BinaryClient::connect_with(bin_addr, "", ClientOptions { gzip: true }).await?;
     assert!(client.gzip_enabled(), "server must accept gzip negotiation");
 
     // Big payload that benefits from gzip — repeating bytes compress well.
-    let big_value: Vec<u8> = "lorem-ipsum-dolor-sit-amet-"
-        .repeat(2_000)
-        .into_bytes();
+    let big_value: Vec<u8> = "lorem-ipsum-dolor-sit-amet-".repeat(2_000).into_bytes();
 
     let results = client
         .produce(
@@ -1888,10 +1904,7 @@ async fn two_members_split_two_partitions_one_each() -> Result<()> {
         .collect();
     assert_eq!(
         combined,
-        std::collections::BTreeSet::from([
-            ("shared".to_string(), 0),
-            ("shared".to_string(), 1),
-        ])
+        std::collections::BTreeSet::from([("shared".to_string(), 0), ("shared".to_string(), 1),])
     );
 
     handle.shutdown().await?;
@@ -1986,7 +1999,9 @@ async fn leave_preserves_remaining_members_partitions_when_possible() -> Result<
     // a and c keep what they had, b's partition goes to whichever has room.
     client
         .post(format!("{}/groups/g/leave", base))
-        .json(&LeaveGroupRequest { member_id: b.member_id.clone() })
+        .json(&LeaveGroupRequest {
+            member_id: b.member_id.clone(),
+        })
         .send()
         .await?
         .error_for_status()?;
@@ -2017,7 +2032,11 @@ async fn leave_preserves_remaining_members_partitions_when_possible() -> Result<
     // Coverage: a + c together still own all four partitions.
     let combined: std::collections::BTreeSet<(String, u32)> = a1_set
         .into_iter()
-        .chain(c1.assignment.iter().map(|tp| (tp.topic.clone(), tp.partition)))
+        .chain(
+            c1.assignment
+                .iter()
+                .map(|tp| (tp.topic.clone(), tp.partition)),
+        )
         .collect();
     assert_eq!(combined.len(), 4);
 
@@ -2060,7 +2079,11 @@ async fn join_only_takes_from_over_allocated_members() -> Result<()> {
         .collect();
     for tp in &a1.assignment {
         let key = (tp.topic.clone(), tp.partition);
-        assert!(a0_set.contains(&key), "a's kept partition {:?} wasn't in its old assignment", key);
+        assert!(
+            a0_set.contains(&key),
+            "a's kept partition {:?} wasn't in its old assignment",
+            key
+        );
     }
 
     handle.shutdown().await?;

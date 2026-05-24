@@ -8,7 +8,7 @@ use anyhow::Result;
 use es_broker::partition_handle::{PartitionHandle, RaftConfig};
 use es_broker::raft::Timing;
 use es_broker::raft_partition::{
-    RaftPartition, RaftPartitionConfig, RaftTransportConfig, test_timing,
+    test_timing, RaftPartition, RaftPartitionConfig, RaftTransportConfig,
 };
 use tempfile::TempDir;
 
@@ -39,7 +39,10 @@ async fn single_node_append_roundtrip() -> Result<()> {
     let mut offsets = Vec::new();
     for i in 0..20u32 {
         let off = rp
-            .append(Some(format!("k{}", i).as_bytes()), format!("v{}", i).as_bytes())
+            .append(
+                Some(format!("k{}", i).as_bytes()),
+                format!("v{}", i).as_bytes(),
+            )
             .await?;
         offsets.push(off);
     }
@@ -160,8 +163,7 @@ async fn auto_snapshot_keeps_raft_log_bounded() -> Result<()> {
     assert_eq!(rp.partition().end_offset(), n as u64);
     // … and the on-disk Raft log has been compacted: at most one batch worth
     // of entries past the snapshot boundary.
-    let raft: es_broker::raft::PersistedRaft =
-        serde_json::from_slice(&std::fs::read(&raft_path)?)?;
+    let raft: es_broker::raft::PersistedRaft = serde_json::from_slice(&std::fs::read(&raft_path)?)?;
     assert!(
         raft.log.len() as u32 <= 50,
         "raft log not compacted: {} entries",
@@ -233,7 +235,10 @@ async fn partition_handle_raft_roundtrip() -> Result<()> {
 
     for i in 0..10u32 {
         let off = handle
-            .append(Some(format!("k{}", i).as_bytes()), format!("v{}", i).as_bytes())
+            .append(
+                Some(format!("k{}", i).as_bytes()),
+                format!("v{}", i).as_bytes(),
+            )
             .await?;
         assert_eq!(off, i as u64);
     }
@@ -340,12 +345,8 @@ async fn two_node_tcp_replication() -> Result<()> {
         snapshot_after_applies: 0,
     };
 
-    let rp1 = RaftPartition::open(
-        tmp1.path().join("p0"), 0, 1 << 20, 1, cfg1,
-    )?;
-    let rp2 = RaftPartition::open(
-        tmp2.path().join("p0"), 0, 1 << 20, 1, cfg2,
-    )?;
+    let rp1 = RaftPartition::open(tmp1.path().join("p0"), 0, 1 << 20, 1, cfg1)?;
+    let rp2 = RaftPartition::open(tmp2.path().join("p0"), 0, 1 << 20, 1, cfg2)?;
 
     // Connect TCP transports.
     let mut peers_for_1 = BTreeMap::new();
@@ -355,11 +356,13 @@ async fn two_node_tcp_replication() -> Result<()> {
     rp1.connect_transport(RaftTransportConfig {
         bind: addr1,
         peer_addrs: peers_for_1,
-    }).await?;
+    })
+    .await?;
     rp2.connect_transport(RaftTransportConfig {
         bind: addr2,
         peer_addrs: peers_for_2,
-    }).await?;
+    })
+    .await?;
 
     // Wait for election + initial heartbeats.
     tokio::time::sleep(Duration::from_millis(1000)).await;
@@ -379,9 +382,7 @@ async fn two_node_tcp_replication() -> Result<()> {
     // The probe landed; now produce a batch through the leader.
     let n = 50u32;
     for i in 0..n {
-        let off = leader
-            .append(None, format!("v{}", i).as_bytes())
-            .await?;
+        let off = leader.append(None, format!("v{}", i).as_bytes()).await?;
         assert_eq!(off, (i + 1) as u64, "offset mismatch at record {}", i);
     }
 
@@ -392,7 +393,10 @@ async fn two_node_tcp_replication() -> Result<()> {
             break;
         }
         if std::time::Instant::now() > deadline {
-            anyhow::bail!("follower didn't catch up: end_offset={}", follower.partition().end_offset());
+            anyhow::bail!(
+                "follower didn't catch up: end_offset={}",
+                follower.partition().end_offset()
+            );
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
