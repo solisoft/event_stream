@@ -100,6 +100,9 @@ pub struct RaftPartitionConfig {
 pub struct RaftTransportConfig {
     pub bind: SocketAddr,
     pub peer_addrs: BTreeMap<NodeId, SocketAddr>,
+    /// Pre-shared secret peers must present in the raft handshake. `None`
+    /// disables peer authentication (only safe on a trusted/loopback network).
+    pub shared_secret: Option<String>,
 }
 
 impl RaftPartitionConfig {
@@ -189,6 +192,7 @@ impl RaftPartition {
             self.raft.inbound.clone(),
             outbound_rx,
             Duration::from_secs(2),
+            tcfg.shared_secret,
         )
         .await?;
         {

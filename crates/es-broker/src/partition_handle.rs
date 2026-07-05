@@ -24,6 +24,8 @@ pub struct RaftConfig {
     pub snapshot_after_applies: u32,
     pub bind: Option<SocketAddr>,
     pub peer_addrs: BTreeMap<crate::raft::NodeId, SocketAddr>,
+    /// Pre-shared secret peers must present in the raft handshake.
+    pub shared_secret: Option<String>,
 }
 
 impl Default for RaftConfig {
@@ -36,6 +38,7 @@ impl Default for RaftConfig {
             snapshot_after_applies: 1024,
             bind: None,
             peer_addrs: BTreeMap::new(),
+            shared_secret: None,
         }
     }
 }

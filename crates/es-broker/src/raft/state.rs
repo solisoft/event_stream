@@ -83,23 +83,28 @@ fn decode_config_change(payload: &[u8]) -> Option<(Vec<NodeId>, Vec<NodeId>)> {
     if payload.len() < 8 || payload[..4] != CONFIG_MAGIC {
         return None;
     }
-    let mut pos = 4;
-    let add_len = u32::from_be_bytes(payload[pos..pos + 4].try_into().ok()?) as usize;
-    pos += 4;
-    let mut add = Vec::with_capacity(add_len);
-    for _ in 0..add_len {
-        let id = u32::from_be_bytes(payload[pos..pos + 4].try_into().ok()?);
-        pos += 4;
-        add.push(id);
+    // Bounds-checked reader over the payload. `take_u32` uses `.get(..)` so a
+    // truncated or lying length field yields `None` instead of panicking, and
+    // capacities are bounded by the bytes actually remaining so a huge declared
+    // count can't drive a giant allocation.
+    fn take_u32(payload: &[u8], pos: &mut usize) -> Option<u32> {
+        let end = pos.checked_add(4)?;
+        let slice = payload.get(*pos..end)?;
+        *pos = end;
+        Some(u32::from_be_bytes(slice.try_into().ok()?))
     }
-    let remove_len = u32::from_be_bytes(payload[pos..pos + 4].try_into().ok()?) as usize;
-    pos += 4;
-    let mut remove = Vec::with_capacity(remove_len);
-    for _ in 0..remove_len {
-        let id = u32::from_be_bytes(payload[pos..pos + 4].try_into().ok()?);
-        pos += 4;
-        remove.push(id);
+    fn take_ids(payload: &[u8], pos: &mut usize) -> Option<Vec<NodeId>> {
+        let len = take_u32(payload, pos)? as usize;
+        let remaining_ids = payload.len().saturating_sub(*pos) / 4;
+        let mut out = Vec::with_capacity(len.min(remaining_ids));
+        for _ in 0..len {
+            out.push(take_u32(payload, pos)?);
+        }
+        Some(out)
     }
+    let mut pos = 4usize;
+    let add = take_ids(payload, &mut pos)?;
+    let remove = take_ids(payload, &mut pos)?;
     Some((add, remove))
 }
 
@@ -184,7 +189,11 @@ impl RaftState {
     }
 
     fn quorum(&self) -> usize {
-        (self.peers.len() + 2) / 2
+        // Cluster size is peers + self. A majority is floor(N/2)+1. `peers`
+        // excludes self, so N = peers.len()+1 and majority = ceil(peers/2)+1.
+        // The previous `(peers+2)/2` was an off-by-one for even N (it let a
+        // candidate self-elect in a 2-node cluster → split-brain).
+        self.peers.len().div_ceil(2) + 1
     }
 
     // ---------- timer-driven events ----------
@@ -345,7 +354,9 @@ impl RaftState {
     }
 
     fn start_election(&mut self) -> Vec<Action> {
-        self.current_term += 1;
+        // saturating_add so a maxed-out term (e.g. one forced by a peer message)
+        // can't panic here in debug builds.
+        self.current_term = self.current_term.saturating_add(1);
         self.role = Role::Candidate;
         self.voted_for = Some(self.me);
         self.dirty = true;
@@ -436,23 +447,35 @@ impl RaftState {
                 }
             };
             if consistent {
-                if !ae.entries.is_empty() {
-                    let start = ae.prev_log_index + 1;
-                    self.log.append_at(start, ae.entries.clone());
-                    self.dirty = true;
-                }
-                // Update commit_index. Per the paper:
-                // commit_index = min(leader_commit, index_of_last_new_entry).
-                let last_new = if ae.entries.is_empty() {
-                    self.log.last_index()
+                // append_at refuses to truncate committed entries; if it does,
+                // we reject the whole AppendEntries rather than silently
+                // reporting success on a log we didn't fully apply.
+                let applied = if !ae.entries.is_empty() {
+                    let start = ae.prev_log_index.saturating_add(1);
+                    let ok = self
+                        .log
+                        .append_at(start, ae.entries.clone(), self.commit_index);
+                    if ok {
+                        self.dirty = true;
+                    }
+                    ok
                 } else {
-                    ae.prev_log_index + ae.entries.len() as LogIndex
+                    true
                 };
-                if ae.leader_commit > self.commit_index {
-                    self.commit_index = ae.leader_commit.min(last_new);
+                if applied {
+                    // Update commit_index. Per the paper:
+                    // commit_index = min(leader_commit, index_of_last_new_entry).
+                    let last_new = if ae.entries.is_empty() {
+                        self.log.last_index()
+                    } else {
+                        ae.prev_log_index.saturating_add(ae.entries.len() as LogIndex)
+                    };
+                    if ae.leader_commit > self.commit_index {
+                        self.commit_index = ae.leader_commit.min(last_new);
+                    }
+                    match_index = self.log.last_index();
+                    success = true;
                 }
-                match_index = self.log.last_index();
-                success = true;
             }
         }
 
@@ -474,9 +497,13 @@ impl RaftState {
             return Vec::new();
         }
         if aer.success {
-            self.match_index.insert(aer.responder_id, aer.match_index);
+            // Clamp a peer-reported match_index to our own last index — a peer
+            // can't have replicated further than we've written — and use
+            // saturating_add so match_index=u64::MAX can't overflow next_index.
+            let mi = aer.match_index.min(self.log.last_index());
+            self.match_index.insert(aer.responder_id, mi);
             self.next_index
-                .insert(aer.responder_id, aer.match_index + 1);
+                .insert(aer.responder_id, mi.saturating_add(1));
             // Recompute commit_index: largest N such that majority of match_index >= N
             // AND log[N].term == current_term (§5.4.2 — no commit from past terms).
             self.recompute_commit_index();
@@ -614,6 +641,33 @@ mod tests {
 
     fn n(me: NodeId, peers: &[NodeId]) -> RaftState {
         RaftState::new(me, peers.to_vec())
+    }
+
+    #[test]
+    fn decode_config_change_rejects_truncated_payload() {
+        // Declares one add id but carries no id bytes — must return None, not
+        // panic on an out-of-bounds slice.
+        let mut payload = CONFIG_MAGIC.to_vec();
+        payload.extend_from_slice(&1u32.to_be_bytes());
+        assert!(decode_config_change(&payload).is_none());
+        // A hostile length must not drive a giant allocation; returns None.
+        let mut huge = CONFIG_MAGIC.to_vec();
+        huge.extend_from_slice(&u32::MAX.to_be_bytes());
+        assert!(decode_config_change(&huge).is_none());
+    }
+
+    #[test]
+    fn quorum_requires_true_majority() {
+        // 2-node cluster (self + 1 peer): a candidate needs both votes, so a
+        // single vote must NOT be enough (guards against split-brain).
+        let s = n(1, &[2]);
+        assert_eq!(s.quorum(), 2);
+        // 3-node: majority is 2.
+        let s = n(1, &[2, 3]);
+        assert_eq!(s.quorum(), 2);
+        // 4-node: majority is 3.
+        let s = n(1, &[2, 3, 4]);
+        assert_eq!(s.quorum(), 3);
     }
 
     #[test]

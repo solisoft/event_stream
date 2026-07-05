@@ -81,6 +81,7 @@ impl GroupCoordinator {
         let mid = member_id
             .filter(|s| !s.is_empty())
             .unwrap_or_else(generate_member_id);
+        validate_member_id(&mid)?;
 
         // Validate all subscribed topics exist.
         for t in &topics {
@@ -89,8 +90,22 @@ impl GroupCoordinator {
             }
         }
 
+        // Cap the number of distinct groups to bound memory. `join` is the only
+        // path that creates a group slot.
+        if !self.state.contains_key(group) && self.state.len() >= MAX_GROUPS {
+            return Err(anyhow!("consumer group limit reached ({})", MAX_GROUPS));
+        }
         let slot = self.slot(group);
         let mut state = slot.lock().await;
+        // Cap members per group so a flood of unique member IDs can't exhaust
+        // memory or drive an ever-more-expensive rebalance.
+        if !state.members.contains_key(&mid) && state.members.len() >= MAX_MEMBERS_PER_GROUP {
+            return Err(anyhow!(
+                "member limit reached for group '{}' ({})",
+                group,
+                MAX_MEMBERS_PER_GROUP
+            ));
+        }
         let now = Instant::now();
         let inserted_or_changed = match state.members.get_mut(&mid) {
             Some(existing) => {
@@ -130,7 +145,13 @@ impl GroupCoordinator {
         member_id: &str,
         generation: u64,
     ) -> Result<HeartbeatReply> {
-        let slot = self.slot(group);
+        // Read-only w.r.t. group creation: an unknown group means the member was
+        // never known, so don't create a slot for it.
+        let Some(slot) = self.state.get(group).map(|s| s.clone()) else {
+            return Ok(HeartbeatReply::UnknownMember {
+                current_generation: 0,
+            });
+        };
         let mut state = slot.lock().await;
         match state.members.get_mut(member_id) {
             None => Ok(HeartbeatReply::UnknownMember {
@@ -152,7 +173,9 @@ impl GroupCoordinator {
     }
 
     pub async fn leave(&self, broker: &Arc<Broker>, group: &str, member_id: &str) -> Result<()> {
-        let slot = self.slot(group);
+        let Some(slot) = self.state.get(group).map(|s| s.clone()) else {
+            return Ok(());
+        };
         let mut state = slot.lock().await;
         if state.members.remove(member_id).is_some() {
             recompute_assignment(broker, &mut state);
@@ -161,7 +184,11 @@ impl GroupCoordinator {
     }
 
     pub async fn assignment(&self, group: &str, member_id: &str) -> AssignmentReply {
-        let slot = self.slot(group);
+        let Some(slot) = self.state.get(group).map(|s| s.clone()) else {
+            return AssignmentReply::UnknownMember {
+                current_generation: 0,
+            };
+        };
         let state = slot.lock().await;
         if !state.members.contains_key(member_id) {
             return AssignmentReply::UnknownMember {
@@ -197,6 +224,23 @@ impl GroupCoordinator {
                     generation = state.generation, "coord: members evicted");
             }
         }
+    }
+
+    /// Union of topics currently subscribed by any member of `group`. Used to
+    /// authorize group operations (a caller must be able to read the group's
+    /// topics). Returns empty for an unknown group without creating a slot.
+    pub async fn group_topics(&self, group: &str) -> Vec<String> {
+        let Some(slot) = self.state.get(group).map(|s| s.clone()) else {
+            return Vec::new();
+        };
+        let state = slot.lock().await;
+        let mut topics: BTreeSet<String> = BTreeSet::new();
+        for m in state.members.values() {
+            for t in &m.topics {
+                topics.insert(t.clone());
+            }
+        }
+        topics.into_iter().collect()
     }
 
     /// Snapshot every group's full state for the `/admin/groups` debug view.
@@ -331,9 +375,27 @@ fn recompute_assignment(broker: &Arc<Broker>, state: &mut GroupState) {
     state.assignment = current;
 }
 
+/// Upper bound on distinct consumer groups tracked by the coordinator.
+const MAX_GROUPS: usize = 100_000;
+/// Upper bound on members within a single group.
+const MAX_MEMBERS_PER_GROUP: usize = 10_000;
+
 fn validate_group_name(name: &str) -> Result<()> {
     if name.is_empty() || name.len() > 200 {
         anyhow::bail!("group name length must be 1..=200");
+    }
+    let ok = name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.');
+    if !ok {
+        anyhow::bail!("group name may only contain ASCII alphanumerics, '_', '-', '.'");
+    }
+    Ok(())
+}
+
+fn validate_member_id(id: &str) -> Result<()> {
+    if id.is_empty() || id.len() > 200 {
+        anyhow::bail!("member_id length must be 1..=200");
     }
     Ok(())
 }

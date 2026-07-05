@@ -34,7 +34,10 @@ pub fn router(broker: Arc<Broker>) -> Router {
         .route("/readyz", get(healthz::readyz))
         .route("/metrics", get(metrics::metrics))
         .route("/topics", get(topics::list).post(topics::create))
-        .route("/topics/:name", get(topics::describe).delete(topics::delete_topic))
+        .route(
+            "/topics/:name",
+            get(topics::describe).delete(topics::delete_topic),
+        )
         .route(
             "/topics/:name/config",
             get(topics::get_config).put(topics::update_config),
@@ -67,7 +70,10 @@ pub fn router(broker: Arc<Broker>) -> Router {
             "/subjects/:subject/versions/latest",
             get(schemas::latest_version),
         )
-        .route("/admin/tiered/:topic/:partition", get(admin_tiered::list_remote))
+        .route(
+            "/admin/tiered/:topic/:partition",
+            get(admin_tiered::list_remote),
+        )
         .layer((
             TraceLayer::new_for_http(),
             CatchPanicLayer::new(),

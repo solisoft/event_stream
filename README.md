@@ -47,7 +47,8 @@ compaction, and bench numbers.
 crates/
 ├── es-protocol/   # serde DTOs + binary wire format
 ├── es-broker/     # broker: storage, HTTP, binary, auth, retention, compaction
-└── es-cli/        # `es` binary
+├── es-cli/        # `es` binary
+└── es-tools/      # offline dump/restore tools
 scripts/demo.sh    # one-command end-to-end exercise
 Makefile           # build · run-broker · demo · test · clean
 ```
@@ -84,6 +85,10 @@ make test          # full test suite
 make run-broker    # release broker on :9000
 
 cargo test --release --test bench -- --ignored --nocapture  # throughput bench
+
+# Backup & restore
+./target/release/es-tools dump --data-dir ./data --output backup.tar.gz
+./target/release/es-tools restore --input backup.tar.gz --data-dir ./new-data
 ```
 
 ## License

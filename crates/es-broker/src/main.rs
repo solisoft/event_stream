@@ -70,6 +70,12 @@ struct Args {
     /// are offloaded here instead of being deleted by retention.
     #[arg(long)]
     cold_storage_dir: Option<PathBuf>,
+
+    /// Pre-shared secret peers must present in the Raft transport handshake.
+    /// Strongly recommended whenever Raft peers talk over an untrusted network —
+    /// without it the raft port accepts messages from any client.
+    #[arg(long, env = "ES_RAFT_SHARED_SECRET")]
+    raft_shared_secret: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -134,6 +140,20 @@ async fn main() -> Result<()> {
     config.max_request_body_bytes = args.max_request_body_bytes;
     config.shutdown_timeout = args.shutdown_timeout;
     config.cold_storage_dir = args.cold_storage_dir;
+    config.raft_shared_secret = args.raft_shared_secret;
+
+    if config.auth_mode == AuthMode::Disabled {
+        tracing::warn!(
+            "authentication is DISABLED (--auth disabled): every request is treated as an \
+             admin with full access. Use `--auth required` on any non-trusted network."
+        );
+    }
+    if config.bind_binary.is_some() && config.tls_cert_path.is_none() {
+        tracing::warn!(
+            "binary protocol listener is plaintext (no TLS): API tokens and record data are \
+             sent unencrypted. Restrict it to a trusted network."
+        );
+    }
 
     let handle = spawn(config).await?;
     tracing::info!(addr = %handle.addr, scheme = handle.scheme, "broker listening");

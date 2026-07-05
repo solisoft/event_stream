@@ -31,6 +31,18 @@ fn check_read_on_all(key: &crate::auth::ApiKey, topics: &[String]) -> AppResult<
     Ok(())
 }
 
+/// Authorize a group operation: the caller must have read access to every topic
+/// the group is subscribed to. Prevents an unrelated principal from disrupting
+/// or inspecting another tenant's consumer group.
+async fn check_group_access(
+    broker: &Arc<Broker>,
+    key: &crate::auth::ApiKey,
+    group: &str,
+) -> AppResult<()> {
+    let topics = broker.coordinator.group_topics(group).await;
+    check_read_on_all(key, &topics)
+}
+
 fn to_tp(v: Vec<(String, u32)>) -> Vec<TopicPartitionDto> {
     v.into_iter()
         .map(|(topic, partition)| TopicPartitionDto { topic, partition })
@@ -57,10 +69,11 @@ pub async fn join(
 
 pub async fn heartbeat(
     State(broker): State<Arc<Broker>>,
-    AuthedKey(_key): AuthedKey,
+    AuthedKey(key): AuthedKey,
     Path(group): Path<String>,
     Json(req): Json<HeartbeatRequest>,
 ) -> AppResult<Json<HeartbeatResponse>> {
+    check_group_access(&broker, &key, &group).await?;
     let reply = broker
         .coordinator
         .heartbeat(&group, &req.member_id, req.generation)
@@ -78,10 +91,11 @@ pub async fn heartbeat(
 
 pub async fn leave(
     State(broker): State<Arc<Broker>>,
-    AuthedKey(_key): AuthedKey,
+    AuthedKey(key): AuthedKey,
     Path(group): Path<String>,
     Json(req): Json<LeaveGroupRequest>,
 ) -> AppResult<StatusCode> {
+    check_group_access(&broker, &key, &group).await?;
     broker
         .coordinator
         .leave(&broker, &group, &req.member_id)
@@ -96,10 +110,11 @@ pub struct AssignmentQuery {
 
 pub async fn assignment(
     State(broker): State<Arc<Broker>>,
-    AuthedKey(_key): AuthedKey,
+    AuthedKey(key): AuthedKey,
     Path(group): Path<String>,
     Query(q): Query<AssignmentQuery>,
 ) -> AppResult<Json<AssignmentResponse>> {
+    check_group_access(&broker, &key, &group).await?;
     let reply = broker.coordinator.assignment(&group, &q.member_id).await;
     match reply {
         AssignmentReply::Ok {

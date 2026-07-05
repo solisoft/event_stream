@@ -38,6 +38,24 @@ use super::messages::{Message, NodeId};
 use super::node::Outbound;
 
 const RAFT_MAGIC: [u8; 4] = *b"RAFT";
+/// Max accepted length of the handshake shared-secret field.
+const MAX_SECRET_LEN: usize = 1024;
+/// How long a peer has to complete the handshake before we drop the socket.
+/// Bounds slowloris-style holds on the raft listener.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Constant-time byte-slice equality, so a peer can't learn the shared secret
+/// from handshake-rejection timing.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
 
 pub struct Transport {
     pub join: JoinHandle<()>,
@@ -53,9 +71,16 @@ pub async fn spawn_transport(
     inbound_tx: mpsc::UnboundedSender<Message>,
     mut outbound_rx: mpsc::UnboundedReceiver<Outbound>,
     reconnect_backoff: Duration,
+    shared_secret: Option<String>,
 ) -> Result<Transport> {
     let listener = TcpListener::bind(bind).await?;
     let cancel = CancellationToken::new();
+    // Pre-shared secret both peers must present in the handshake. Without it the
+    // raft port accepts any TCP client, letting an attacker inject arbitrary
+    // AppendEntries/InstallSnapshot/config-change messages into replicated
+    // state. `None`/empty preserves the (insecure) no-auth behavior for
+    // single-node/loopback setups.
+    let secret: Arc<Option<Vec<u8>>> = Arc::new(shared_secret.map(|s| s.into_bytes()));
 
     // Each peer gets a per-peer mpsc; the dialer task drains it onto its socket.
     let peer_senders: Arc<DashMap<NodeId, mpsc::UnboundedSender<Vec<u8>>>> =
@@ -65,6 +90,7 @@ pub async fn spawn_transport(
     {
         let inbound_tx = inbound_tx.clone();
         let cancel = cancel.clone();
+        let secret = secret.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -79,8 +105,9 @@ pub async fn spawn_transport(
                         };
                         let inbound_tx = inbound_tx.clone();
                         let cancel = cancel.clone();
+                        let secret = secret.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_inbound(sock, inbound_tx, cancel).await {
+                            if let Err(e) = handle_inbound(sock, inbound_tx, cancel, secret).await {
                                 tracing::debug!(error = %e, "raft inbound closed");
                             }
                         });
@@ -96,6 +123,7 @@ pub async fn spawn_transport(
         peer_senders.insert(peer_id, peer_tx);
         let cancel = cancel.clone();
         let my_id = node_id;
+        let secret = secret.clone();
         tokio::spawn(async move {
             dial_loop(
                 my_id,
@@ -104,6 +132,7 @@ pub async fn spawn_transport(
                 peer_rx,
                 reconnect_backoff,
                 cancel,
+                secret,
             )
             .await;
         });
@@ -147,6 +176,7 @@ fn frame(msg: &Message) -> Vec<u8> {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dial_loop(
     me: NodeId,
     peer_id: NodeId,
@@ -154,6 +184,7 @@ async fn dial_loop(
     mut peer_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     reconnect_backoff: Duration,
     cancel: CancellationToken,
+    secret: Arc<Option<Vec<u8>>>,
 ) {
     loop {
         if cancel.is_cancelled() {
@@ -170,7 +201,7 @@ async fn dial_loop(
             }
         };
         let _ = sock.set_nodelay(true);
-        if let Err(e) = run_outbound(sock, me, &mut peer_rx, &cancel).await {
+        if let Err(e) = run_outbound(sock, me, &mut peer_rx, &cancel, &secret).await {
             tracing::debug!(peer = peer_id, error = %e, "raft connection dropped");
         }
         if cancel.is_cancelled() {
@@ -185,10 +216,17 @@ async fn run_outbound(
     me: NodeId,
     peer_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
     cancel: &CancellationToken,
+    secret: &Option<Vec<u8>>,
 ) -> std::io::Result<()> {
-    // Handshake: send magic + our node id.
+    // Handshake: send magic + our node id + the shared secret.
     sock.write_all(&RAFT_MAGIC).await?;
     sock.write_all(&me.to_be_bytes()).await?;
+    let secret_bytes: &[u8] = secret.as_deref().unwrap_or(&[]);
+    sock.write_all(&(secret_bytes.len() as u32).to_be_bytes())
+        .await?;
+    if !secret_bytes.is_empty() {
+        sock.write_all(secret_bytes).await?;
+    }
 
     // We don't read from this socket on the dialer side — inbound peer messages
     // arrive on that peer's own outbound-to-us connection (the peer dials us).
@@ -208,20 +246,58 @@ async fn handle_inbound(
     mut sock: TcpStream,
     inbound_tx: mpsc::UnboundedSender<Message>,
     cancel: CancellationToken,
+    secret: Arc<Option<Vec<u8>>>,
 ) -> std::io::Result<()> {
     let _ = sock.set_nodelay(true);
-    // Handshake.
-    let mut magic = [0u8; 4];
-    sock.read_exact(&mut magic).await?;
-    if magic != RAFT_MAGIC {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "bad raft magic",
-        ));
+    // Handshake, under a timeout so a peer can't hold the socket open forever
+    // by stalling mid-handshake.
+    let handshake = async {
+        let mut magic = [0u8; 4];
+        sock.read_exact(&mut magic).await?;
+        if magic != RAFT_MAGIC {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "bad raft magic",
+            ));
+        }
+        let mut idbuf = [0u8; 4];
+        sock.read_exact(&mut idbuf).await?;
+        let _peer_id = u32::from_be_bytes(idbuf);
+
+        // Authenticate the peer via the pre-shared secret before we accept any
+        // Raft messages from this connection.
+        let mut slen_buf = [0u8; 4];
+        sock.read_exact(&mut slen_buf).await?;
+        let slen = u32::from_be_bytes(slen_buf) as usize;
+        if slen > MAX_SECRET_LEN {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "raft handshake secret too long",
+            ));
+        }
+        let mut presented = vec![0u8; slen];
+        if slen > 0 {
+            sock.read_exact(&mut presented).await?;
+        }
+        let expected: &[u8] = secret.as_deref().unwrap_or(&[]);
+        if !constant_time_eq(&presented, expected) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "raft handshake auth failed",
+            ));
+        }
+        Ok(())
+    };
+    match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "raft handshake timed out",
+            ))
+        }
     }
-    let mut idbuf = [0u8; 4];
-    sock.read_exact(&mut idbuf).await?;
-    let _peer_id = u32::from_be_bytes(idbuf);
 
     let mut len_buf = [0u8; 4];
     loop {
@@ -250,5 +326,91 @@ async fn handle_inbound(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::raft::messages::{Message, RequestVote};
+
+    fn sample_msg() -> Message {
+        Message::RequestVote(RequestVote {
+            term: 99,
+            candidate_id: 7,
+            last_log_index: 0,
+            last_log_term: 0,
+        })
+    }
+
+    async fn send_handshake(client: &mut TcpStream, node_id: u32, secret: &[u8]) {
+        client.write_all(&RAFT_MAGIC).await.unwrap();
+        client.write_all(&node_id.to_be_bytes()).await.unwrap();
+        client
+            .write_all(&(secret.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        if !secret.is_empty() {
+            client.write_all(secret).await.unwrap();
+        }
+    }
+
+    #[test]
+    fn constant_time_eq_matches_std_eq() {
+        assert!(constant_time_eq(b"secret", b"secret"));
+        assert!(!constant_time_eq(b"secret", b"secreu"));
+        assert!(!constant_time_eq(b"secret", b"secre"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[tokio::test]
+    async fn rejects_peer_with_wrong_secret() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let secret = Arc::new(Some(b"correct-secret".to_vec()));
+
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let _ = handle_inbound(sock, inbound_tx, cancel, secret).await;
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        send_handshake(&mut client, 7, b"wrong-secret").await;
+        // Even if the attacker sends a well-formed frame, it must never be
+        // delivered because the handshake auth failed.
+        let _ = client.write_all(&frame(&sample_msg())).await;
+
+        let got = tokio::time::timeout(Duration::from_millis(300), inbound_rx.recv()).await;
+        assert!(
+            matches!(got, Ok(None)) || got.is_err(),
+            "no message may be delivered when the secret is wrong"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn accepts_peer_with_correct_secret() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let secret = Arc::new(Some(b"correct-secret".to_vec()));
+
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let _ = handle_inbound(sock, inbound_tx, cancel, secret).await;
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        send_handshake(&mut client, 7, b"correct-secret").await;
+        client.write_all(&frame(&sample_msg())).await.unwrap();
+
+        let got = tokio::time::timeout(Duration::from_millis(500), inbound_rx.recv())
+            .await
+            .expect("message should be delivered within timeout");
+        assert!(matches!(got, Some(Message::RequestVote(_))));
+        server.abort();
     }
 }

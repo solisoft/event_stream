@@ -1,0 +1,216 @@
+<div class="reveal">
+  <p class="font-mono text-[11px] tracking-[0.28em] uppercase text-indigo-300/80 mb-5">§07 · Backup &amp; restore</p>
+  <h1 class="font-display text-[42px] md:text-[62px] leading-[1.0] tracking-[-0.025em] text-white font-light">
+    Dump,
+    <span class="font-display italic text-indigo-200/90 font-light">restore</span>,
+    migrate.
+  </h1>
+</div>
+
+<p class="reveal d1 mt-7 text-[17px] leading-[1.7] text-slate-300 max-w-[58ch] font-light">
+  Offline tools for backing up and restoring the entire data directory — topics, partitions, segment files, consumer group offsets, schemas, and producer state. No broker needed; works directly on disk. Ships as the <code>es-tools</code> binary.
+</p>
+
+<div class="codeblock">
+  <div class="codeblock-bar">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="label">build</span>
+    <span class="lang">bash</span>
+  </div>
+<pre><span class="c-fn">$</span> cargo build <span class="c-key">--release</span>
+<span class="c-fn">$</span> ./target/release/es-tools <span class="c-key">--help</span></pre>
+</div>
+
+<div class="rule-x my-14"></div>
+
+<h2 id="dump"><span class="num">§</span>Dump — create a backup</h2>
+
+<p class="reveal d1 mt-3 text-[15px] leading-[1.75] text-slate-300 max-w-[58ch] font-light">
+  Stop the broker first (the tools work offline and expect the data directory to be quiescent). Then point <code>es-tools dump</code> at the data directory.
+</p>
+
+<div class="codeblock mt-5">
+  <div class="codeblock-bar">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="label">es-tools dump</span>
+    <span class="lang">bash</span>
+  </div>
+<pre><span class="c-com"># Full backup</span>
+<span class="c-fn">$</span> es-tools dump <span class="c-key">--data-dir</span> ./data <span class="c-key">--output</span> backup.tar.gz
+
+<span class="c-com"># Filter specific topics</span>
+<span class="c-fn">$</span> es-tools dump <span class="c-key">--data-dir</span> ./data <span class="c-key">--output</span> orders-only.tar.gz <span class="c-key">--topics</span> orders
+
+<span class="c-com"># Include auth keys (excluded by default)</span>
+<span class="c-fn">$</span> es-tools dump <span class="c-key">--data-dir</span> ./data <span class="c-key">--output</span> full.tar.gz <span class="c-key">--include-keys</span>
+
+<span class="c-com"># Verify segment CRC integrity while copying</span>
+<span class="c-fn">$</span> es-tools dump <span class="c-key">--data-dir</span> ./data <span class="c-key">--output</span> verified.tar.gz <span class="c-key">--verify</span></pre>
+</div>
+
+<div class="rule-x my-10"></div>
+
+<h3>FLAGS</h3>
+
+<div class="overflow-x-auto mt-3">
+<table class="w-full text-[13.5px] leading-relaxed text-slate-300">
+  <thead>
+    <tr class="border-b border-white/10 text-left">
+      <th class="py-2 pr-6 font-mono text-[10.5px] tracking-[0.14em] uppercase text-slate-400">Flag</th>
+      <th class="py-2 pr-6 font-mono text-[10.5px] tracking-[0.14em] uppercase text-slate-400">Default</th>
+      <th class="py-2 font-mono text-[10.5px] tracking-[0.14em] uppercase text-slate-400">Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr class="border-b border-white/[0.04]">
+      <td class="py-2.5 pr-6 font-mono text-[12px] text-indigo-300"><code>--data-dir</code></td>
+      <td class="py-2.5 pr-6 font-mono text-[12px] text-slate-500"><code>./data</code></td>
+      <td class="py-2.5">Path to the broker's data directory.</td>
+    </tr>
+    <tr class="border-b border-white/[0.04]">
+      <td class="py-2.5 pr-6 font-mono text-[12px] text-indigo-300"><code>--output</code></td>
+      <td class="py-2.5 pr-6 font-mono text-[12px] text-slate-500"><code>backup.tar.gz</code></td>
+      <td class="py-2.5">Output archive path (<code>.tar.gz</code>).</td>
+    </tr>
+    <tr class="border-b border-white/[0.04]">
+      <td class="py-2.5 pr-6 font-mono text-[12px] text-indigo-300"><code>--topics</code></td>
+      <td class="py-2.5 pr-6 font-mono text-[12px] text-slate-500">(all)</td>
+      <td class="py-2.5">Comma-separated topic names to include.</td>
+    </tr>
+    <tr class="border-b border-white/[0.04]">
+      <td class="py-2.5 pr-6 font-mono text-[12px] text-indigo-300"><code>--include-keys</code></td>
+      <td class="py-2.5 pr-6 font-mono text-[12px] text-slate-500">false</td>
+      <td class="py-2.5">Include <code>keys.json</code> (auth secrets) in the archive.</td>
+    </tr>
+    <tr>
+      <td class="py-2.5 pr-6 font-mono text-[12px] text-indigo-300"><code>--verify</code></td>
+      <td class="py-2.5 pr-6 font-mono text-[12px] text-slate-500">false</td>
+      <td class="py-2.5">CRC-check every record in every segment while copying. Slower but validates integrity.</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<div class="rule-x my-14"></div>
+
+<h2 id="restore"><span class="num">§</span>Restore — rebuild a data directory</h2>
+
+<p class="reveal d1 mt-3 text-[15px] leading-[1.75] text-slate-300 max-w-[58ch] font-light">
+  Restore extracts the archive into a data directory. The directory must not already contain data (pass <code>--force</code> to override). After restoring, start the broker — its startup recovery will validate segments and rebuild indexes.
+</p>
+
+<div class="codeblock mt-5">
+  <div class="codeblock-bar">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="label">es-tools restore</span>
+    <span class="lang">bash</span>
+  </div>
+<pre><span class="c-com"># Restore to a fresh directory</span>
+<span class="c-fn">$</span> es-tools restore <span class="c-key">--input</span> backup.tar.gz <span class="c-key">--data-dir</span> ./new-data
+
+<span class="c-com"># Overwrite an existing directory</span>
+<span class="c-fn">$</span> es-tools restore <span class="c-key">--input</span> backup.tar.gz <span class="c-key">--data-dir</span> ./data <span class="c-key">--force</span></pre>
+</div>
+
+<div class="rule-x my-10"></div>
+
+<h3>FLAGS</h3>
+
+<div class="overflow-x-auto mt-3">
+<table class="w-full text-[13.5px] leading-relaxed text-slate-300">
+  <thead>
+    <tr class="border-b border-white/10 text-left">
+      <th class="py-2 pr-6 font-mono text-[10.5px] tracking-[0.14em] uppercase text-slate-400">Flag</th>
+      <th class="py-2 pr-6 font-mono text-[10.5px] tracking-[0.14em] uppercase text-slate-400">Default</th>
+      <th class="py-2 font-mono text-[10.5px] tracking-[0.14em] uppercase text-slate-400">Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr class="border-b border-white/[0.04]">
+      <td class="py-2.5 pr-6 font-mono text-[12px] text-indigo-300"><code>--input</code></td>
+      <td class="py-2.5 pr-6 font-mono text-[12px] text-slate-500"><code>backup.tar.gz</code></td>
+      <td class="py-2.5">Path to the backup archive.</td>
+    </tr>
+    <tr>
+      <td class="py-2.5 pr-6 font-mono text-[12px] text-indigo-300"><code>--data-dir</code></td>
+      <td class="py-2.5 pr-6 font-mono text-[12px] text-slate-500"><code>./data</code></td>
+      <td class="py-2.5">Target data directory (created if missing).</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<div class="rule-x my-14"></div>
+
+<h2 id="archive-format"><span class="num">§</span>Archive format</h2>
+
+<p class="reveal d1 mt-3 text-[15px] leading-[1.75] text-slate-300 max-w-[58ch] font-light">
+  The backup is a standard <code>.tar.gz</code> archive. Inspect it with <code>tar tzf</code> or extract it with any tar-compatible tool.
+</p>
+
+<div class="codeblock mt-5">
+  <div class="codeblock-bar">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="label">archive structure</span>
+    <span class="lang">text</span>
+  </div>
+<pre><span class="c-com">manifest.json                # version, timestamp, topic list, file count</span>
+<span class="c-dim">topics/</span>
+<span class="c-dim">  orders/</span>
+<span class="c-dim">    topic.json               # topic metadata + config</span>
+<span class="c-dim">    0/</span>
+<span class="c-dim">      00000000000000000000.log  # binary segment (big-endian records)</span>
+<span class="c-dim">      00000000000000000000.index</span>
+<span class="c-dim">    1/</span>
+<span class="c-dim">      00000000000000000000.log</span>
+<span class="c-dim">      00000000000000000000.index</span>
+<span class="c-dim">groups/</span>
+<span class="c-dim">  analytics.json            # consumer group offsets</span>
+<span class="c-dim">schemas.json                # schema registry</span>
+<span class="c-dim">producers.json              # idempotent producer state</span>
+<span class="c-dim">keys.json                   # auth keys (only with --include-keys)</span></pre>
+</div>
+
+<p class="mt-5 text-[15px] leading-[1.75] text-slate-300 max-w-[58ch] font-light">
+  Segment <code>.log</code> files are copied byte-for-byte — no re-encoding. The broker's own <a href="<%= docs_storage_path() %>">startup recovery</a> handles index rebuilding and torn-write truncation, so the tool doesn't need to decode records during backup.
+</p>
+
+<div class="rule-x my-14"></div>
+
+<h2 id="workflow"><span class="num">§</span>Typical workflow</h2>
+
+<div class="codeblock mt-4">
+  <div class="codeblock-bar">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="label">backup → migrate → verify</span>
+    <span class="lang">bash</span>
+  </div>
+<pre><span class="c-com"># 1. Stop the broker</span>
+<span class="c-fn">$</span> kill <span class="c-key">-TERM</span> <span class="c-num">$(pidof es-broker)</span>
+
+<span class="c-com"># 2. Create a verified backup</span>
+<span class="c-fn">$</span> es-tools dump <span class="c-key">--data-dir</span> ./data <span class="c-key">--output</span> backup.tar.gz <span class="c-key">--verify</span>
+
+<span class="c-com"># 3. Copy to another machine and restore</span>
+<span class="c-fn">$</span> <span class="c-key">scp</span> backup.tar.gz other-host:/tmp/
+<span class="c-fn">$</span> <span class="c-key">ssh</span> other-host <span class="c-str">"\</span>
+<span class="c-str">  es-tools restore --input /tmp/backup.tar.gz --data-dir /srv/es/data"</span>
+
+<span class="c-com"># 4. Start the broker on the new machine</span>
+<span class="c-fn">$</span> <span class="c-key">ssh</span> other-host <span class="c-str">"\</span>
+<span class="c-str">  es-broker --data-dir /srv/es/data --bind 0.0.0.0:9000"</span>
+
+<span class="c-com"># 5. Verify — all data should be reachable</span>
+<span class="c-fn">$</span> <span class="c-key">export</span> ES_BROKER=<span class="c-str">http://other-host:9000</span>
+<span class="c-fn">$</span> es topic list
+<span class="c-fn">$</span> es topic describe <span class="c-key">--name</span> orders</pre>
+</div>
+
+<div class="rule-x my-14"></div>
+
+<div class="flex items-start gap-3 p-4 rounded-xl bg-emerald-400/[0.06] ring-1 ring-emerald-400/20">
+  <span class="font-mono text-[10px] tracking-[0.2em] uppercase text-emerald-300">Shipped</span>
+  <p class="text-[13.5px] leading-relaxed text-slate-200">
+    Dump/restore is a lightweight offline tool (no broker runtime needed). It copies segment files byte-for-byte — no record decoding at dump time, so backups are fast even for large data sets. Use <code>--verify</code> when you want CRC validation on every record.
+  </p>
+</div>

@@ -139,7 +139,7 @@ impl Partition {
             active
                 .index
                 .write()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .push(offset - active.base_offset, file_pos);
             active.observe_timestamp(timestamp_ms);
         }

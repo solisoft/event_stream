@@ -12,6 +12,13 @@ use es_protocol::wire::{
     WireProduceRecord, WireProduceRequest, WireProduceResult, FEATURE_GZIP, WIRE_MAGIC,
 };
 
+/// Upper bound on a server-declared frame size. Protects the client from a
+/// malicious/compromised broker forcing a giant allocation. Mirrors the
+/// server's own frame cap.
+const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+/// Cap on decompressed frame size to protect the client from a decompression bomb.
+const MAX_DECOMPRESSED_BYTES: usize = 256 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ClientOptions {
     /// Request gzip compression on the connection. The server may decline,
@@ -111,8 +118,8 @@ impl BinaryClient {
         let mut len_buf = [0u8; 4];
         self.sock.read_exact(&mut len_buf).await?;
         let total = u32::from_be_bytes(len_buf) as usize;
-        if total < 5 {
-            return Err(anyhow!("server sent undersized frame {}", total));
+        if !(5..=MAX_FRAME_BYTES).contains(&total) {
+            return Err(anyhow!("server sent out-of-bounds frame size {}", total));
         }
         let mut frame = vec![0u8; total];
         self.sock.read_exact(&mut frame).await?;
@@ -211,8 +218,15 @@ fn compress(input: &[u8]) -> std::io::Result<Vec<u8>> {
 fn decompress(input: &[u8]) -> std::io::Result<Vec<u8>> {
     use flate2::read::GzDecoder;
     use std::io::Read;
-    let mut dec = GzDecoder::new(input);
-    let mut out = Vec::with_capacity(input.len() * 2);
-    dec.read_to_end(&mut out)?;
+    let dec = GzDecoder::new(input);
+    let mut limited = dec.take(MAX_DECOMPRESSED_BYTES as u64 + 1);
+    let mut out = Vec::with_capacity((input.len() * 2).min(MAX_DECOMPRESSED_BYTES));
+    limited.read_to_end(&mut out)?;
+    if out.len() > MAX_DECOMPRESSED_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "decompressed frame exceeds maximum size",
+        ));
+    }
     Ok(out)
 }

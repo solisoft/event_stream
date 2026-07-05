@@ -95,7 +95,12 @@ pub fn recover_partition(dir: &Path) -> io::Result<RecoveredPartition> {
             segments[active_idx]
                 .size_bytes
                 .load(std::sync::atomic::Ordering::Acquire),
-            (segments[active_idx].index.read().unwrap().len() as u64) * 16,
+            (segments[active_idx]
+                .index
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .len() as u64)
+                * 16,
         )?
     } else {
         SegmentAppender::open_existing(

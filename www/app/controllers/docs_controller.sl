@@ -46,4 +46,11 @@ class DocsController < Controller
         @title = "Cluster setup — es"
         render("docs/cluster", { "layout": "docs" })
     end
+
+    # GET /docs/tools
+    def tools
+        @section = "tools"
+        @title = "Backup & restore — es"
+        render("docs/tools", { "layout": "docs" })
+    end
 end

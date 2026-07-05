@@ -215,6 +215,13 @@ impl<'a> WireReader<'a> {
     pub fn remaining(&self) -> usize {
         self.bytes.len() - self.pos
     }
+    /// Bounded capacity hint for a length-prefixed collection. Never trust a
+    /// wire count to size an allocation directly — cap it to the number of
+    /// items that could possibly still fit in the unread bytes. `min_item_bytes`
+    /// is the smallest encoded size of one item.
+    pub fn cap_hint(&self, count: usize, min_item_bytes: usize) -> usize {
+        count.min(self.remaining() / min_item_bytes.max(1))
+    }
     fn ensure(&self, n: usize) -> io::Result<()> {
         if self.remaining() < n {
             Err(io::Error::new(
@@ -332,7 +339,9 @@ pub fn decode_produce_request(bytes: &[u8]) -> io::Result<WireProduceRequest> {
     let topic = r.get_str()?;
     let producer_id = r.get_opt_string_i32()?;
     let n = r.get_u32()? as usize;
-    let mut records = Vec::with_capacity(n);
+    // Min per-record wire size: key(i32=4) + value_len(u32=4) + partition(i32=4)
+    // + sequence(i64=8) = 20 bytes. Cap the pre-allocation to the frame size.
+    let mut records = Vec::with_capacity(r.cap_hint(n, 20));
     for _ in 0..n {
         let key = r.get_opt_bytes_i32()?;
         let value = r.get_value()?;
@@ -366,7 +375,8 @@ pub fn encode_produce_response(results: &[WireProduceResult]) -> Vec<u8> {
 pub fn decode_produce_response(bytes: &[u8]) -> io::Result<Vec<WireProduceResult>> {
     let mut r = WireReader::new(bytes);
     let n = r.get_u32()? as usize;
-    let mut out = Vec::with_capacity(n);
+    // Min per-result wire size: partition(u32=4) + offset(u64=8) + duplicate(u8=1).
+    let mut out = Vec::with_capacity(r.cap_hint(n, 13));
     for _ in 0..n {
         out.push(WireProduceResult {
             partition: r.get_u32()?,
@@ -418,7 +428,9 @@ pub fn decode_consume_response(bytes: &[u8]) -> io::Result<WireConsumeResponse> 
     let next_offset = r.get_u64()?;
     let high_watermark = r.get_u64()?;
     let n = r.get_u32()? as usize;
-    let mut records = Vec::with_capacity(n);
+    // Min per-record wire size: partition(4) + offset(8) + timestamp(8) +
+    // key(i32=4) + value_len(u32=4) = 28 bytes.
+    let mut records = Vec::with_capacity(r.cap_hint(n, 28));
     for _ in 0..n {
         records.push(WireRecord {
             partition: r.get_u32()?,
@@ -493,5 +505,28 @@ mod tests {
         assert_eq!(back.records[0].value, resp.records[0].value);
         assert_eq!(back.next_offset, 101);
         assert_eq!(back.high_watermark, 200);
+    }
+
+    #[test]
+    fn decode_produce_request_rejects_bogus_record_count_without_oom() {
+        // Craft a tiny frame that lies about its record count (u32::MAX) but
+        // carries no record bytes. The decoder must not pre-allocate ~4 billion
+        // records — cap_hint bounds capacity to the (near-zero) remaining bytes,
+        // and the first record read fails cleanly.
+        let mut b = WireBuf::new();
+        b.put_str(""); // topic
+        b.put_opt_string_i32(None); // producer_id
+        b.put_u32(u32::MAX); // record_count — hostile
+        let err = decode_produce_request(&b.bytes).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn cap_hint_bounds_capacity_to_remaining_bytes() {
+        let buf = [0u8; 40];
+        let r = WireReader::new(&buf);
+        // A hostile count is clamped to what could actually fit.
+        assert_eq!(r.cap_hint(usize::MAX, 20), 2);
+        assert_eq!(r.cap_hint(1, 20), 1);
     }
 }

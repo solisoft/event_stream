@@ -228,6 +228,7 @@ async fn partition_handle_raft_roundtrip() -> Result<()> {
             snapshot_after_applies: 0,
             bind: None,
             peer_addrs: BTreeMap::new(),
+            shared_secret: None,
         }),
     )?;
 
@@ -279,6 +280,7 @@ async fn partition_handle_raft_survives_restart() -> Result<()> {
         snapshot_after_applies: 0,
         bind: None,
         peer_addrs: BTreeMap::new(),
+        shared_secret: None,
     };
 
     {
@@ -357,11 +359,13 @@ async fn two_node_tcp_replication() -> Result<()> {
     rp1.connect_transport(RaftTransportConfig {
         bind: addr1,
         peer_addrs: peers_for_1,
+        shared_secret: None,
     })
     .await?;
     rp2.connect_transport(RaftTransportConfig {
         bind: addr2,
         peer_addrs: peers_for_2,
+        shared_secret: None,
     })
     .await?;
 

@@ -143,15 +143,16 @@ impl PersistedTopicConfig {
         }
     }
 
-    fn resolve_raft(&self, data_dir: &Path) -> Option<RaftConfig> {
+    fn resolve_raft(&self, broker: &Config) -> Option<RaftConfig> {
         self.raft.as_ref().map(|rc| RaftConfig {
             node_id: rc.node_id,
             peers: rc.peers.clone(),
-            raft_store_dir: data_dir.join("raft"),
+            raft_store_dir: broker.data_dir.join("raft"),
             timing: Timing::default(),
             snapshot_after_applies: rc.snapshot_after_applies.max(1),
             bind: None,
             peer_addrs: BTreeMap::new(),
+            shared_secret: broker.raft_shared_secret.clone(),
         })
     }
 
@@ -204,7 +205,7 @@ impl Topic {
         if partitions == 0 {
             return Err(anyhow!("topic must have at least 1 partition"));
         }
-        validate_name(name)?;
+        validate_topic_name(name)?;
 
         let topic_dir = root.join(name);
         std::fs::create_dir_all(&topic_dir)
@@ -219,7 +220,7 @@ impl Topic {
             .map(PersistedTopicConfig::from_patch)
             .unwrap_or_default();
         let resolved = persisted.resolve(broker)?;
-        let raft_cfg = persisted.resolve_raft(&broker.data_dir);
+        let raft_cfg = persisted.resolve_raft(broker);
         let meta = TopicMeta {
             partitions,
             config: persisted.clone(),
@@ -264,6 +265,7 @@ impl Topic {
                         .iter()
                         .map(|(id, addr)| (*id, SocketAddr::new(addr.ip(), addr.port() + i as u16)))
                         .collect(),
+                    shared_secret: raft_cfg.shared_secret.clone(),
                 };
                 if let Err(e) = p.connect_transport(tcfg).await {
                     tracing::warn!(
@@ -285,7 +287,7 @@ impl Topic {
         let meta: TopicMeta = serde_json::from_slice(&meta_bytes)
             .with_context(|| format!("parse topic meta {:?}", meta_path))?;
         let resolved = meta.config.resolve(broker)?;
-        let raft_cfg = meta.config.resolve_raft(&broker.data_dir);
+        let raft_cfg = meta.config.resolve_raft(broker);
         let mut parts = Vec::with_capacity(meta.partitions as usize);
         for id in 0..meta.partitions {
             let dir = topic_dir.join(id.to_string());
@@ -361,7 +363,10 @@ impl Topic {
     }
 }
 
-fn validate_name(name: &str) -> Result<()> {
+/// Validate a topic name. Rejects anything that isn't `[A-Za-z0-9_.-]{1,200}`
+/// and the `.`/`..` path specials, so a topic name can never be used to escape
+/// the data directory when it's joined into a filesystem path.
+pub fn validate_topic_name(name: &str) -> Result<()> {
     if name.is_empty() || name.len() > 200 {
         return Err(anyhow!("topic name length must be 1..=200"));
     }

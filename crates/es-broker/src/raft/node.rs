@@ -173,20 +173,33 @@ pub fn spawn_node_with_store(
 
                 msg = inbound_rx.recv() => {
                     let Some(msg) = msg else { break; };
-                    if let Message::InstallSnapshot(ref is) = msg {
-                        let snap = PersistedSnapshot {
+                    // Hold the snapshot bytes aside and persist them only if the
+                    // state machine actually accepts the snapshot. Persisting
+                    // before validation lets a rejected or forged InstallSnapshot
+                    // land on disk and corrupt state on the next restart.
+                    let pending_snapshot = if let Message::InstallSnapshot(ref is) = msg {
+                        Some(PersistedSnapshot {
                             last_index: is.last_index,
                             last_term: is.last_term,
                             data: is.data.clone(),
-                        };
-                        if let Err(e) = store.save_snapshot(&snap) {
-                            tracing::error!(error = %e, "raft: failed to save received snapshot");
+                        })
+                    } else {
+                        None
+                    };
+                    let (actions, snapshot_accepted) = {
+                        let mut s = state_for_task.lock().await;
+                        let before_base = s.log.base_index;
+                        let actions = s.on_message(msg);
+                        // A snapshot is accepted iff it advanced the log's base.
+                        (actions, s.log.base_index > before_base)
+                    };
+                    if snapshot_accepted {
+                        if let Some(snap) = pending_snapshot {
+                            if let Err(e) = store.save_snapshot(&snap) {
+                                tracing::error!(error = %e, "raft: failed to save received snapshot");
+                            }
                         }
                     }
-                    let actions = {
-                        let mut s = state_for_task.lock().await;
-                        s.on_message(msg)
-                    };
                     apply_and_persist(&state_for_task, &store, &outbound_tx, &committed_tx,
                                       &mut election_deadline, timing, actions).await;
                 }

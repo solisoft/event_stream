@@ -117,6 +117,7 @@ async fn three_node_tcp_transport_elects_a_leader() -> Result<()> {
             inbound_tx,
             outbound_rx,
             Duration::from_millis(50),
+            None,
         )
         .await?;
         handles.push((id, node, transport));

@@ -115,8 +115,19 @@ impl Log {
         self.entries.truncate(keep);
     }
 
+    /// Append entries starting at `start_index`, truncating any conflicting
+    /// suffix. `committed` is the highest index known to be committed; a
+    /// conflict at or below it is refused (returns `false` without mutating the
+    /// log) so already-committed history can never be overwritten — a legitimate
+    /// leader never conflicts below the commit point, so this only rejects
+    /// forged/buggy appends. Returns `true` when the append was applied.
     #[allow(clippy::explicit_counter_loop)]
-    pub fn append_at(&mut self, start_index: LogIndex, mut new_entries: Vec<LogEntry>) {
+    pub fn append_at(
+        &mut self,
+        start_index: LogIndex,
+        mut new_entries: Vec<LogEntry>,
+        committed: LogIndex,
+    ) -> bool {
         let mut idx = start_index;
         let mut skip = 0usize;
         while skip < new_entries.len() {
@@ -126,6 +137,10 @@ impl Log {
                     idx += 1;
                 }
                 Some(_) => {
+                    if idx <= committed {
+                        // Refuse to truncate committed entries.
+                        return false;
+                    }
                     self.truncate_from(idx);
                     break;
                 }
@@ -133,7 +148,7 @@ impl Log {
             }
         }
         if skip == new_entries.len() {
-            return;
+            return true;
         }
         let to_append = new_entries.split_off(skip);
         let mut next = self.last_index() + 1;
@@ -144,6 +159,7 @@ impl Log {
             next += 1;
         }
         self.entries.extend(out);
+        true
     }
 
     /// Drop every entry with `index <= cut_index`. `cut_term` becomes the new
@@ -154,7 +170,8 @@ impl Log {
             return;
         }
         let drop_count = if let Some(first) = self.entries.first() {
-            ((cut_index + 1).saturating_sub(first.index) as usize).min(self.entries.len())
+            (cut_index.saturating_add(1).saturating_sub(first.index) as usize)
+                .min(self.entries.len())
         } else {
             0
         };
@@ -402,9 +419,23 @@ mod tests {
         let mut log = Log::default();
         log.append_assign_indices(vec![e(1, b"a"), e(1, b"b"), e(2, b"c")]);
         // Suppose leader sends a conflicting entry starting at index 3, term 3.
-        log.append_at(3, vec![e(3, b"C")]);
+        log.append_at(3, vec![e(3, b"C")], 0);
         assert_eq!(log.last_index(), 3);
         assert_eq!(log.term_at(3), Some(3));
+    }
+
+    #[test]
+    fn append_at_refuses_to_truncate_committed() {
+        let mut log = Log::default();
+        log.append_assign_indices(vec![e(1, b"a"), e(1, b"b"), e(2, b"c")]);
+        // Indices 1..=3 are committed. A conflicting entry at index 2 would
+        // overwrite committed history — append_at must refuse and leave the log
+        // untouched.
+        let applied = log.append_at(2, vec![e(9, b"X")], 3);
+        assert!(!applied);
+        assert_eq!(log.last_index(), 3);
+        assert_eq!(log.term_at(2), Some(1));
+        assert_eq!(log.term_at(3), Some(2));
     }
 
     #[test]
@@ -412,7 +443,7 @@ mod tests {
         let mut log = Log::default();
         log.append_assign_indices(vec![e(1, b"a"), e(1, b"b")]);
         // Leader sends [t1@2, t2@3]. We already have t1@2 — accept, then append t2@3.
-        log.append_at(2, vec![e(1, b"b-dup"), e(2, b"c")]);
+        log.append_at(2, vec![e(1, b"b-dup"), e(2, b"c")], 0);
         assert_eq!(log.last_index(), 3);
         assert_eq!(log.term_at(2), Some(1));
         assert_eq!(log.term_at(3), Some(2));

@@ -37,6 +37,11 @@ pub struct Config {
     pub raft_bind: Option<SocketAddr>,
     pub raft_peer_addrs: BTreeMap<u32, SocketAddr>,
 
+    /// Pre-shared secret that peers must present in the Raft transport
+    /// handshake. When `None`, the raft port performs no peer authentication
+    /// (only safe on a fully trusted/loopback network).
+    pub raft_shared_secret: Option<String>,
+
     /// Cold-storage directory for tiered storage. When set, sealed segments are
     /// offloaded here instead of being deleted by retention.
     pub cold_storage_dir: Option<PathBuf>,
@@ -68,6 +73,7 @@ impl Config {
             raft_node_id: None,
             raft_bind: None,
             raft_peer_addrs: BTreeMap::new(),
+            raft_shared_secret: None,
             cold_storage_dir: None,
         }
     }
