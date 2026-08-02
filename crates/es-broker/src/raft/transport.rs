@@ -44,6 +44,16 @@ const MAX_SECRET_LEN: usize = 1024;
 /// Bounds slowloris-style holds on the raft listener.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Whether this address can only be reached from the machine itself.
+///
+/// The unspecified address (`0.0.0.0`, `::`) is deliberately **not** loopback:
+/// it is the value that looks harmless in a config file and binds every
+/// interface, including the public one. That is the exact case the old
+/// "loopback setups" comment did not cover.
+fn bind_is_loopback(addr: &SocketAddr) -> bool {
+    addr.ip().is_loopback()
+}
+
 /// Constant-time byte-slice equality, so a peer can't learn the shared secret
 /// from handshake-rejection timing.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -73,14 +83,35 @@ pub async fn spawn_transport(
     reconnect_backoff: Duration,
     shared_secret: Option<String>,
 ) -> Result<Transport> {
-    let listener = TcpListener::bind(bind).await?;
-    let cancel = CancellationToken::new();
     // Pre-shared secret both peers must present in the handshake. Without it the
     // raft port accepts any TCP client, letting an attacker inject arbitrary
     // AppendEntries/InstallSnapshot/config-change messages into replicated
-    // state. `None`/empty preserves the (insecure) no-auth behavior for
-    // single-node/loopback setups.
-    let secret: Arc<Option<Vec<u8>>> = Arc::new(shared_secret.map(|s| s.into_bytes()));
+    // state.
+    //
+    // No-auth is still allowed, but only where it was ever defensible: a bind
+    // the kernel will not route from off-box. The old comment called it "the
+    // (insecure) no-auth behavior for single-node/loopback setups" and then let
+    // it apply to `0.0.0.0` too — which on any host with a public address is
+    // remote control of the replicated state by anyone who can reach the port.
+    //
+    // Whether that is safe depends entirely on the bind address, so the code
+    // now depends on the bind address rather than on the operator having read
+    // a comment.
+    let secret: Arc<Option<Vec<u8>>> = Arc::new(
+        shared_secret
+            .filter(|s| !s.is_empty())
+            .map(|s| s.into_bytes()),
+    );
+    if secret.is_none() && !bind_is_loopback(&bind) {
+        anyhow::bail!(
+            "refusing to open an unauthenticated raft port on {bind}: no shared secret is \
+             configured, and this address is reachable from off-box. Set the cluster shared \
+             secret, or bind to 127.0.0.1 for a single-node setup."
+        );
+    }
+
+    let listener = TcpListener::bind(bind).await?;
+    let cancel = CancellationToken::new();
 
     // Each peer gets a per-peer mpsc; the dialer task drains it onto its socket.
     let peer_senders: Arc<DashMap<NodeId, mpsc::UnboundedSender<Vec<u8>>>> =
@@ -412,5 +443,38 @@ mod tests {
             .expect("message should be delivered within timeout");
         assert!(matches!(got, Some(Message::RequestVote(_))));
         server.abort();
+    }
+}
+
+#[cfg(test)]
+mod bind_guard_tests {
+    use super::bind_is_loopback;
+    use std::net::SocketAddr;
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn loopback_may_run_without_a_secret() {
+        // The case the exemption was written for, and the only one where it was
+        // ever true: a port the kernel will not route from off-box.
+        assert!(bind_is_loopback(&addr("127.0.0.1:9300")));
+        assert!(bind_is_loopback(&addr("[::1]:9300")));
+    }
+
+    #[test]
+    fn the_unspecified_address_is_not_loopback() {
+        // The whole point. `0.0.0.0` looks harmless in a config file and binds
+        // every interface including the public one — so an unauthenticated
+        // raft port there is remote control of the replicated state.
+        assert!(!bind_is_loopback(&addr("0.0.0.0:9300")));
+        assert!(!bind_is_loopback(&addr("[::]:9300")));
+    }
+
+    #[test]
+    fn a_routable_address_is_not_loopback() {
+        assert!(!bind_is_loopback(&addr("203.0.113.7:9300")));
+        assert!(!bind_is_loopback(&addr("10.0.0.7:9300")));
     }
 }
