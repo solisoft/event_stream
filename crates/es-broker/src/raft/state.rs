@@ -468,7 +468,8 @@ impl RaftState {
                     let last_new = if ae.entries.is_empty() {
                         self.log.last_index()
                     } else {
-                        ae.prev_log_index.saturating_add(ae.entries.len() as LogIndex)
+                        ae.prev_log_index
+                            .saturating_add(ae.entries.len() as LogIndex)
                     };
                     if ae.leader_commit > self.commit_index {
                         self.commit_index = ae.leader_commit.min(last_new);

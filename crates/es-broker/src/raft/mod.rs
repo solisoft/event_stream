@@ -30,4 +30,4 @@ pub use log::{JsonStore, Log, MemStore, PersistedRaft, PersistedSnapshot, RaftSt
 pub use messages::{LogEntry, LogIndex, Message, NodeId, Term};
 pub use node::{spawn_node, spawn_node_with_store, NodeHandle, Outbound, ProposeReply, Timing};
 pub use state::{Action, RaftState, Role};
-pub use transport::{spawn_transport, Transport};
+pub use transport::{group_key, spawn_transport, RaftHub, Transport};

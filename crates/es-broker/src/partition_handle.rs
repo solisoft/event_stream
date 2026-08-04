@@ -9,7 +9,7 @@ use anyhow::Result;
 use tokio_util::sync::CancellationToken;
 
 use crate::partition::Partition;
-use crate::raft::Timing;
+use crate::raft::{RaftHub, Timing};
 use crate::raft_partition::{RaftPartition, RaftPartitionConfig, RaftTransportConfig};
 use crate::storage::record::Record;
 use crate::storage::segment::Segment;
@@ -212,6 +212,19 @@ impl PartitionHandle {
             Self::Plain(_) => Ok(()),
             Self::Raft(p) => p.connect_transport(tcfg).await,
         }
+    }
+
+    /// Route this partition over a broker-wide hub. A plain partition has no
+    /// Raft traffic, so this is a no-op for it.
+    pub fn attach_to_hub(&self, hub: &Arc<RaftHub>, group: &str) -> Result<()> {
+        match self {
+            Self::Plain(_) => Ok(()),
+            Self::Raft(p) => p.attach_to_hub(hub, group),
+        }
+    }
+
+    pub fn is_raft(&self) -> bool {
+        matches!(self, Self::Raft(_))
     }
 
     pub async fn shutdown(&self) {

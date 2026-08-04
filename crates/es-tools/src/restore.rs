@@ -233,7 +233,9 @@ mod tests {
     fn rejects_traversal_and_absolute_paths() {
         // Parent-dir traversal (zip-slip) must be rejected.
         assert!(!is_safe_relative_path(Path::new("../../etc/cron.d/pwn")));
-        assert!(!is_safe_relative_path(Path::new("topics/../../../etc/passwd")));
+        assert!(!is_safe_relative_path(Path::new(
+            "topics/../../../etc/passwd"
+        )));
         // Absolute paths must be rejected.
         assert!(!is_safe_relative_path(Path::new("/etc/passwd")));
         // Empty path is not a valid extraction target.
