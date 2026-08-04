@@ -319,6 +319,11 @@ impl Topic {
         }
     }
 
+    /// Every partition of this topic, for callers that need the handle itself.
+    pub fn raft_partitions(&self) -> impl Iterator<Item = &PartitionHandle> {
+        self.partitions.iter().filter(|p| p.is_raft())
+    }
+
     pub fn has_raft_partitions(&self) -> bool {
         self.partitions.iter().any(|p| p.is_raft())
     }

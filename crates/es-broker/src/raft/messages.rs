@@ -114,6 +114,24 @@ impl Message {
         }
     }
 
+    /// Which node sent this message.
+    ///
+    /// Every variant already carries it under a different name, which is why
+    /// nothing could ask the question generically before. A leader needs it to
+    /// know which peers it has actually heard from recently — `match_index` alone
+    /// keeps the acknowledgements of peers that have since died, so a leader that
+    /// lost its majority would still report one.
+    pub fn sender(&self) -> NodeId {
+        match self {
+            Self::RequestVote(m) => m.candidate_id,
+            Self::RequestVoteResp(m) => m.voter_id,
+            Self::AppendEntries(m) => m.leader_id,
+            Self::AppendEntriesResp(m) => m.responder_id,
+            Self::InstallSnapshot(m) => m.leader_id,
+            Self::InstallSnapshotResp(m) => m.responder_id,
+        }
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(64);
         match self {

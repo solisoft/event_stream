@@ -10,6 +10,7 @@ pub mod groups;
 pub mod healthz;
 pub mod metrics;
 pub mod produce;
+pub mod raft_status;
 pub mod schemas;
 pub mod topics;
 
@@ -33,6 +34,7 @@ pub fn router(broker: Arc<Broker>) -> Router {
         .route("/healthz", get(healthz::healthz))
         .route("/readyz", get(healthz::readyz))
         .route("/metrics", get(metrics::metrics))
+        .route("/raft", get(raft_status::raft_status))
         .route("/topics", get(topics::list).post(topics::create))
         .route(
             "/topics/:name",

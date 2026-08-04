@@ -225,6 +225,21 @@ impl RaftPartition {
         Ok(())
     }
 
+    /// The Raft state machine behind this partition, for reporting only.
+    ///
+    /// Read-only by convention: the node loop owns every mutation, and a second
+    /// writer would race it. Exposed so `/raft` can answer "is this member
+    /// replicating?" — which nothing outside the process could tell before.
+    pub fn raft_state(&self) -> &Arc<TokioMutex<RaftState>> {
+        &self.raft.state
+    }
+
+    /// Which peers this node has heard from recently. See
+    /// [`NodeHandle::peers_heard_from`].
+    pub async fn peers_heard_from(&self, within: Duration) -> Vec<NodeId> {
+        self.raft.peers_heard_from(within).await
+    }
+
     pub fn partition(&self) -> &Arc<Partition> {
         &self.partition
     }
