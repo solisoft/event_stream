@@ -70,6 +70,48 @@ struct Args {
     /// are offloaded here instead of being deleted by retention.
     #[arg(long)]
     cold_storage_dir: Option<PathBuf>,
+
+    /// Pre-shared secret peers must present in the Raft transport handshake.
+    /// Strongly recommended whenever Raft peers talk over an untrusted network —
+    /// without it the raft port accepts messages from any client.
+    #[arg(long, env = "ES_RAFT_SHARED_SECRET")]
+    raft_shared_secret: Option<String>,
+
+    /// This broker's Raft node id, unique in the cluster. Setting it makes every
+    /// topic on this broker a replicated one; leaving it unset runs a
+    /// single-node broker.
+    #[arg(long)]
+    raft_node_id: Option<u32>,
+
+    /// Address this broker listens on for Raft RPCs from its peers. All groups
+    /// share this one port — the group name travels in each frame.
+    #[arg(long)]
+    raft_bind: Option<SocketAddr>,
+
+    /// A peer, as `<node-id>=<host:port>`. Repeat once per other member. The
+    /// membership is this node plus exactly these peers, so a member with no
+    /// address cannot be declared.
+    #[arg(long = "raft-peer", value_parser = parse_raft_peer)]
+    raft_peers: Vec<(u32, SocketAddr)>,
+}
+
+/// Parse `<node-id>=<host:port>`.
+fn parse_raft_peer(s: &str) -> Result<(u32, SocketAddr), String> {
+    let (id, addr) = s
+        .split_once('=')
+        .ok_or_else(|| format!("expected <node-id>=<host:port>, got '{s}'"))?;
+    let id: u32 = id
+        .trim()
+        .parse()
+        .map_err(|_| format!("'{id}' is not a node id"))?;
+    if id == 0 {
+        return Err("node id 0 is the 'no leader known' sentinel and cannot name a peer".into());
+    }
+    let addr: SocketAddr = addr
+        .trim()
+        .parse()
+        .map_err(|_| format!("'{addr}' is not a host:port address"))?;
+    Ok((id, addr))
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -134,6 +176,32 @@ async fn main() -> Result<()> {
     config.max_request_body_bytes = args.max_request_body_bytes;
     config.shutdown_timeout = args.shutdown_timeout;
     config.cold_storage_dir = args.cold_storage_dir;
+    config.raft_shared_secret = args.raft_shared_secret;
+    config.raft_node_id = args.raft_node_id;
+    config.raft_bind = args.raft_bind;
+    for (id, addr) in args.raft_peers {
+        if let Some(prev) = config.raft_peer_addrs.insert(id, addr) {
+            anyhow::bail!(
+                "--raft-peer {id} was given twice ({prev} then {addr}); one address per peer"
+            );
+        }
+    }
+    // Refuse here rather than at the first append: a broker that got its
+    // cluster settings wrong must not reach the point of accepting writes.
+    config.validate_raft()?;
+
+    if config.auth_mode == AuthMode::Disabled {
+        tracing::warn!(
+            "authentication is DISABLED (--auth disabled): every request is treated as an \
+             admin with full access. Use `--auth required` on any non-trusted network."
+        );
+    }
+    if config.bind_binary.is_some() && config.tls_cert_path.is_none() {
+        tracing::warn!(
+            "binary protocol listener is plaintext (no TLS): API tokens and record data are \
+             sent unencrypted. Restrict it to a trusted network."
+        );
+    }
 
     let handle = spawn(config).await?;
     tracing::info!(addr = %handle.addr, scheme = handle.scheme, "broker listening");

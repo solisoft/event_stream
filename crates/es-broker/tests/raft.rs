@@ -117,6 +117,7 @@ async fn three_node_tcp_transport_elects_a_leader() -> Result<()> {
             inbound_tx,
             outbound_rx,
             Duration::from_millis(50),
+            None,
         )
         .await?;
         handles.push((id, node, transport));
@@ -465,6 +466,21 @@ async fn snapshot_sent_to_lagging_follower() -> Result<()> {
     assert!(leader.is_some(), "no leader");
     let leader_id = leader.unwrap();
 
+    // Which node wins the election is genuinely nondeterministic, so the stores
+    // are picked by the outcome. Naming node 1 as the leader made this test pass
+    // only in the runs where node 1 happened to win.
+    let follower_id: NodeId = if leader_id == 1 { 2 } else { 1 };
+    let leader_store = if leader_id == 1 {
+        store_1.clone()
+    } else {
+        store_2.clone()
+    };
+    let follower_store = if follower_id == 1 {
+        store_1.clone()
+    } else {
+        store_2.clone()
+    };
+
     // Propose entries and pump aggressively so the follower acks.
     for i in 0..10u32 {
         handles
@@ -498,7 +514,7 @@ async fn snapshot_sent_to_lagging_follower() -> Result<()> {
         assert!(snap_index > 0);
         assert_eq!(snap.data, b"snap-data");
 
-        let loaded = store_1.load_snapshot()?.unwrap();
+        let loaded = leader_store.load_snapshot()?.unwrap();
         assert_eq!(loaded.last_index, snap_index);
 
         let s = h.state.lock().await;
@@ -506,10 +522,23 @@ async fn snapshot_sent_to_lagging_follower() -> Result<()> {
         drop(s);
     }
 
-    // Simulate follower falling behind by compacting its log.
+    // Put the follower genuinely behind. Compacting *its* log does not do that:
+    // the leader decides what to send from its own `next_index` for that peer,
+    // and a follower that has acked everything is not behind no matter what its
+    // own log looks like. So drop the follower's entries AND rewind the leader's
+    // idea of where it is, which is the state after a follower has been down
+    // long enough for the leader to compact past it.
     {
-        let mut s = handles.get(&2).unwrap().state.lock().await;
-        s.log.compact_through(snap_index, 1);
+        let mut s = handles.get(&follower_id).unwrap().state.lock().await;
+        s.log.truncate_from(1);
+        s.commit_index = 0;
+        s.last_applied = 0;
+        drop(s);
+    }
+    {
+        let mut s = handles.get(&leader_id).unwrap().state.lock().await;
+        s.next_index.insert(follower_id, 1);
+        s.match_index.insert(follower_id, 0);
         drop(s);
     }
 
@@ -517,11 +546,11 @@ async fn snapshot_sent_to_lagging_follower() -> Result<()> {
     pump_outbound(&mut handles, Instant::now() + Duration::from_millis(500)).await?;
 
     // Verify follower received and persisted the snapshot.
-    let snap_loaded = store_2.load_snapshot()?.unwrap();
+    let snap_loaded = follower_store.load_snapshot()?.unwrap();
     assert_eq!(snap_loaded.last_index, snap_index);
     assert_eq!(snap_loaded.data, b"snap-data");
 
-    let s = handles.get(&2).unwrap().state.lock().await;
+    let s = handles.get(&follower_id).unwrap().state.lock().await;
     assert_eq!(
         s.log.base_index, snap_index,
         "follower did not apply snapshot base_index"

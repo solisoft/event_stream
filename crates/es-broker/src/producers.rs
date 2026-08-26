@@ -62,6 +62,9 @@ struct PersistedRegistry {
     producers: Vec<PersistedProducer>,
 }
 
+/// Upper bound on distinct producers tracked for idempotent dedupe.
+const MAX_PRODUCERS: usize = 100_000;
+
 #[allow(clippy::type_complexity)]
 pub struct ProducerRegistry {
     file_path: PathBuf,
@@ -101,6 +104,27 @@ impl ProducerRegistry {
         Ok(Arc::new(store))
     }
 
+    /// Validate an incoming `producer_id` and enforce the registry cap. Call
+    /// before touching producer state so a flood of random ids can't grow the
+    /// registry (and the on-disk `producers.json`) without bound.
+    pub fn check_admission(&self, producer_id: &str) -> Result<()> {
+        if producer_id.is_empty() || producer_id.len() > 200 {
+            return Err(anyhow!("producer_id length must be 1..=200"));
+        }
+        let ok = producer_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.');
+        if !ok {
+            return Err(anyhow!(
+                "producer_id may only contain ASCII alphanumerics, '_', '-', '.'"
+            ));
+        }
+        if !self.state.contains_key(producer_id) && self.state.len() >= MAX_PRODUCERS {
+            return Err(anyhow!("producer limit reached ({})", MAX_PRODUCERS));
+        }
+        Ok(())
+    }
+
     fn slot(&self, producer_id: &str) -> Arc<Mutex<BTreeMap<(String, u32), PartitionState>>> {
         if let Some(slot) = self.state.get(producer_id) {
             return slot.clone();
@@ -125,6 +149,10 @@ impl ProducerRegistry {
         let slot = self.slot(producer_id);
         let mut guard = slot.lock().await;
         let key = (topic.to_string(), partition);
+        // Callers reject negative sequences (see the produce handlers), and the
+        // comparisons use saturating math, so an attacker-supplied i64 can never
+        // overflow here. The sequence is only advanced in `record_offset` after a
+        // successful append, so a failed append doesn't strand the sequence.
         match guard.get(&key) {
             None => {
                 // First record we see from this producer on this partition.
@@ -133,7 +161,7 @@ impl ProducerRegistry {
                 guard.insert(
                     key,
                     PartitionState {
-                        last_seen_sequence: sequence - 1,
+                        last_seen_sequence: sequence.saturating_sub(1),
                         last_offset: 0,
                     },
                 );
@@ -144,7 +172,7 @@ impl ProducerRegistry {
                     DedupeOutcome::Duplicate {
                         prev_offset: ps.last_offset,
                     }
-                } else if sequence == ps.last_seen_sequence + 1 {
+                } else if sequence == ps.last_seen_sequence.saturating_add(1) {
                     DedupeOutcome::Accept
                 } else if sequence < ps.last_seen_sequence {
                     DedupeOutcome::SequenceTooLow {
@@ -152,7 +180,7 @@ impl ProducerRegistry {
                     }
                 } else {
                     DedupeOutcome::Gap {
-                        expected: ps.last_seen_sequence + 1,
+                        expected: ps.last_seen_sequence.saturating_add(1),
                         got: sequence,
                     }
                 }

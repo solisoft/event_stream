@@ -10,6 +10,11 @@ use crate::topic::write_json_atomic;
 
 pub type GroupOffsets = BTreeMap<String, BTreeMap<u32, u64>>;
 
+/// Upper bound on the number of distinct consumer groups tracked. Bounds
+/// memory/inode growth from an attacker committing offsets under many random
+/// group names.
+const MAX_GROUPS: usize = 100_000;
+
 pub struct GroupStore {
     dir: PathBuf,
     entries: DashMap<String, Arc<Mutex<GroupOffsets>>>,
@@ -60,6 +65,11 @@ impl GroupStore {
         offset: u64,
     ) -> Result<()> {
         validate_group_name(group)?;
+        // Cap the number of tracked groups. `commit` is the only path that
+        // creates a group slot, so enforcing here bounds total growth.
+        if !self.entries.contains_key(group) && self.entries.len() >= MAX_GROUPS {
+            anyhow::bail!("consumer group limit reached ({})", MAX_GROUPS);
+        }
         let slot = self.slot(group);
         let mut guard = slot.lock().await;
         guard
@@ -71,13 +81,17 @@ impl GroupStore {
     }
 
     pub async fn fetch(&self, group: &str, topic: &str, partition: u32) -> Option<u64> {
-        let slot = self.slot(group);
+        // Read-only: never create a slot for an unknown group (that would let a
+        // flood of random group names exhaust memory).
+        let slot = self.entries.get(group).map(|s| s.clone())?;
         let guard = slot.lock().await;
         guard.get(topic).and_then(|m| m.get(&partition)).copied()
     }
 
     pub async fn snapshot(&self, group: &str) -> GroupOffsets {
-        let slot = self.slot(group);
+        let Some(slot) = self.entries.get(group).map(|s| s.clone()) else {
+            return GroupOffsets::new();
+        };
         let guard = slot.lock().await;
         guard.clone()
     }

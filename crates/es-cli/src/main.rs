@@ -19,9 +19,16 @@ struct Cli {
     broker: String,
 
     /// Bearer token sent on every request when auth is enabled on the broker.
-    /// May be set via the `ES_AUTH` environment variable.
+    /// May be set via the `ES_AUTH` environment variable. NOTE: passing the
+    /// secret inline (`--auth <token>`) exposes it to other local users via
+    /// `ps`/`/proc` and shell history — prefer `--auth-file` or `ES_AUTH`.
     #[arg(long, env = "ES_AUTH")]
     auth: Option<String>,
+
+    /// Read the bearer token from this file (first line). Preferred over
+    /// `--auth` because the secret never appears on the command line.
+    #[arg(long)]
+    auth_file: Option<PathBuf>,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -314,7 +321,15 @@ fn build_patch(
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let client = build_client(cli.auth.as_deref())?;
+    let auth = match &cli.auth_file {
+        Some(path) => {
+            let contents = std::fs::read_to_string(path)
+                .with_context(|| format!("read auth file {:?}", path))?;
+            Some(contents.lines().next().unwrap_or("").trim().to_string())
+        }
+        None => cli.auth.clone(),
+    };
+    let client = build_client(auth.as_deref())?;
     let base = cli.broker.trim_end_matches('/').to_string();
     match cli.cmd {
         Cmd::Topic { sub } => match sub {

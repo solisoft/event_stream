@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -10,8 +9,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::partition_handle::{PartitionHandle, RaftConfig};
-use crate::raft::Timing;
+use crate::raft::{group_key, RaftHub, Timing};
 use es_protocol::{CleanupPolicyDto, TopicConfigDto, TopicConfigPatch};
+
+/// Raft applies between snapshots when the operator has not set a value.
+/// Snapshotting on every apply would rewrite the whole partition state per
+/// record.
+const DEFAULT_SNAPSHOT_AFTER_APPLIES: u32 = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CleanupPolicy {
@@ -143,15 +147,51 @@ impl PersistedTopicConfig {
         }
     }
 
-    fn resolve_raft(&self, data_dir: &Path) -> Option<RaftConfig> {
+    /// The Raft configuration for this topic's partitions, if any.
+    ///
+    /// Broker-level cluster membership wins over the persisted topic field, and
+    /// deliberately so: which node this process is, and where the other members
+    /// are, are properties of the *process*. A node id stored in topic metadata
+    /// would claim the same id on every machine that metadata reached.
+    ///
+    /// The membership is `self` plus exactly the peers that have an address.
+    /// There is no way to name a member without giving its address, which
+    /// removes the failure where a member counts toward a quorum the node can
+    /// never reach.
+    fn resolve_raft(&self, broker: &Config, topic_name: &str) -> Option<RaftConfig> {
+        // Each topic gets its own Raft state directory. Sharing one would put
+        // two topics' partition 0 in the same state file and let each overwrite
+        // the other's term and vote.
+        let raft_store_dir = broker.data_dir.join("raft").join(topic_name);
+
+        if let Some(node_id) = broker.raft_node_id {
+            let snapshot_after_applies = self
+                .raft
+                .as_ref()
+                .map(|rc| rc.snapshot_after_applies)
+                .filter(|n| *n > 0)
+                .unwrap_or(DEFAULT_SNAPSHOT_AFTER_APPLIES);
+            return Some(RaftConfig {
+                node_id,
+                peers: broker.raft_peer_addrs.keys().copied().collect(),
+                raft_store_dir,
+                timing: Timing::default(),
+                snapshot_after_applies,
+                bind: broker.raft_bind,
+                peer_addrs: broker.raft_peer_addrs.clone(),
+                shared_secret: broker.raft_shared_secret.clone(),
+            });
+        }
+
         self.raft.as_ref().map(|rc| RaftConfig {
             node_id: rc.node_id,
             peers: rc.peers.clone(),
-            raft_store_dir: data_dir.join("raft"),
+            raft_store_dir,
             timing: Timing::default(),
             snapshot_after_applies: rc.snapshot_after_applies.max(1),
             bind: None,
             peer_addrs: BTreeMap::new(),
+            shared_secret: broker.raft_shared_secret.clone(),
         })
     }
 
@@ -204,7 +244,7 @@ impl Topic {
         if partitions == 0 {
             return Err(anyhow!("topic must have at least 1 partition"));
         }
-        validate_name(name)?;
+        validate_topic_name(name)?;
 
         let topic_dir = root.join(name);
         std::fs::create_dir_all(&topic_dir)
@@ -219,7 +259,7 @@ impl Topic {
             .map(PersistedTopicConfig::from_patch)
             .unwrap_or_default();
         let resolved = persisted.resolve(broker)?;
-        let raft_cfg = persisted.resolve_raft(&broker.data_dir);
+        let raft_cfg = persisted.resolve_raft(broker, name);
         let meta = TopicMeta {
             partitions,
             config: persisted.clone(),
@@ -252,29 +292,40 @@ impl Topic {
         }))
     }
 
-    /// Connect Raft transports for all Raft-backed partitions. Called after
-    /// the broker has bound its ports.
-    pub async fn connect_raft_transports(&self, raft_cfg: &RaftConfig) {
+    /// Route every Raft-backed partition of this topic over the broker's hub.
+    ///
+    /// Errors are returned, not logged: a partition that failed to attach
+    /// accepts writes and replicates none of them, which is the one state an
+    /// operator cannot tell apart from a healthy one.
+    pub fn attach_raft(&self, hub: &Arc<RaftHub>) -> Result<()> {
         for (i, p) in self.partitions.iter().enumerate() {
-            if let Some(bind_addr) = raft_cfg.bind {
-                let tcfg = crate::raft_partition::RaftTransportConfig {
-                    bind: SocketAddr::new(bind_addr.ip(), bind_addr.port() + i as u16),
-                    peer_addrs: raft_cfg
-                        .peer_addrs
-                        .iter()
-                        .map(|(id, addr)| (*id, SocketAddr::new(addr.ip(), addr.port() + i as u16)))
-                        .collect(),
-                };
-                if let Err(e) = p.connect_transport(tcfg).await {
-                    tracing::warn!(
-                        topic = %self.name,
-                        partition = i,
-                        error = %e,
-                        "raft transport connection failed; operating in single-node mode"
-                    );
-                }
+            if !p.is_raft() {
+                continue;
+            }
+            let group = group_key(&self.name, i as u32);
+            p.attach_to_hub(hub, &group)
+                .with_context(|| format!("attach {} partition {} to the raft hub", self.name, i))?;
+        }
+        Ok(())
+    }
+
+    /// Stop routing this topic's partitions. Called when a topic is deleted so
+    /// a topic later recreated under the same name can register again.
+    pub fn detach_raft(&self, hub: &Arc<RaftHub>) {
+        for (i, p) in self.partitions.iter().enumerate() {
+            if p.is_raft() {
+                hub.unregister(&group_key(&self.name, i as u32));
             }
         }
+    }
+
+    /// Every partition of this topic, for callers that need the handle itself.
+    pub fn raft_partitions(&self) -> impl Iterator<Item = &PartitionHandle> {
+        self.partitions.iter().filter(|p| p.is_raft())
+    }
+
+    pub fn has_raft_partitions(&self) -> bool {
+        self.partitions.iter().any(|p| p.is_raft())
     }
 
     pub fn open(root: &Path, name: &str, broker: &Config) -> Result<Arc<Self>> {
@@ -285,7 +336,7 @@ impl Topic {
         let meta: TopicMeta = serde_json::from_slice(&meta_bytes)
             .with_context(|| format!("parse topic meta {:?}", meta_path))?;
         let resolved = meta.config.resolve(broker)?;
-        let raft_cfg = meta.config.resolve_raft(&broker.data_dir);
+        let raft_cfg = meta.config.resolve_raft(broker, name);
         let mut parts = Vec::with_capacity(meta.partitions as usize);
         for id in 0..meta.partitions {
             let dir = topic_dir.join(id.to_string());
@@ -361,7 +412,10 @@ impl Topic {
     }
 }
 
-fn validate_name(name: &str) -> Result<()> {
+/// Validate a topic name. Rejects anything that isn't `[A-Za-z0-9_.-]{1,200}`
+/// and the `.`/`..` path specials, so a topic name can never be used to escape
+/// the data directory when it's joined into a filesystem path.
+pub fn validate_topic_name(name: &str) -> Result<()> {
     if name.is_empty() || name.len() > 200 {
         return Err(anyhow!("topic name length must be 1..=200"));
     }

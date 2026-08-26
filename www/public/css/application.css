@@ -697,6 +697,11 @@ img, video {
   margin-right: auto;
 }
 
+.my-10 {
+  margin-top: 2.5rem;
+  margin-bottom: 2.5rem;
+}
+
 .my-14 {
   margin-top: 3.5rem;
   margin-bottom: 3.5rem;
@@ -1109,6 +1114,10 @@ img, video {
   overflow: hidden;
 }
 
+.overflow-x-auto {
+  overflow-x: auto;
+}
+
 .truncate {
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1161,6 +1170,10 @@ img, video {
 
 .border-white\/10 {
   border-color: rgb(255 255 255 / 0.1);
+}
+
+.border-white\/\[0\.04\] {
+  border-color: rgb(255 255 255 / 0.04);
 }
 
 .border-white\/\[0\.06\] {
@@ -1490,6 +1503,10 @@ img, video {
   padding-left: 1rem;
 }
 
+.pr-6 {
+  padding-right: 1.5rem;
+}
+
 .pt-16 {
   padding-top: 4rem;
 }
@@ -1693,6 +1710,10 @@ img, video {
 
 .tracking-\[0\.12em\] {
   letter-spacing: 0.12em;
+}
+
+.tracking-\[0\.14em\] {
+  letter-spacing: 0.14em;
 }
 
 .tracking-\[0\.15em\] {

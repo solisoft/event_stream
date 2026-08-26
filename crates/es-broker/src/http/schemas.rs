@@ -66,6 +66,7 @@ pub async fn register(
 
 pub async fn get(
     State(broker): State<Arc<Broker>>,
+    AuthedKey(_key): AuthedKey,
     Path(id): Path<u32>,
 ) -> AppResult<Json<SchemaResponse>> {
     let entry = broker
@@ -75,7 +76,10 @@ pub async fn get(
     Ok(Json(SchemaResponse::from(entry.as_ref())))
 }
 
-pub async fn list(State(broker): State<Arc<Broker>>) -> Json<Vec<SchemaResponse>> {
+pub async fn list(
+    State(broker): State<Arc<Broker>>,
+    AuthedKey(_key): AuthedKey,
+) -> Json<Vec<SchemaResponse>> {
     let schemas: Vec<SchemaResponse> = broker
         .schemas
         .list()
@@ -87,6 +91,7 @@ pub async fn list(State(broker): State<Arc<Broker>>) -> Json<Vec<SchemaResponse>
 
 pub async fn latest_version(
     State(broker): State<Arc<Broker>>,
+    AuthedKey(_key): AuthedKey,
     Path(subject): Path<String>,
 ) -> AppResult<Json<SchemaResponse>> {
     let entry = broker

@@ -29,7 +29,11 @@ futures = { workspace = true }
 governor = { workspace = true }
 humantime = { workspace = true }
 rand = { workspace = true }
-rustls = { workspace = true }
+# `ring` is not a rustls default feature, and main.rs installs
+# `rustls::crypto::ring` as the process provider. Without it declared here the
+# crate only builds when a sibling happens to enable it — `cargo build -p
+# es-broker` alone failed.
+rustls = { workspace = true, features = ["ring"] }
 rustls-pemfile = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

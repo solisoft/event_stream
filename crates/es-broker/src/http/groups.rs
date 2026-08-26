@@ -36,9 +36,15 @@ pub async fn commit(
 
 pub async fn offsets(
     State(broker): State<Arc<Broker>>,
-    AuthedKey(_key): AuthedKey,
+    AuthedKey(key): AuthedKey,
     Path(group): Path<String>,
 ) -> Json<GroupOffsetsResponse> {
     let snapshot = broker.groups.snapshot(&group).await;
-    Json(GroupOffsetsResponse { offsets: snapshot })
+    // Only expose committed offsets for topics the caller can read, so one
+    // principal can't enumerate another tenant's group positions.
+    let offsets = snapshot
+        .into_iter()
+        .filter(|(topic, _)| key.can(AclAction::Read, topic))
+        .collect();
+    Json(GroupOffsetsResponse { offsets })
 }

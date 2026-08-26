@@ -127,7 +127,7 @@ impl Segment {
         let start_pos = self
             .index
             .read()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .floor(rel)
             .map(|(_, pos)| pos)
             .unwrap_or(0);

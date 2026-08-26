@@ -1,16 +1,17 @@
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use es_protocol::wire::{
-    decode_consume_request, decode_produce_request,
-    encode_produce_response, HandshakeStatus, Opcode, WireProduceResult,
-    FEATURE_GZIP, WIRE_MAGIC,
+    decode_consume_request, decode_produce_request, encode_produce_response, HandshakeStatus,
+    Opcode, WireProduceResult, FEATURE_GZIP, WIRE_MAGIC,
 };
 
 use crate::auth::{AclAction, ApiKey, AuthMode};
@@ -19,6 +20,19 @@ use crate::producers::DedupeOutcome;
 
 /// Maximum allowed frame body size. Caps memory per connection.
 const MAX_FRAME_BYTES: u32 = 64 * 1024 * 1024;
+/// Maximum decompressed payload size. Bounds a gzip decompression bomb: the
+/// 64 MiB frame cap only limits the *compressed* bytes, which can inflate to
+/// many GB. Set above the frame cap so legitimate compressible frames still fit.
+const MAX_DECOMPRESSED_BYTES: usize = 256 * 1024 * 1024;
+/// Max concurrent binary connections. Bounds socket/task/memory exhaustion.
+const MAX_CONNECTIONS: usize = 4096;
+/// Time budget for a client to complete the handshake before we drop the
+/// socket. Bounds pre-auth slowloris holds.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Once a frame's length prefix has arrived, its body must follow within this
+/// window. (There is deliberately no timeout on the *idle* wait for the next
+/// frame — consumers may hold a connection open between requests.)
+const FRAME_BODY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Run the binary protocol accept loop on `listener` until `cancel` fires.
 pub async fn serve_binary(
@@ -28,6 +42,7 @@ pub async fn serve_binary(
 ) -> Result<()> {
     let addr = listener.local_addr()?;
     tracing::info!(?addr, "binary: listening");
+    let conn_limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -42,9 +57,19 @@ pub async fn serve_binary(
                         continue;
                     }
                 };
+                // Bound concurrent connections. If we're at the cap, drop the
+                // new connection rather than spawning an unbounded task.
+                let permit = match conn_limit.clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        tracing::warn!(peer = ?peer, "binary: connection limit reached, dropping");
+                        continue;
+                    }
+                };
                 let broker = broker.clone();
                 let cancel = cancel.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     if let Err(e) = handle_connection(broker, sock, peer, cancel).await {
                         tracing::debug!(peer = ?peer, error = %e, "binary: connection ended");
                     }
@@ -66,18 +91,37 @@ async fn handle_connection(
     sock.set_nodelay(true).ok();
     // ---- Handshake ----
     // Client: magic(4) | features(u32) | auth_token_len(u32) | auth_token
-    let mut magic = [0u8; 4];
-    sock.read_exact(&mut magic).await?;
+    // Read the fixed header + token under a timeout so a peer can't hold the
+    // connection open indefinitely by stalling mid-handshake (pre-auth
+    // slowloris).
+    let handshake_read = async {
+        let mut magic = [0u8; 4];
+        sock.read_exact(&mut magic).await?;
+        let mut buf4 = [0u8; 4];
+        sock.read_exact(&mut buf4).await?;
+        let client_features = u32::from_be_bytes(buf4);
+        sock.read_exact(&mut buf4).await?;
+        let token_len = u32::from_be_bytes(buf4);
+        if token_len > 1024 {
+            return Ok::<_, std::io::Error>((magic, client_features, Vec::new(), true));
+        }
+        let mut token_bytes = vec![0u8; token_len as usize];
+        if !token_bytes.is_empty() {
+            sock.read_exact(&mut token_bytes).await?;
+        }
+        Ok((magic, client_features, token_bytes, false))
+    };
+    let (magic, client_features, token_bytes, token_too_long) =
+        match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake_read).await {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => return Ok(()), // handshake timed out; drop the connection
+        };
     if magic != WIRE_MAGIC {
         write_handshake_status(&mut sock, HandshakeStatus::BadMagic, "bad magic").await?;
         return Ok(());
     }
-    let mut buf4 = [0u8; 4];
-    sock.read_exact(&mut buf4).await?;
-    let client_features = u32::from_be_bytes(buf4);
-    sock.read_exact(&mut buf4).await?;
-    let token_len = u32::from_be_bytes(buf4);
-    if token_len > 1024 {
+    if token_too_long {
         write_handshake_status(
             &mut sock,
             HandshakeStatus::AuthFailed,
@@ -85,10 +129,6 @@ async fn handle_connection(
         )
         .await?;
         return Ok(());
-    }
-    let mut token_bytes = vec![0u8; token_len as usize];
-    if !token_bytes.is_empty() {
-        sock.read_exact(&mut token_bytes).await?;
     }
     let token = String::from_utf8(token_bytes).unwrap_or_default();
 
@@ -202,7 +242,18 @@ async fn read_frame(
         ));
     }
     let mut frame = vec![0u8; total as usize];
-    sock.read_exact(&mut frame).await?;
+    // The length is committed; require the body to arrive promptly so a client
+    // can't declare a large frame and then trickle the bytes (slowloris).
+    match tokio::time::timeout(FRAME_BODY_TIMEOUT, sock.read_exact(&mut frame)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "frame body read timed out",
+            ))
+        }
+    }
     let request_id = u32::from_be_bytes(frame[0..4].try_into().unwrap());
     let opcode_byte = frame[4];
     let opcode = Opcode::from_u8(opcode_byte).ok_or_else(|| {
@@ -279,9 +330,18 @@ fn encode_consume_from_records(
 fn decompress(input: &[u8]) -> std::io::Result<Vec<u8>> {
     use flate2::read::GzDecoder;
     use std::io::Read;
-    let mut dec = GzDecoder::new(input);
-    let mut out = Vec::with_capacity(input.len() * 2);
-    dec.read_to_end(&mut out)?;
+    let dec = GzDecoder::new(input);
+    // Bound the decompressed size: read at most MAX_DECOMPRESSED_BYTES + 1 and
+    // reject if the stream is longer, so a compression bomb can't exhaust memory.
+    let mut limited = dec.take(MAX_DECOMPRESSED_BYTES as u64 + 1);
+    let mut out = Vec::with_capacity((input.len() * 2).min(MAX_DECOMPRESSED_BYTES));
+    limited.read_to_end(&mut out)?;
+    if out.len() > MAX_DECOMPRESSED_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "decompressed frame exceeds maximum size",
+        ));
+    }
     Ok(out)
 }
 
@@ -315,13 +375,23 @@ async fn dispatch(
             }
 
             // Idempotent path mirrors the HTTP handler.
-            if req.producer_id.is_some() {
+            if let Some(pid) = &req.producer_id {
+                broker
+                    .producers
+                    .check_admission(pid)
+                    .map_err(|e| format!("{}", e))?;
                 for (i, r) in req.records.iter().enumerate() {
-                    if r.sequence.is_none() {
-                        return Err(format!(
-                            "record {} missing sequence (required when producer_id is set)",
-                            i
-                        ));
+                    match r.sequence {
+                        None => {
+                            return Err(format!(
+                                "record {} missing sequence (required when producer_id is set)",
+                                i
+                            ));
+                        }
+                        Some(s) if s < 0 => {
+                            return Err(format!("record {} has negative sequence {}", i, s));
+                        }
+                        Some(_) => {}
                     }
                 }
             }
@@ -443,7 +513,8 @@ async fn dispatch(
                 .bytes_consumed_total
                 .fetch_add(consumed_bytes, Ordering::Relaxed);
 
-            let body = encode_consume_from_records(req.partition, next_offset, high_watermark, &records);
+            let body =
+                encode_consume_from_records(req.partition, next_offset, high_watermark, &records);
             Ok((Opcode::ConsumeOk, body))
         }
         // Server response codes should never arrive on the request side.

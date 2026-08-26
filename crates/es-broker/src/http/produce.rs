@@ -46,13 +46,26 @@ pub async fn produce(
 
     // Idempotent path is opt-in via the request-level producer_id.
     let producer_id = req.producer_id.as_deref();
-    if producer_id.is_some() {
+    if let Some(pid) = producer_id {
+        broker
+            .producers
+            .check_admission(pid)
+            .map_err(|e| AppError::bad_request(e.to_string()))?;
         for (idx, r) in req.records.iter().enumerate() {
-            if r.sequence.is_none() {
-                return Err(AppError::bad_request(format!(
-                    "record {} missing sequence (required when producer_id is set)",
-                    idx
-                )));
+            match r.sequence {
+                None => {
+                    return Err(AppError::bad_request(format!(
+                        "record {} missing sequence (required when producer_id is set)",
+                        idx
+                    )));
+                }
+                Some(s) if s < 0 => {
+                    return Err(AppError::bad_request(format!(
+                        "record {} has negative sequence {}",
+                        idx, s
+                    )));
+                }
+                Some(_) => {}
             }
         }
     }

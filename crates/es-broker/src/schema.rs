@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::topic::write_json_atomic;
 
+/// Upper bound on the number of registered schemas.
+const MAX_SCHEMAS: usize = 100_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchemaEntry {
     pub id: u32,
@@ -80,6 +83,12 @@ impl SchemaStore {
         }
         if schema.is_empty() || schema.len() > 512 * 1024 {
             return Err(anyhow!("schema must be 1..=512 KiB"));
+        }
+        // Cap the total number of registered schemas. Each register() rewrites
+        // the whole schemas.json, so unbounded growth is both a memory and a
+        // write-amplification concern.
+        if !self.subjects.contains_key(&subject) && self.schemas.len() >= MAX_SCHEMAS {
+            return Err(anyhow!("schema registry limit reached ({})", MAX_SCHEMAS));
         }
 
         // Validate that the schema is parseable (basic JSON parse).

@@ -168,6 +168,7 @@
         <% if section == "cli" %>§04 · CLI<% end %>
         <% if section == "storage" %>§05 · Storage<% end %>
         <% if section == "cluster" %>§06 · Cluster<% end %>
+        <% if section == "tools" %>§07 · Backup &amp; restore<% end %>
       </span>
       <div class="ml-auto flex items-center gap-4">
         <span class="hidden md:inline-block font-mono text-[10px] tracking-[0.15em] text-slate-500 uppercase">v0.1.0 · rust 1.95</span>
@@ -229,12 +230,23 @@
           </li>
         </ul>
 
+        <p class="font-mono text-[10px] tracking-[0.22em] uppercase text-slate-500 mb-3">Operations</p>
+        <ul class="space-y-0.5 mb-7">
+          <li>
+            <a href="<%= docs_tools_path() %>" class="side-link <% if section == "tools" %>active<% end %> flex items-baseline gap-3 px-3 py-1.5 rounded-md text-[13.5px] text-slate-300 hover:text-white transition">
+              <span class="ch font-mono text-[10.5px] tracking-widest text-slate-500">07</span>
+              <span>Backup &amp; restore</span>
+            </a>
+          </li>
+        </ul>
+
         <div class="mt-10 p-4 rounded-xl bg-white/[0.025] ring-1 ring-white/[0.06]">
           <p class="font-mono text-[10px] tracking-[0.2em] uppercase text-indigo-300/80 mb-2">Workspace</p>
           <ul class="space-y-1.5 font-mono text-[11.5px] text-slate-400/90">
             <li>· crates/<span class="text-slate-200">es-broker</span></li>
             <li>· crates/<span class="text-slate-200">es-cli</span></li>
             <li>· crates/<span class="text-slate-200">es-protocol</span></li>
+            <li>· crates/<span class="text-slate-200">es-tools</span></li>
           </ul>
         </div>
       </div>
@@ -253,6 +265,7 @@
           <% if section == "cli" %>§04 · CLI<% end %>
           <% if section == "storage" %>§05 · Storage<% end %>
           <% if section == "cluster" %>§06 · Cluster<% end %>
+          <% if section == "tools" %>§07 · Backup &amp; restore<% end %>
         </span>
         <span class="text-slate-600">es / docs · built with soli</span>
       </footer>

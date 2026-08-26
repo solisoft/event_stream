@@ -3,8 +3,9 @@
 //! Owns the [`RaftState`], the election + heartbeat timers, inbound messages,
 //! outbound messages, the persistent store, and the committed-entry stream.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use rand::Rng;
@@ -66,9 +67,32 @@ pub struct NodeHandle {
     /// Shared with the node loop so application-triggered snapshots can be
     /// persisted alongside everything else the loop persists.
     pub store: Arc<dyn RaftStore>,
+    /// When each peer was last heard from, in monotonic time.
+    ///
+    /// Kept out here rather than in [`RaftState`] on purpose: the state machine is
+    /// pure and has no clock, and giving it one to answer a reporting question
+    /// would be the wrong trade. Written by the node loop as messages arrive.
+    last_contact: Arc<Mutex<BTreeMap<NodeId, Instant>>>,
 }
 
 impl NodeHandle {
+    /// Peers heard from within `within`.
+    ///
+    /// This is what makes a quorum report mean something. `match_index` records
+    /// what a peer once acknowledged and keeps saying so after the peer dies, so a
+    /// leader that has lost its majority still looks like it has one.
+    pub async fn peers_heard_from(&self, within: Duration) -> Vec<NodeId> {
+        let now = Instant::now();
+        let map = self.last_contact.lock().await;
+        let mut alive: Vec<NodeId> = map
+            .iter()
+            .filter(|(_, seen)| now.duration_since(**seen) <= within)
+            .map(|(peer, _)| *peer)
+            .collect();
+        alive.sort_unstable();
+        alive
+    }
+
     pub async fn role(&self) -> Role {
         self.state.lock().await.role
     }
@@ -160,6 +184,9 @@ pub fn spawn_node_with_store(
     let state_for_task = state.clone();
     let cancel_for_task = cancel.clone();
     let store_for_handle = store.clone();
+    // Written by the loop as messages arrive, read by `peers_heard_from`.
+    let last_contact: Arc<Mutex<BTreeMap<NodeId, Instant>>> = Arc::new(Mutex::new(BTreeMap::new()));
+    let last_contact_for_task = last_contact.clone();
     let join = tokio::spawn(async move {
         let mut election_deadline = randomized_deadline(timing);
         let mut heartbeat_tick = tokio::time::interval(timing.heartbeat);
@@ -173,20 +200,40 @@ pub fn spawn_node_with_store(
 
                 msg = inbound_rx.recv() => {
                     let Some(msg) = msg else { break; };
-                    if let Message::InstallSnapshot(ref is) = msg {
-                        let snap = PersistedSnapshot {
+                    // Before anything else: this peer is alive. Recorded for every
+                    // message, request or response, because either one proves the
+                    // same thing.
+                    last_contact_for_task
+                        .lock()
+                        .await
+                        .insert(msg.sender(), Instant::now());
+                    // Hold the snapshot bytes aside and persist them only if the
+                    // state machine actually accepts the snapshot. Persisting
+                    // before validation lets a rejected or forged InstallSnapshot
+                    // land on disk and corrupt state on the next restart.
+                    let pending_snapshot = if let Message::InstallSnapshot(ref is) = msg {
+                        Some(PersistedSnapshot {
                             last_index: is.last_index,
                             last_term: is.last_term,
                             data: is.data.clone(),
-                        };
-                        if let Err(e) = store.save_snapshot(&snap) {
-                            tracing::error!(error = %e, "raft: failed to save received snapshot");
+                        })
+                    } else {
+                        None
+                    };
+                    let (actions, snapshot_accepted) = {
+                        let mut s = state_for_task.lock().await;
+                        let before_base = s.log.base_index;
+                        let actions = s.on_message(msg);
+                        // A snapshot is accepted iff it advanced the log's base.
+                        (actions, s.log.base_index > before_base)
+                    };
+                    if snapshot_accepted {
+                        if let Some(snap) = pending_snapshot {
+                            if let Err(e) = store.save_snapshot(&snap) {
+                                tracing::error!(error = %e, "raft: failed to save received snapshot");
+                            }
                         }
                     }
-                    let actions = {
-                        let mut s = state_for_task.lock().await;
-                        s.on_message(msg)
-                    };
                     apply_and_persist(&state_for_task, &store, &outbound_tx, &committed_tx,
                                       &mut election_deadline, timing, actions).await;
                 }
@@ -250,6 +297,7 @@ pub fn spawn_node_with_store(
         join: Some(join),
         propose_tx,
         store: store_for_handle,
+        last_contact,
     })
 }
 

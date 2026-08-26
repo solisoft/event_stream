@@ -24,8 +24,9 @@ use tokio_util::sync::CancellationToken;
 use crate::partition::Partition;
 use crate::raft::state::RaftState;
 use crate::raft::{
-    spawn_node_with_store, transport::Transport, JsonStore, LogIndex, NodeHandle, NodeId, Outbound,
-    ProposeReply, RaftStore, Timing,
+    spawn_node_with_store,
+    transport::{RaftHub, Transport},
+    JsonStore, LogIndex, NodeHandle, NodeId, Outbound, ProposeReply, RaftStore, Timing,
 };
 use tokio::sync::Mutex as TokioMutex;
 
@@ -65,6 +66,11 @@ fn decode_append_command(bytes: &[u8]) -> Result<(Option<Vec<u8>>, Vec<u8>)> {
     Ok((key, value))
 }
 
+/// How long an accepted proposal is given to commit before the caller is told
+/// it did not. Only reached when the leader has lost its majority — a healthy
+/// cluster commits in the time one round trip takes.
+const COMMIT_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[derive(Debug)]
 pub struct AppendResult {
     pub offset: u64,
@@ -100,6 +106,9 @@ pub struct RaftPartitionConfig {
 pub struct RaftTransportConfig {
     pub bind: SocketAddr,
     pub peer_addrs: BTreeMap<NodeId, SocketAddr>,
+    /// Pre-shared secret peers must present in the raft handshake. `None`
+    /// disables peer authentication (only safe on a trusted/loopback network).
+    pub shared_secret: Option<String>,
 }
 
 impl RaftPartitionConfig {
@@ -172,16 +181,33 @@ impl RaftPartition {
         }))
     }
 
-    /// Connect this Raft partition to peer nodes via TCP. Must be called after
-    /// `open()` and before any appends. Without this, the node operates in
-    /// single-node mode.
+    /// Route this partition's Raft traffic over a hub shared with every other
+    /// partition on this broker. Must be called after `open()` and before any
+    /// appends; without it the node operates in single-node mode.
+    ///
+    /// This is the path a real cluster uses. `connect_transport` below is the
+    /// same thing with a hub of its own, for a single partition.
+    pub fn attach_to_hub(&self, hub: &Arc<RaftHub>, group: &str) -> Result<()> {
+        let outbound_rx = self.take_outbound()?;
+        hub.register(group, self.raft.inbound.clone(), outbound_rx)
+            .with_context(|| format!("register raft group '{group}'"))?;
+        // The dispatcher handle is dropped: the hub's cancellation token stops
+        // it, and the task must outlive this call.
+        Ok(())
+    }
+
+    fn take_outbound(&self) -> Result<mpsc::UnboundedReceiver<Outbound>> {
+        let mut guard = self.outbound_rx.lock().unwrap();
+        guard
+            .take()
+            .ok_or_else(|| anyhow!("this partition's raft transport is already connected"))
+    }
+
+    /// Connect this Raft partition to peer nodes via TCP on a hub of its own.
+    /// Must be called after `open()` and before any appends. Without this, the
+    /// node operates in single-node mode.
     pub async fn connect_transport(&self, tcfg: RaftTransportConfig) -> Result<()> {
-        let outbound_rx = {
-            let mut guard = self.outbound_rx.lock().unwrap();
-            guard
-                .take()
-                .ok_or_else(|| anyhow!("outbound already consumed"))?
-        };
+        let outbound_rx = self.take_outbound()?;
         let transport = crate::raft::spawn_transport(
             self.raft.id,
             tcfg.bind,
@@ -189,6 +215,7 @@ impl RaftPartition {
             self.raft.inbound.clone(),
             outbound_rx,
             Duration::from_secs(2),
+            tcfg.shared_secret,
         )
         .await?;
         {
@@ -196,6 +223,21 @@ impl RaftPartition {
             *guard = Some(transport);
         }
         Ok(())
+    }
+
+    /// The Raft state machine behind this partition, for reporting only.
+    ///
+    /// Read-only by convention: the node loop owns every mutation, and a second
+    /// writer would race it. Exposed so `/raft` can answer "is this member
+    /// replicating?" — which nothing outside the process could tell before.
+    pub fn raft_state(&self) -> &Arc<TokioMutex<RaftState>> {
+        &self.raft.state
+    }
+
+    /// Which peers this node has heard from recently. See
+    /// [`NodeHandle::peers_heard_from`].
+    pub async fn peers_heard_from(&self, within: Duration) -> Vec<NodeId> {
+        self.raft.peers_heard_from(within).await
     }
 
     pub fn partition(&self) -> &Arc<Partition> {
@@ -230,11 +272,22 @@ impl RaftPartition {
             }
         };
 
-        match rx.await {
-            Ok(Ok(result)) => Ok(result.offset),
-            Ok(Err(e)) => Err(anyhow!(e)),
-            Err(_) => Err(anyhow!(
+        // Bounded, because an entry proposed while the quorum is gone never
+        // commits and an unbounded wait would hold the client's connection for
+        // as long as the outage lasts. The slot is left in place on purpose: the
+        // apply loop removes it if the entry does eventually commit, so giving
+        // up here leaks nothing.
+        match tokio::time::timeout(COMMIT_TIMEOUT, rx).await {
+            Ok(Ok(Ok(result))) => Ok(result.offset),
+            Ok(Ok(Err(e))) => Err(anyhow!(e)),
+            Ok(Err(_)) => Err(anyhow!(
                 "raft apply task exited before this entry was applied"
+            )),
+            Err(_) => Err(anyhow!(
+                "raft entry {} was accepted into the log but did not commit within {:?}: the \
+                 leader cannot reach a majority of the cluster",
+                index,
+                COMMIT_TIMEOUT
             )),
         }
     }

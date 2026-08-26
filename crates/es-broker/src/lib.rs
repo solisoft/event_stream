@@ -101,6 +101,9 @@ impl Drop for BrokerHandle {
 /// listener when `config.bind_binary` is set.
 pub async fn spawn(config: Config) -> Result<BrokerHandle> {
     let broker = Broker::open(config.clone())?;
+    // Before the HTTP port opens: a cluster member that cannot reach its peers
+    // must not get as far as accepting a write.
+    broker.start_raft().await?;
     broker.start_background();
     let app = http::router(broker.clone());
 

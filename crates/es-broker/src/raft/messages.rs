@@ -114,6 +114,24 @@ impl Message {
         }
     }
 
+    /// Which node sent this message.
+    ///
+    /// Every variant already carries it under a different name, which is why
+    /// nothing could ask the question generically before. A leader needs it to
+    /// know which peers it has actually heard from recently — `match_index` alone
+    /// keeps the acknowledgements of peers that have since died, so a leader that
+    /// lost its majority would still report one.
+    pub fn sender(&self) -> NodeId {
+        match self {
+            Self::RequestVote(m) => m.candidate_id,
+            Self::RequestVoteResp(m) => m.voter_id,
+            Self::AppendEntries(m) => m.leader_id,
+            Self::AppendEntriesResp(m) => m.responder_id,
+            Self::InstallSnapshot(m) => m.leader_id,
+            Self::InstallSnapshotResp(m) => m.responder_id,
+        }
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(64);
         match self {
@@ -197,7 +215,9 @@ impl Message {
                 let prev_log_index = r.u64()?;
                 let prev_log_term = r.u64()?;
                 let n = r.u32()? as usize;
-                let mut entries = Vec::with_capacity(n);
+                // Min per-entry wire size: term(u64=8) + index(u64=8) +
+                // payload_len(u32=4) = 20 bytes. Cap the pre-allocation.
+                let mut entries = Vec::with_capacity(r.cap_hint(n, 20));
                 for _ in 0..n {
                     let term = r.u64()?;
                     let index = r.u64()?;
@@ -265,6 +285,13 @@ struct Reader<'a> {
 impl<'a> Reader<'a> {
     fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, pos: 0 }
+    }
+    fn remaining(&self) -> usize {
+        self.bytes.len() - self.pos
+    }
+    /// Bounded capacity hint — never pre-allocate from an untrusted wire count.
+    fn cap_hint(&self, count: usize, min_item_bytes: usize) -> usize {
+        count.min(self.remaining() / min_item_bytes.max(1))
     }
     fn ensure(&self, n: usize) -> io::Result<()> {
         if self.bytes.len() - self.pos < n {

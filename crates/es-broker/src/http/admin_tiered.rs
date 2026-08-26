@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use axum::{
-    Json,
     extract::{Path, State},
+    Json,
 };
 use serde::Serialize;
 
@@ -24,6 +24,10 @@ pub async fn list_remote(
     if !key.is_admin() {
         return Err(AppError::forbidden("admin access required"));
     }
+    // Validate the topic name before it reaches the tiered store, where it is
+    // joined into a filesystem path — otherwise a `../` name could enumerate
+    // directories outside the cold-storage root.
+    crate::topic::validate_topic_name(&topic).map_err(|e| AppError::bad_request(e.to_string()))?;
     let segments = match &broker.tiered_store {
         Some(store) => store
             .list_remote(&topic, partition)

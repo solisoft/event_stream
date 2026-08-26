@@ -39,6 +39,11 @@ const HEADER_LEN: usize = 8 + 8 + 4; // offset + ts + key_len
 const VALUE_LEN_FIELD: usize = 4;
 const CRC_LEN: usize = 4;
 const RECORD_LEN_FIELD: usize = 4;
+/// Upper bound on a single record's on-disk body. The `record_len` field is a
+/// u32 read straight off disk; without a cap a corrupt/hostile length (up to
+/// ~4 GiB) forces a giant zeroed allocation during recovery or consume. Set
+/// well above any realistic record size.
+const MAX_RECORD_BODY_BYTES: usize = 256 * 1024 * 1024;
 
 /// Encode a record into `buf`. Returns the total number of bytes written, including
 /// the leading `record_len` and trailing CRC.
@@ -99,6 +104,12 @@ pub fn read_record<R: Read + Seek>(reader: &mut R) -> Result<Record, RecordDecod
         return Err(RecordDecodeError::Invalid {
             at,
             reason: "body_len below minimum",
+        });
+    }
+    if body_len > MAX_RECORD_BODY_BYTES {
+        return Err(RecordDecodeError::Invalid {
+            at,
+            reason: "body_len exceeds maximum",
         });
     }
 
