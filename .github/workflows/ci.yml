@@ -140,6 +140,13 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # rust-toolchain.toml pins the compiler, and in this directory rustup uses
+      # that toolchain, not the stable one above: the target has to be added to
+      # it, or a cross target (darwin-amd64 here) fails on "can't find crate
+      # for `core`".
+      - name: Add the target to the pinned toolchain
+        run: rustup target add ${{ matrix.target }}
+
       - name: Build
         run: cargo build --profile dist --locked --target ${{ matrix.target }} --bin es-broker --bin es --bin es-tools
 
