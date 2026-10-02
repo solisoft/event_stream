@@ -79,3 +79,24 @@ def pluralize_simple(count: Int, word: String) -> String
     end
     return str(count) + " " + word + "s"
 end
+
+# The pages before and after `section` in `pages` (reading order, each
+# [section, title, path]); nil at either end.
+def doc_neighbors(section, pages)
+    previous_page = nil
+    following_page = nil
+    for page, i in pages
+        if page[0] == section
+            previous_page = pages[i - 1] if i > 0
+            following_page = pages[i + 1] if i < pages.length - 1
+        end
+    end
+    {"previous": previous_page, "next": following_page}
+end
+
+# Which item of the site header a docs section highlights.
+def site_nav_for(section)
+    return section if ["demo", "api", "cluster"].contains(section)
+
+    "docs"
+end

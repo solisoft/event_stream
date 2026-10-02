@@ -63,15 +63,36 @@ The broker grew through five hardening phases on top of the original "basic" bui
 - **Phase 4** — idempotent producer with replay-dedup; admin API for producer state and offset resets.
 - **Phase 5** — length-prefixed binary protocol on a second TCP listener; native `Vec<u8>` payloads; gzip negotiated at handshake; pipelined client; `--flush-every-records` policy.
 
-**Test totals: 38 passing** — 7 unit + 29 integration + 2 protocol unit, plus an ignored
-throughput bench (`cargo test --release --test bench -- --ignored --nocapture`).
+Since then: Raft replication across brokers, consumer-group coordination, schema
+registry, tiered storage, and a security and performance audit (see below).
+
+**Test totals: 158 passing** across the workspace, plus an ignored throughput bench
+(`cargo test --release --test bench -- --ignored --nocapture`).
+
+## Defaults worth knowing
+
+- **Durable by default.** Nothing is acknowledged before it is fsynced, one fsync per
+  request (shared between concurrent requests through group commit), not per record.
+- **Auth is off by default — and then only loopback.** With `--auth disabled` every caller
+  is an admin, so the broker refuses a non-loopback bind unless
+  `--allow-remote-unauthenticated` is passed, and answers only requests whose `Host` names
+  this machine (DNS-rebinding guard). No CORS headers unless `--cors-origin` lists origins.
+- **TLS covers both listeners.** `--tls-cert`/`--tls-key` apply to HTTP and the binary
+  protocol; giving only one of them is an error.
+- **Tenants are isolated.** ACL prefixes match at name boundaries (`orders` covers
+  `orders.eu`, not `ordersecret`); consumer groups and idempotent producer ids belong to the
+  key that first used them; `/metrics` needs a key and shows only what it can read.
+- **Limits.** Records up to 8 MiB on both protocols, consume responses up to 8 MiB /
+  10,000 records, produce and consume byte-rate quotas per key.
+- **Raft peers authenticate each other** (HMAC challenge-response, MAC on every frame).
+  Replication traffic is not encrypted: keep `--raft-bind` on a private network.
 
 ## What's not here
 
 In rough order of cost:
 
-- **Replication via Raft** — closes the single-point-of-failure gap. Multi-month build.
-- **Consumer-group coordination** — Kafka-style member assignment + rebalances. We track offsets, we don't coordinate workers.
+- **Leader routing** — a produce sent to a Raft follower fails with a leader hint; the client retries.
+- **Safe membership changes and linearizable reads** in Raft.
 - **`sendfile(2)` consume** — zero-copy from page cache to socket. Awkward in the current wire format.
 
 See `.claude/plans/i-want-a-basic-rippling-glade.md` for the full build log, including the bench surprises (fsync was the original ceiling worth ~100×; pipelining didn't help on loopback with a single partition).

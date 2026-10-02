@@ -1,0 +1,345 @@
+# Vérifie puis déploie le site (es.solisoft.net) à chaque push sur main qui
+# touche www/. Même serveur et même contrat que soli.solisoft.net
+# (../lang/.github/workflows/deploy-www.yml) et grc.solisoft.net :
+#   1. rsync de www/ dans <sites_dir>/<site_dir>/ — ce dossier et rien d'autre ;
+#   2. soli-proxy deploy : démarre le slot inactif, l'attend, bascule le trafic,
+#      arrête l'ancien.
+#
+# Pas de migrations : le site n'a ni base ni modèle.
+#
+# Le dossier du site doit déjà exister sur le serveur : ce workflow ne crée
+# aucun site et ne touche à aucun autre dossier. L'app.infos, lui, vient du
+# dépôt (www/app.infos, sections [development]/[production]) et part avec le
+# reste ; le proxy relit sa configuration quand il change.
+name: deploy www
+
+on:
+  push:
+    branches: [main]
+    # Le site, c'est www/. Un commit qui ne touche que le Rust n'y change rien,
+    # et redéployer pour lui ferait passer le site par une bascule pour rien.
+    paths:
+      - 'www/**'
+      - '.github/workflows/deploy-www.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'www/**'
+      - '.github/workflows/deploy-www.yml'
+  workflow_dispatch:
+
+# Deux pushes rapprochés ne doivent pas s'entrelacer au milieu d'un rsync, et un
+# déploiement en cours n'est jamais annulé — ce serait laisser au serveur un
+# arbre à moitié copié.
+concurrency:
+  group: deploy-es-www-${{ github.event_name == 'pull_request' && github.ref || 'main' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # La version contre laquelle le site est vérifié. Une CI qui vérifie le site
+  # avec un autre interpréteur que la production n'a pas vérifié la production :
+  # l'écart avec le serveur est signalé plus bas.
+  SOLI_VERSION: "2.12.0"
+
+jobs:
+  # Runners GitHub et pas le runner maison de grc : ce dépôt est public, les
+  # minutes y sont gratuites, et un runner auto-hébergé sur un dépôt public
+  # exécuterait sur nos machines le code de n'importe quelle pull request.
+  verify:
+    name: le site se construit et répond
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: www
+    steps:
+      - uses: actions/checkout@v5
+
+      # Téléchargement direct de la release épinglée : le install.sh publié ne
+      # connaît que `latest`.
+      - name: Installer la soli épinglée
+        working-directory: .
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          curl -fsSL "https://github.com/solisoft/soli_lang/releases/download/v$SOLI_VERSION/soli-linux-amd64.tar.gz" \
+            -o "$tmp/pkg.tar.gz"
+          tar -xzf "$tmp/pkg.tar.gz" -C "$tmp"
+          sudo install -m 0755 "$(find "$tmp" -type f -name soli -perm -u+x | head -1)" /usr/local/bin/soli
+          rm -rf "$tmp"
+          got="$(soli --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+          [ "$got" = "$SOLI_VERSION" ] || { echo "soli $got installée, $SOLI_VERSION attendue" >&2; exit 1; }
+          echo "soli $got"
+
+      # Tailwind se compile sur le poste (`npm run build:css`) et le résultat est
+      # versionné ; la production sert public/ tel quel. Un fichier vide ici, et
+      # le site partirait sans style.
+      - name: Le CSS compilé est versionné
+        run: test -s public/css/application.css
+
+      # Le CSS versionné doit être celui que les sources produisent : une classe
+      # Tailwind ajoutée à une vue sans recompiler n'aurait aucun style en
+      # production, sans qu'aucune autre étape ne le voie.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: www/package-lock.json
+
+      - name: Le CSS versionné correspond aux sources
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund
+          npm run build:css
+          git diff --exit-code --stat -- public/css/application.css \
+            || { echo "public/css/application.css est périmé : lancer 'npm run build:css' dans www/ et versionner le résultat." >&2; exit 1; }
+
+      # La vraie porte. Le site démarre exactement comme sur le serveur — sans
+      # .env, qu'il n'utilise pas — puis chaque page doit répondre 200 : une vue
+      # qui lève, un partiel absent ou un helper cassé échoue ici et non en
+      # production. /up est fourni par Soli et ne répond qu'une fois les
+      # handlers chauds.
+      - name: Le site démarre et chaque page répond
+        run: |
+          set -euo pipefail
+          soli serve . --port 19555 --workers 1 > /tmp/boot.log 2>&1 &
+          pid=$!
+          code=000
+          for i in $(seq 1 45); do
+            code="$(curl -s -o /dev/null -w '%{http_code}' -m 2 http://127.0.0.1:19555/up || echo 000)"
+            [ "$code" = "200" ] && break
+            kill -0 $pid 2>/dev/null || { echo "le serveur est sorti avant de répondre" >&2; break; }
+            sleep 1
+          done
+          fail=0
+          if [ "$code" = "200" ]; then
+            # Les pages de la navigation, lues dans les routes plutôt que
+            # recopiées : une page ajoutée est vérifiée sans toucher ce fichier.
+            pages="$(grep -oE 'get\("(/[^"]*)"' config/routes.sl | sed -E 's/get\("//; s/"$//' | grep -v ':' | sort -u)"
+            for p in $pages; do
+              c="$(curl -s -o /dev/null -w '%{http_code}' -m 5 "http://127.0.0.1:19555$p" || echo 000)"
+              echo "$p -> $c"
+              [ "$c" = "200" ] || fail=1
+            done
+          else
+            echo "/up a répondu $code, pas 200" >&2
+            fail=1
+          fi
+          kill -TERM $pid 2>/dev/null || true
+          wait $pid 2>/dev/null || true
+          if [ "$fail" != 0 ]; then
+            tail -40 /tmp/boot.log >&2
+            exit 1
+          fi
+
+      # Indicatif, pas bloquant : deux avertissements antérieurs à ce workflow.
+      # À promouvoir en porte (retirer continue-on-error) une fois à zéro.
+      - name: Lint (indicatif)
+        continue-on-error: true
+        run: soli lint app
+
+  deploy:
+    name: déployer es.solisoft.net
+    needs: verify
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment:
+      name: www
+      url: https://${{ vars.DEPLOY_DOMAIN || 'es.solisoft.net' }}
+    env:
+      HOST: ${{ secrets.DEPLOY_HOST }}
+      USER: ${{ vars.DEPLOY_USER || 'rocky' }}
+      SITES_DIR: ${{ vars.DEPLOY_SITES_DIR || '/home/rocky/sites' }}
+      # Trois identités distinctes. DOMAIN est ce à quoi le site répond (sonde
+      # HTTPS finale). SITE_DIR est le dossier sous sites/ (cible du rsync, et
+      # filtre des pids sur /proc/<pid>/cwd). APP est le `name` de l'app.infos
+      # du serveur, l'identifiant que prennent soli-proxy deploy/restart.
+      DOMAIN: ${{ vars.DEPLOY_DOMAIN || 'es.solisoft.net' }}
+      SITE_DIR: ${{ vars.DEPLOY_SITE_DIR || vars.DEPLOY_DOMAIN || 'es.solisoft.net' }}
+      APP: ${{ vars.DEPLOY_APP || 'es.solisoft.net' }}
+      # Les pids des processus qui servent CE site ; le serveur en héberge une
+      # douzaine. Reconnus à leur ligne de commande et à leur dossier, pas au nom
+      # du binaire : quand soli.toml épingle une autre version que
+      # /usr/local/bin/soli, soli-proxy lance le runtime en cache et
+      # `pgrep -x soli` ne le voit plus (grc, 24/09/2026). Le filtre est un `if`
+      # et pas un `[ ... ] && echo` : un `&&` faux en fin de boucle fait sortir
+      # le `for` en 1 et, sous `set -e`, tue l'étape.
+      PIDS: |
+        for x in $(pgrep -f -- " serve \. --port" 2>/dev/null); do
+          if [ "$(readlink /proc/$x/cwd 2>/dev/null)" = "${{ vars.DEPLOY_SITES_DIR || '/home/rocky/sites' }}/${{ vars.DEPLOY_SITE_DIR || vars.DEPLOY_DOMAIN || 'es.solisoft.net' }}" ]; then
+            echo $x
+          fi
+        done
+      PROBE: |
+        p=$(for x in $(pgrep -f -- " serve \. --port" 2>/dev/null); do
+              if [ "$(readlink /proc/$x/cwd 2>/dev/null)" = "${{ vars.DEPLOY_SITES_DIR || '/home/rocky/sites' }}/${{ vars.DEPLOY_SITE_DIR || vars.DEPLOY_DOMAIN || 'es.solisoft.net' }}" ]; then
+                tr "\0" "\n" < /proc/$x/cmdline | grep -A1 -- "--port" | tail -1
+              fi
+            done | sort -u | tail -1)
+        [ -n "$p" ] || { echo 000; exit 0; }
+        curl -s -o /dev/null -w "%{http_code}" -m 5 "http://127.0.0.1:$p/up"
+    steps:
+      - uses: actions/checkout@v5
+
+      # Tant que rien n'est configuré sur ce dépôt, le job dit ce qui manque et
+      # s'arrête sans échouer : ajouter ce workflow ne doit pas rendre main
+      # rouge. Il se met à déployer le jour où les secrets existent.
+      - name: Le déploiement est-il configuré ?
+        id: cfg
+        run: |
+          set -euo pipefail
+          if [ -z "${HOST:-}" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "DEPLOY_HOST n'est pas défini : rien n'est déployé."
+            echo ""
+            echo "Pour l'activer, ajouter au dépôt :"
+            echo "  secrets :   DEPLOY_HOST, SSH_DEPLOY_KEY, SSH_KNOWN_HOSTS"
+            echo "  variables : DEPLOY_DOMAIN (es.solisoft.net par défaut),"
+            echo "              DEPLOY_USER (rocky), DEPLOY_SITES_DIR (/home/rocky/sites),"
+            echo "              DEPLOY_SITE_DIR, DEPLOY_APP (es.solisoft.net)"
+            echo ""
+            echo "Le dossier du site doit déjà exister sur le serveur avec son"
+            echo "app.infos ; ce workflow ne le crée pas."
+            exit 0
+          fi
+          case "$DOMAIN" in *.*) ;; *) echo "DEPLOY_DOMAIN doit contenir un point : $DOMAIN" >&2; exit 1 ;; esac
+          echo "configured=true" >> "$GITHUB_OUTPUT"
+          echo "Cible : $USER@$HOST:$SITES_DIR/$SITE_DIR  (domaine $DOMAIN, app proxy $APP)"
+
+      - name: Préparer SSH
+        if: steps.cfg.outputs.configured == 'true'
+        run: |
+          set -euo pipefail
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "${{ secrets.SSH_DEPLOY_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          # known_hosts plutôt que StrictHostKeyChecking=no : on ne désactive pas
+          # la vérification d'hôte sur un canal qui porte du code de production.
+          printf '%s\n' "${{ secrets.SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      # Le dossier seulement : rsync le créerait, et un site qui apparaît sur un
+      # serveur partagé doit être une décision, pas l'effet d'une variable mal
+      # renseignée. Pas de .env non plus : le site n'en lit aucune variable.
+      - name: Le site existe sur le serveur
+        if: steps.cfg.outputs.configured == 'true'
+        run: |
+          set -euo pipefail
+          ssh "$USER@$HOST" "test -d '$SITES_DIR/$SITE_DIR'" \
+            || { echo "$SITES_DIR/$SITE_DIR n'existe pas : le créer à la main (voir l'en-tête de ce fichier)" >&2; exit 1; }
+
+      # --delete-delay : ce qui quitte le dépôt quitte le serveur. Les exclusions
+      # protègent ce qui appartient au serveur — un .env éventuel et le
+      # déclencheur du proxy (restart.txt) — plus ce qui n'a rien à y faire :
+      # node_modules (entrée de build, 200 Mo inutiles là-bas), les specs et les
+      # notes pour agents. config.toml, run/ et sites/ sont des artefacts root
+      # qu'un passage du proxy peut laisser dans le dossier du site : exclus
+      # plutôt que supprimés, un déploiement automatique n'étant pas le bon
+      # endroit pour faucher des fichiers root.
+      - name: Synchroniser les fichiers
+        if: steps.cfg.outputs.configured == 'true'
+        run: |
+          set -euo pipefail
+          rsync -rlzv --delete-delay --delay-updates \
+            --exclude='.git/' \
+            --exclude='.claude/' \
+            --exclude='node_modules/' \
+            --exclude='.env' \
+            --exclude='.env.*' \
+            --exclude='restart.txt' \
+            --exclude='tmp/' \
+            --exclude='coverage/' \
+            --exclude='tests/' \
+            --exclude='config.toml' \
+            --exclude='run/' \
+            --exclude='sites/' \
+            www/ "$USER@$HOST:$SITES_DIR/$SITE_DIR/"
+
+      # Indicatif, pas une porte : la version du serveur dérive à son propre
+      # rythme, et l'étape vient après le rsync — bloquer ici laisserait le site
+      # à moitié déployé, fichiers copiés et bascule jamais faite.
+      - name: Comparer la soli du serveur à l'épinglée
+        if: steps.cfg.outputs.configured == 'true'
+        run: |
+          set -euo pipefail
+          installed="$(ssh "$USER@$HOST" 'soli --version' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+          echo "serveur : $installed — épinglée : $SOLI_VERSION"
+          if [ "$installed" != "$SOLI_VERSION" ]; then
+            echo "::warning title=Écart de version Soli::Le serveur exécute Soli $installed ; ce workflow a vérifié $SOLI_VERSION. Déploiement maintenu — aligner SOLI_VERSION ici, ou mettre le serveur à jour."
+          fi
+
+      # `soli-proxy deploy` plutôt que `touch restart.txt` : la commande rend un
+      # code de sortie et une raison. Le fichier déclencheur est ignoré en
+      # silence quand le proxy ne peut pas démarrer le slot — un processus
+      # orphelin qui tient le port, par exemple — et le déploiement passe au
+      # vert pendant que l'ancien code continue de servir.
+      - name: Bascule blue-green
+        if: steps.cfg.outputs.configured == 'true'
+        run: |
+          set -euo pipefail
+          before="$(ssh "$USER@$HOST" "$PIDS")"
+          echo "processus avant : ${before:-aucun}"
+          echo "$before" > /tmp/pids-before
+          if ! ssh "$USER@$HOST" "soli-proxy deploy -c '$SITES_DIR/config.toml' '$APP' 2>&1"; then
+            echo "" >&2
+            echo "La bascule a échoué. Cause fréquente : un slot orphelin tient encore son port." >&2
+            echo "  ssh $USER@$HOST 'soli-proxy logs -c $SITES_DIR/config.toml $APP'" >&2
+            exit 1
+          fi
+
+      # Le contrôle porte sur un NOUVEAU processus : un 200 de l'ancien slot
+      # prouverait seulement que le site répond, pas qu'il répond avec ce qui
+      # vient d'être poussé.
+      - name: Le nouveau slot répond
+        if: steps.cfg.outputs.configured == 'true'
+        run: |
+          set -euo pipefail
+          before="$(cat /tmp/pids-before)"
+          for i in $(seq 1 30); do
+            sleep 3
+            now="$(ssh "$USER@$HOST" "$PIDS")"
+            fresh="$(comm -13 <(echo "$before" | sort) <(echo "$now" | sort) | tr -d ' ')"
+            if [ -n "$fresh" ]; then
+              code="$(ssh "$USER@$HOST" "$PROBE" 2>/dev/null | tail -1 || echo 000)"
+              echo "essai $i : nouveau processus $fresh, /up -> $code"
+              [ "$code" = "200" ] && { echo "Le nouveau slot répond."; exit 0; }
+            else
+              echo "essai $i : pas encore de nouveau processus"
+            fi
+          done
+          echo "" >&2
+          echo "Aucun nouveau slot n'a répondu 200 sur /up en 90 s." >&2
+          echo "  ssh $USER@$HOST 'soli-proxy logs -c $SITES_DIR/config.toml $APP'" >&2
+          exit 1
+
+      # Après une bascule, le proxy répartit encore le trafic sur les DEUX ports
+      # alors qu'un seul processus tourne : une requête sur deux tombe sur un port
+      # mort et reçoit un 421. `restart` relance les deux slots sur le code
+      # courant.
+      - name: Relancer les deux slots
+        if: steps.cfg.outputs.configured == 'true'
+        run: ssh "$USER@$HOST" "soli-proxy restart -c '$SITES_DIR/config.toml' '$APP'"
+
+      # De bout en bout, à travers le proxy, avec le vrai nom d'hôte — là où le
+      # 421 se voit. La sonde sur le port de l'app contourne justement la partie
+      # qui échoue.
+      - name: Le site répond à travers le proxy
+        if: steps.cfg.outputs.configured == 'true'
+        run: |
+          set -euo pipefail
+          want=12
+          probe="for i in \$(seq 1 $want); do curl -sk -m 8 --resolve '$DOMAIN:443:127.0.0.1' -o /dev/null -w '%{http_code} ' 'https://$DOMAIN/up'; done"
+          # Compter les 200, pas le reste : la sonde termine par une espace, et
+          # `tr ' ' '\n'` produit une ligne vide de plus.
+          for attempt in 1 2 3 4 5; do
+            sleep 4
+            codes="$(ssh "$USER@$HOST" "$probe" 2>/dev/null || true)"
+            ok="$(printf '%s' "$codes" | tr ' ' '\n' | grep -c '^200$' || true)"
+            echo "essai $attempt : $codes(${ok:-0}/$want à 200)"
+            [ "${ok:-0}" -eq "$want" ] && { echo "$want requêtes sur $want à 200."; exit 0; }
+          done
+          echo "" >&2
+          echo "Le site n'a pas répondu $want/$want à travers le proxy." >&2
+          exit 1

@@ -1,12 +1,13 @@
-use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use dashmap::DashMap;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use es_protocol::wire::{
@@ -14,35 +15,99 @@ use es_protocol::wire::{
     Opcode, WireProduceResult, FEATURE_GZIP, WIRE_MAGIC,
 };
 
-use crate::auth::{AclAction, ApiKey, AuthMode};
+use crate::auth::{AclAction, ApiKey, AuthMode, ANONYMOUS_ADMIN};
 use crate::broker::Broker;
-use crate::producers::DedupeOutcome;
+use crate::dataplane::{self, IncomingRecord};
 
-/// Maximum allowed frame body size. Caps memory per connection.
-const MAX_FRAME_BYTES: u32 = 64 * 1024 * 1024;
-/// Maximum decompressed payload size. Bounds a gzip decompression bomb: the
-/// 64 MiB frame cap only limits the *compressed* bytes, which can inflate to
-/// many GB. Set above the frame cap so legitimate compressible frames still fit.
-const MAX_DECOMPRESSED_BYTES: usize = 256 * 1024 * 1024;
-/// Max concurrent binary connections. Bounds socket/task/memory exhaustion.
-const MAX_CONNECTIONS: usize = 4096;
-/// Time budget for a client to complete the handshake before we drop the
-/// socket. Bounds pre-auth slowloris holds.
+use super::codec::{self, IoStream};
+
+/// Ceiling on concurrent connections, before the file-descriptor budget.
+const MAX_CONNECTIONS_CAP: usize = 4096;
+/// Time budget for a client to complete the (TLS and protocol) handshake.
+/// Bounds pre-auth slowloris holds.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Once a frame's length prefix has arrived, its body must follow within this
-/// window. (There is deliberately no timeout on the *idle* wait for the next
-/// frame — consumers may hold a connection open between requests.)
+/// window.
 const FRAME_BODY_TIMEOUT: Duration = Duration::from_secs(30);
+/// A response the client does not read within this long ends the connection,
+/// instead of parking its task and buffers forever.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Requests one connection may have in progress at once.
+const MAX_INFLIGHT_PER_CONN: usize = 32;
+/// Bytes of request frames (in KiB) held in memory across all connections.
+/// Every frame — and every decompression — draws from it before it is read,
+/// so memory is bounded by this rather than by connections × frame size.
+const INFLIGHT_BUDGET_KIB: u32 = 1024 * 1024;
+
+fn kib(bytes: usize) -> u32 {
+    (bytes.div_ceil(1024)).clamp(1, INFLIGHT_BUDGET_KIB as usize) as u32
+}
+
+/// How many connections this process can afford: half of the soft
+/// `RLIMIT_NOFILE`, leaving the rest for segment files and HTTP. A cap above
+/// the descriptor limit meant `accept` started failing first — and so did
+/// every `open` the broker needed for its own data.
+pub fn connection_budget() -> usize {
+    #[cfg(unix)]
+    {
+        let mut rl = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit only writes the struct we pass.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } == 0 {
+            let soft = rl.rlim_cur as usize;
+            return (soft / 2).clamp(16, MAX_CONNECTIONS_CAP);
+        }
+    }
+    MAX_CONNECTIONS_CAP
+}
+
+/// Largest request frame accepted (and largest decompressed payload).
+fn max_request_bytes(broker: &Broker) -> usize {
+    (broker.config.max_record_bytes + (1 << 20)).max(16 << 20)
+}
+
+/// Releases a per-IP connection slot when the connection ends.
+struct IpSlot {
+    map: Arc<DashMap<IpAddr, usize>>,
+    ip: IpAddr,
+}
+
+impl Drop for IpSlot {
+    fn drop(&mut self) {
+        let empty = match self.map.get_mut(&self.ip) {
+            Some(mut c) => {
+                *c = c.saturating_sub(1);
+                *c == 0
+            }
+            None => false,
+        };
+        if empty {
+            self.map.remove_if(&self.ip, |_, c| *c == 0);
+        }
+    }
+}
 
 /// Run the binary protocol accept loop on `listener` until `cancel` fires.
 pub async fn serve_binary(
     broker: Arc<Broker>,
     listener: TcpListener,
     cancel: CancellationToken,
+    tls: Option<tokio_rustls::TlsAcceptor>,
 ) -> Result<()> {
     let addr = listener.local_addr()?;
-    tracing::info!(?addr, "binary: listening");
-    let conn_limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let max_connections = connection_budget();
+    tracing::info!(
+        ?addr,
+        tls = tls.is_some(),
+        max_connections,
+        "binary: listening"
+    );
+    let conn_limit = Arc::new(Semaphore::new(max_connections));
+    let budget = Arc::new(Semaphore::new(INFLIGHT_BUDGET_KIB as usize));
+    let per_ip: Arc<DashMap<IpAddr, usize>> = Arc::new(DashMap::new());
+    let max_per_ip = broker.config.binary_max_connections_per_ip.max(1);
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -53,12 +118,13 @@ pub async fn serve_binary(
                 let (sock, peer) = match res {
                     Ok(s) => s,
                     Err(e) => {
+                        // EMFILE/ENFILE persist until something closes; a hot
+                        // retry loop only burns CPU and floods the log.
                         tracing::warn!(error = %e, "binary: accept failed");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
                         continue;
                     }
                 };
-                // Bound concurrent connections. If we're at the cap, drop the
-                // new connection rather than spawning an unbounded task.
                 let permit = match conn_limit.clone().try_acquire_owned() {
                     Ok(p) => p,
                     Err(_) => {
@@ -66,11 +132,24 @@ pub async fn serve_binary(
                         continue;
                     }
                 };
+                let ip = peer.ip();
+                {
+                    let mut c = per_ip.entry(ip).or_insert(0);
+                    if *c >= max_per_ip {
+                        tracing::warn!(peer = ?peer, "binary: per-address connection limit reached, dropping");
+                        continue;
+                    }
+                    *c += 1;
+                }
+                let slot = IpSlot { map: per_ip.clone(), ip };
                 let broker = broker.clone();
                 let cancel = cancel.clone();
+                let tls = tls.clone();
+                let budget = budget.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    if let Err(e) = handle_connection(broker, sock, peer, cancel).await {
+                    let _slot = slot;
+                    if let Err(e) = handle_connection(broker, sock, peer, cancel, tls, budget).await {
                         tracing::debug!(peer = ?peer, error = %e, "binary: connection ended");
                     }
                 });
@@ -81,50 +160,82 @@ pub async fn serve_binary(
 
 async fn handle_connection(
     broker: Arc<Broker>,
-    mut sock: TcpStream,
+    sock: TcpStream,
     peer: SocketAddr,
     cancel: CancellationToken,
+    tls: Option<tokio_rustls::TlsAcceptor>,
+    budget: Arc<Semaphore>,
 ) -> Result<()> {
-    // TCP_NODELAY off keeps frame writes small. We coalesce header + payload
-    // in `write_frame` so a single write_all is one packet; NODELAY just makes
-    // sure the kernel doesn't add latency waiting for more bytes.
     sock.set_nodelay(true).ok();
-    // ---- Handshake ----
-    // Client: magic(4) | features(u32) | auth_token_len(u32) | auth_token
-    // Read the fixed header + token under a timeout so a peer can't hold the
-    // connection open indefinitely by stalling mid-handshake (pre-auth
-    // slowloris).
-    let handshake_read = async {
-        let mut magic = [0u8; 4];
-        sock.read_exact(&mut magic).await?;
-        let mut buf4 = [0u8; 4];
-        sock.read_exact(&mut buf4).await?;
-        let client_features = u32::from_be_bytes(buf4);
-        sock.read_exact(&mut buf4).await?;
-        let token_len = u32::from_be_bytes(buf4);
-        if token_len > 1024 {
-            return Ok::<_, std::io::Error>((magic, client_features, Vec::new(), true));
+    let stream: Box<dyn IoStream> = match tls {
+        None => Box::new(sock),
+        Some(acceptor) => {
+            match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(sock)).await {
+                Ok(Ok(s)) => Box::new(s),
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) => return Ok(()),
+            }
         }
-        let mut token_bytes = vec![0u8; token_len as usize];
-        if !token_bytes.is_empty() {
-            sock.read_exact(&mut token_bytes).await?;
-        }
-        Ok((magic, client_features, token_bytes, false))
     };
+    serve(broker, stream, peer, cancel, budget).await
+}
+
+/// Client handshake: `magic(4) | features(u32) | auth_token_len(u32) | auth_token`.
+async fn read_handshake<S: AsyncRead + Unpin>(
+    sock: &mut S,
+) -> std::io::Result<([u8; 4], u32, Vec<u8>, bool)> {
+    let mut head = [0u8; 12];
+    sock.read_exact(&mut head).await?;
+    let magic: [u8; 4] = head[0..4].try_into().unwrap();
+    let client_features = u32::from_be_bytes(head[4..8].try_into().unwrap());
+    let token_len = u32::from_be_bytes(head[8..12].try_into().unwrap());
+    if token_len > 1024 {
+        return Ok((magic, client_features, Vec::new(), true));
+    }
+    let mut token = vec![0u8; token_len as usize];
+    sock.read_exact(&mut token).await?;
+    Ok((magic, client_features, token, false))
+}
+
+async fn write_handshake<S: AsyncWrite + Unpin>(
+    sock: &mut S,
+    status: HandshakeStatus,
+    features: u32,
+    msg: &str,
+) -> std::io::Result<()> {
+    // Server reply: magic(4) | status(u8) | features(u32) | msg_len(u32) | msg
+    let mut out = Vec::with_capacity(13 + msg.len());
+    out.extend_from_slice(&WIRE_MAGIC);
+    out.push(status as u8);
+    out.extend_from_slice(&features.to_be_bytes());
+    out.extend_from_slice(&(msg.len() as u32).to_be_bytes());
+    out.extend_from_slice(msg.as_bytes());
+    sock.write_all(&out).await?;
+    sock.flush().await
+}
+
+async fn serve(
+    broker: Arc<Broker>,
+    mut stream: Box<dyn IoStream>,
+    peer: SocketAddr,
+    cancel: CancellationToken,
+    budget: Arc<Semaphore>,
+) -> Result<()> {
     let (magic, client_features, token_bytes, token_too_long) =
-        match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake_read).await {
+        match tokio::time::timeout(HANDSHAKE_TIMEOUT, read_handshake(&mut stream)).await {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => return Err(e.into()),
             Err(_) => return Ok(()), // handshake timed out; drop the connection
         };
     if magic != WIRE_MAGIC {
-        write_handshake_status(&mut sock, HandshakeStatus::BadMagic, "bad magic").await?;
+        write_handshake(&mut stream, HandshakeStatus::BadMagic, 0, "bad magic").await?;
         return Ok(());
     }
     if token_too_long {
-        write_handshake_status(
-            &mut sock,
+        write_handshake(
+            &mut stream,
             HandshakeStatus::AuthFailed,
+            0,
             "auth token too long",
         )
         .await?;
@@ -132,177 +243,337 @@ async fn handle_connection(
     }
     let token = String::from_utf8(token_bytes).unwrap_or_default();
 
-    // Authenticate the connection up-front. The principal is captured for every
-    // request issued on this stream.
-    let key = match broker.config.auth_mode {
-        AuthMode::Disabled => Arc::new(crate::auth::ApiKey {
-            key_id: "anonymous".to_string(),
-            name: "anonymous".to_string(),
-            acls: vec![crate::auth::AclRule {
-                action: crate::auth::AclAction::Admin,
-                topic_prefix: "*".to_string(),
-            }],
-            produce_bytes_per_sec: None,
-            consume_bytes_per_sec: None,
-            created_at_ms: 0,
-            disabled: false,
-        }),
-        AuthMode::Required => {
-            if token.is_empty() {
-                write_handshake_status(
-                    &mut sock,
-                    HandshakeStatus::AuthRequired,
-                    "auth token required",
-                )
-                .await?;
+    let auth_required = broker.config.auth_mode == AuthMode::Required;
+    let mut key: Arc<ApiKey> = if !auth_required {
+        ANONYMOUS_ADMIN.clone()
+    } else {
+        if token.is_empty() {
+            write_handshake(
+                &mut stream,
+                HandshakeStatus::AuthRequired,
+                0,
+                "auth token required",
+            )
+            .await?;
+            return Ok(());
+        }
+        match broker.keys.authenticate(&token) {
+            Some(k) => k,
+            None => {
+                write_handshake(&mut stream, HandshakeStatus::AuthFailed, 0, "invalid token")
+                    .await?;
                 return Ok(());
-            }
-            match broker.keys.authenticate(&token) {
-                Some(k) => k,
-                None => {
-                    write_handshake_status(&mut sock, HandshakeStatus::AuthFailed, "invalid token")
-                        .await?;
-                    return Ok(());
-                }
             }
         }
     };
+    let mut epoch = broker.keys.revocation_epoch();
 
     // We support only the gzip feature bit. The negotiated set is the
     // intersection of what the client requested and what we know about.
-    let supported: u32 = FEATURE_GZIP;
-    let negotiated = client_features & supported;
-    write_handshake_ok(&mut sock, negotiated).await?;
-    let gzip = (negotiated & FEATURE_GZIP) != 0;
+    let negotiated = client_features & FEATURE_GZIP;
+    write_handshake(&mut stream, HandshakeStatus::Ok, negotiated, "").await?;
+    let gzip = negotiated & FEATURE_GZIP != 0;
     tracing::debug!(?peer, principal = %key.name, gzip, "binary: handshake complete");
 
-    // ---- Frame loop ----
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => return Ok(()),
-            res = read_frame(&mut sock, gzip) => {
-                let (request_id, opcode, payload) = match res {
-                    Ok(Some(v)) => v,
-                    Ok(None) => return Ok(()), // peer closed
-                    Err(e) => return Err(e.into()),
-                };
-                let response_payload = dispatch(&broker, &key, opcode, &payload).await;
-                match response_payload {
-                    Ok((resp_op, body)) => {
-                        write_frame(&mut sock, request_id, resp_op, &body, gzip).await?;
+    let (mut rd, wr) = tokio::io::split(stream);
+    let conn_cancel = cancel.child_token();
+    let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(MAX_INFLIGHT_PER_CONN * 2);
+    let writer = tokio::spawn(writer_loop(wr, out_rx, conn_cancel.clone()));
+    let inflight = Arc::new(Semaphore::new(MAX_INFLIGHT_PER_CONN));
+    let max_request = max_request_bytes(&broker);
+    let idle = broker.config.binary_idle_timeout;
+    // Produces to one topic start in the order they arrived: each waits for
+    // the previous one's completion signal. Requests to different topics, and
+    // all consumes, run concurrently.
+    let mut chains: HashMap<String, oneshot::Receiver<()>> = HashMap::new();
+
+    let result: Result<()> = async {
+        loop {
+            let mut len_buf = [0u8; 4];
+            let read = tokio::select! {
+                _ = conn_cancel.cancelled() => return Ok(()),
+                r = tokio::time::timeout(idle, rd.read_exact(&mut len_buf)) => r,
+            };
+            match read {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) => {
+                    tracing::debug!(?peer, "binary: idle connection closed");
+                    return Ok(());
+                }
+            }
+            let total = u32::from_be_bytes(len_buf) as usize;
+            if !(5..=max_request).contains(&total) {
+                return Err(anyhow::anyhow!("frame size {} out of bounds", total));
+            }
+            // Memory first, bytes second.
+            let mem = budget.clone().acquire_many_owned(kib(total)).await?;
+            let mut head = [0u8; 5];
+            let mut payload = vec![0u8; total - 5];
+            let body = async {
+                rd.read_exact(&mut head).await?;
+                rd.read_exact(&mut payload).await
+            };
+            match tokio::time::timeout(FRAME_BODY_TIMEOUT, body).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) => return Err(anyhow::anyhow!("frame body read timed out")),
+            }
+            let request_id = u32::from_be_bytes(head[0..4].try_into().unwrap());
+            let Some(opcode) = Opcode::from_u8(head[4]) else {
+                return Err(anyhow::anyhow!("unknown opcode {:#x}", head[4]));
+            };
+
+            // The key was captured at handshake; a revocation must reach
+            // connections that are already open, not only new ones.
+            if auth_required {
+                let now = broker.keys.revocation_epoch();
+                if now != epoch {
+                    epoch = now;
+                    match broker.keys.get_enabled(&key.key_id) {
+                        Some(k) => key = k,
+                        None => {
+                            let frame = error_frame(request_id, "key revoked", gzip);
+                            let _ = out_tx.send(frame).await;
+                            return Ok(());
+                        }
                     }
-                    Err(msg) => {
-                        write_frame(&mut sock, request_id, Opcode::Error, msg.as_bytes(), gzip).await?;
+                }
+            }
+
+            let permit = inflight.clone().acquire_owned().await?;
+            match opcode {
+                Opcode::Ping => {
+                    let frame = respond(request_id, Opcode::PingOk, Vec::new(), gzip).await;
+                    if out_tx.send(frame).await.is_err() {
+                        return Ok(());
                     }
+                }
+                Opcode::Produce | Opcode::Consume => {
+                    // Authorize on the topic named at the head of the payload
+                    // before decompressing or decoding the rest of it.
+                    let topic = match codec::peek_topic(&payload, gzip) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            let frame = error_frame(request_id, &format!("decode: {}", e), gzip);
+                            let _ = out_tx.send(frame).await;
+                            continue;
+                        }
+                    };
+                    let action = if opcode == Opcode::Produce {
+                        AclAction::Write
+                    } else {
+                        AclAction::Read
+                    };
+                    if !key.can(action, &topic) {
+                        let msg = format!(
+                            "forbidden: key '{}' has no {} access to '{}'",
+                            key.key_id,
+                            if action == AclAction::Write {
+                                "write"
+                            } else {
+                                "read"
+                            },
+                            topic
+                        );
+                        let _ = out_tx.send(error_frame(request_id, &msg, gzip)).await;
+                        continue;
+                    }
+                    let (done_tx, done_rx) = oneshot::channel::<()>();
+                    let prev = if opcode == Opcode::Produce {
+                        chains.insert(topic, done_rx)
+                    } else {
+                        None
+                    };
+                    let broker = broker.clone();
+                    let key = key.clone();
+                    let out_tx = out_tx.clone();
+                    let budget = budget.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        let _mem = mem;
+                        if let Some(prev) = prev {
+                            let _ = prev.await;
+                        }
+                        let (op, body) =
+                            process(&broker, &key, opcode, payload, gzip, max_request, &budget)
+                                .await;
+                        drop(done_tx);
+                        let frame = respond(request_id, op, body, gzip).await;
+                        let _ = out_tx.send(frame).await;
+                    });
+                }
+                other => {
+                    let msg = format!("unexpected opcode in request: {:?}", other);
+                    let _ = out_tx.send(error_frame(request_id, &msg, gzip)).await;
                 }
             }
         }
     }
-}
+    .await;
 
-async fn write_handshake_ok(sock: &mut TcpStream, features: u32) -> std::io::Result<()> {
-    sock.write_all(&WIRE_MAGIC).await?;
-    sock.write_all(&[HandshakeStatus::Ok as u8]).await?;
-    sock.write_all(&features.to_be_bytes()).await?;
-    sock.write_all(&0u32.to_be_bytes()).await?; // empty msg
-    Ok(())
-}
-
-async fn write_handshake_status(
-    sock: &mut TcpStream,
-    status: HandshakeStatus,
-    msg: &str,
-) -> std::io::Result<()> {
-    // Server reply: magic(4) | status(u8) | features(u32) | msg_len(u32) | msg
-    sock.write_all(&WIRE_MAGIC).await?;
-    sock.write_all(&[status as u8]).await?;
-    sock.write_all(&0u32.to_be_bytes()).await?; // no features yet
-    let msg_bytes = msg.as_bytes();
-    sock.write_all(&(msg_bytes.len() as u32).to_be_bytes())
-        .await?;
-    sock.write_all(msg_bytes).await?;
-    Ok(())
-}
-
-async fn read_frame(
-    sock: &mut TcpStream,
-    gzip: bool,
-) -> std::io::Result<Option<(u32, Opcode, Vec<u8>)>> {
-    let mut len_buf = [0u8; 4];
-    match sock.read_exact(&mut len_buf).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
+    // Let requests already in progress finish and their responses go out;
+    // the writer stops once every sender is gone.
+    drop(out_tx);
+    if result.is_err() {
+        conn_cancel.cancel();
     }
-    let total = u32::from_be_bytes(len_buf);
-    if !(5..=MAX_FRAME_BYTES).contains(&total) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("frame size {} out of bounds", total),
-        ));
-    }
-    let mut frame = vec![0u8; total as usize];
-    // The length is committed; require the body to arrive promptly so a client
-    // can't declare a large frame and then trickle the bytes (slowloris).
-    match tokio::time::timeout(FRAME_BODY_TIMEOUT, sock.read_exact(&mut frame)).await {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => return Err(e),
-        Err(_) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "frame body read timed out",
-            ))
+    let _ = tokio::time::timeout(WRITE_TIMEOUT, writer).await;
+    result
+}
+
+async fn writer_loop(
+    mut wr: tokio::io::WriteHalf<Box<dyn IoStream>>,
+    mut rx: mpsc::Receiver<Vec<u8>>,
+    cancel: CancellationToken,
+) {
+    loop {
+        let frame = tokio::select! {
+            _ = cancel.cancelled() => break,
+            f = rx.recv() => match f {
+                Some(f) => f,
+                None => break,
+            },
+        };
+        let write = async {
+            wr.write_all(&frame).await?;
+            if rx.is_empty() {
+                wr.flush().await?;
+            }
+            Ok::<_, std::io::Error>(())
+        };
+        match tokio::time::timeout(WRITE_TIMEOUT, write).await {
+            Ok(Ok(())) => {}
+            _ => {
+                cancel.cancel();
+                break;
+            }
         }
     }
-    let request_id = u32::from_be_bytes(frame[0..4].try_into().unwrap());
-    let opcode_byte = frame[4];
-    let opcode = Opcode::from_u8(opcode_byte).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("unknown opcode {:#x}", opcode_byte),
-        )
-    })?;
-    let raw_payload = &frame[5..];
-    let payload = if gzip {
-        decompress(raw_payload)?
-    } else {
-        raw_payload.to_vec()
-    };
-    Ok(Some((request_id, opcode, payload)))
+    let _ = wr.flush().await;
 }
 
-async fn write_frame(
-    sock: &mut TcpStream,
-    request_id: u32,
+fn error_frame(request_id: u32, msg: &str, gzip: bool) -> Vec<u8> {
+    let body = if gzip {
+        codec::compress(msg.as_bytes()).unwrap_or_default()
+    } else {
+        msg.as_bytes().to_vec()
+    };
+    codec::encode_frame(request_id, Opcode::Error, &body).unwrap_or_default()
+}
+
+/// Frame a response, compressing on a blocking thread when it is large.
+async fn respond(request_id: u32, opcode: Opcode, body: Vec<u8>, gzip: bool) -> Vec<u8> {
+    let body = if !gzip {
+        body
+    } else if body.len() < 64 * 1024 {
+        match codec::compress(&body) {
+            Ok(b) => b,
+            Err(e) => return error_frame(request_id, &format!("compress: {}", e), gzip),
+        }
+    } else {
+        match tokio::task::spawn_blocking(move || codec::compress(&body)).await {
+            Ok(Ok(b)) => b,
+            _ => return error_frame(request_id, "compress failed", gzip),
+        }
+    };
+    match codec::encode_frame(request_id, opcode, &body) {
+        Ok(f) => f,
+        Err(e) => error_frame(request_id, &e.to_string(), gzip),
+    }
+}
+
+/// Run one produce or consume. Returns the response opcode and the
+/// (uncompressed) body.
+async fn process(
+    broker: &Arc<Broker>,
+    key: &ApiKey,
     opcode: Opcode,
-    payload: &[u8],
+    payload: Vec<u8>,
     gzip: bool,
-) -> std::io::Result<()> {
-    let body: std::borrow::Cow<[u8]> = if gzip {
-        std::borrow::Cow::Owned(compress(payload)?)
+    max_request: usize,
+    budget: &Arc<Semaphore>,
+) -> (Opcode, Vec<u8>) {
+    let err = |m: String| (Opcode::Error, m.into_bytes());
+    let (payload, _inflated_mem) = if gzip {
+        // Reserve the decompressed bytes in the global budget before inflating.
+        let reserve = match budget.clone().acquire_many_owned(kib(max_request)).await {
+            Ok(p) => p,
+            Err(_) => return err("server shutting down".into()),
+        };
+        match tokio::task::spawn_blocking(move || codec::decompress(&payload, max_request)).await {
+            Ok(Ok(p)) => (p, Some(reserve)),
+            Ok(Err(e)) => return err(format!("decode: {}", e)),
+            Err(_) => return err("decode task failed".into()),
+        }
     } else {
-        std::borrow::Cow::Borrowed(payload)
+        (payload, None)
     };
-    let total = (4 + 1 + body.len()) as u32;
-    let mut frame = Vec::with_capacity(4 + 4 + 1 + body.len());
-    frame.extend_from_slice(&total.to_be_bytes());
-    frame.extend_from_slice(&request_id.to_be_bytes());
-    frame.push(opcode as u8);
-    frame.extend_from_slice(&body);
-    sock.write_all(&frame).await?;
-    Ok(())
-}
-
-fn compress(input: &[u8]) -> std::io::Result<Vec<u8>> {
-    use flate2::write::GzEncoder;
-    use flate2::Compression;
-    use std::io::Write;
-    let mut enc = GzEncoder::new(
-        Vec::with_capacity(input.len() / 2 + 32),
-        Compression::default(),
-    );
-    enc.write_all(input)?;
-    enc.finish()
+    match opcode {
+        Opcode::Produce => {
+            let req = match decode_produce_request(&payload) {
+                Ok(r) => r,
+                Err(e) => return err(format!("decode: {}", e)),
+            };
+            drop(payload);
+            let records = req
+                .records
+                .into_iter()
+                .map(|r| IncomingRecord {
+                    key: r.key,
+                    value: r.value,
+                    partition: r.partition,
+                    sequence: r.sequence,
+                })
+                .collect();
+            match dataplane::produce(broker, key, &req.topic, records, req.producer_id.as_deref())
+                .await
+            {
+                Ok(produced) => {
+                    let results: Vec<WireProduceResult> = produced
+                        .into_iter()
+                        .map(|p| WireProduceResult {
+                            partition: p.partition,
+                            offset: p.offset,
+                            duplicate: p.duplicate,
+                        })
+                        .collect();
+                    (Opcode::ProduceOk, encode_produce_response(&results))
+                }
+                Err(e) => err(e.to_string()),
+            }
+        }
+        Opcode::Consume => {
+            let req = match decode_consume_request(&payload) {
+                Ok(r) => r,
+                Err(e) => return err(format!("decode: {}", e)),
+            };
+            match dataplane::consume(
+                broker,
+                key,
+                &req.topic,
+                req.partition,
+                req.offset,
+                req.max_records as usize,
+                req.max_bytes as usize,
+            )
+            .await
+            {
+                Ok(f) => (
+                    Opcode::ConsumeOk,
+                    encode_consume_from_records(
+                        req.partition,
+                        f.next_offset,
+                        f.high_watermark,
+                        &f.records,
+                    ),
+                ),
+                Err(e) => err(e.to_string()),
+            }
+        }
+        other => err(format!("unexpected opcode in request: {:?}", other)),
+    }
 }
 
 /// Encode a consume response directly from storage records, avoiding the
@@ -313,7 +584,13 @@ fn encode_consume_from_records(
     high_watermark: u64,
     records: &[crate::storage::record::Record],
 ) -> Vec<u8> {
-    let mut b = es_protocol::wire::WireBuf::new();
+    let size: usize = records
+        .iter()
+        .map(|r| 4 + 8 + 8 + 4 + r.key.as_ref().map_or(0, |k| k.len()) + 4 + r.value.len())
+        .sum();
+    let mut b = es_protocol::wire::WireBuf {
+        bytes: Vec::with_capacity(20 + size),
+    };
     b.put_u64(next_offset);
     b.put_u64(high_watermark);
     b.put_u32(records.len() as u32);
@@ -325,199 +602,4 @@ fn encode_consume_from_records(
         b.put_value(&r.value);
     }
     b.bytes
-}
-
-fn decompress(input: &[u8]) -> std::io::Result<Vec<u8>> {
-    use flate2::read::GzDecoder;
-    use std::io::Read;
-    let dec = GzDecoder::new(input);
-    // Bound the decompressed size: read at most MAX_DECOMPRESSED_BYTES + 1 and
-    // reject if the stream is longer, so a compression bomb can't exhaust memory.
-    let mut limited = dec.take(MAX_DECOMPRESSED_BYTES as u64 + 1);
-    let mut out = Vec::with_capacity((input.len() * 2).min(MAX_DECOMPRESSED_BYTES));
-    limited.read_to_end(&mut out)?;
-    if out.len() > MAX_DECOMPRESSED_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "decompressed frame exceeds maximum size",
-        ));
-    }
-    Ok(out)
-}
-
-async fn dispatch(
-    broker: &Arc<Broker>,
-    key: &Arc<ApiKey>,
-    opcode: Opcode,
-    payload: &[u8],
-) -> std::result::Result<(Opcode, Vec<u8>), String> {
-    match opcode {
-        Opcode::Ping => Ok((Opcode::PingOk, Vec::new())),
-        Opcode::Produce => {
-            let req = decode_produce_request(payload).map_err(|e| format!("decode: {}", e))?;
-            if !key.can(AclAction::Write, &req.topic) {
-                return Err(format!(
-                    "forbidden: key '{}' has no write access to '{}'",
-                    key.key_id, req.topic
-                ));
-            }
-            let topic = broker
-                .topic(&req.topic)
-                .ok_or_else(|| format!("topic '{}' not found", req.topic))?;
-
-            let request_bytes: u64 = req
-                .records
-                .iter()
-                .map(|r| r.key.as_ref().map(|k| k.len() as u64).unwrap_or(0) + r.value.len() as u64)
-                .sum();
-            if let Err(retry_after) = broker.keys.check_produce(&key.key_id, request_bytes as u32) {
-                return Err(format!("rate_limited: retry in {:.1}s", retry_after));
-            }
-
-            // Idempotent path mirrors the HTTP handler.
-            if let Some(pid) = &req.producer_id {
-                broker
-                    .producers
-                    .check_admission(pid)
-                    .map_err(|e| format!("{}", e))?;
-                for (i, r) in req.records.iter().enumerate() {
-                    match r.sequence {
-                        None => {
-                            return Err(format!(
-                                "record {} missing sequence (required when producer_id is set)",
-                                i
-                            ));
-                        }
-                        Some(s) if s < 0 => {
-                            return Err(format!("record {} has negative sequence {}", i, s));
-                        }
-                        Some(_) => {}
-                    }
-                }
-            }
-
-            let mut results: Vec<WireProduceResult> = Vec::with_capacity(req.records.len());
-            let mut total_appended: u64 = 0;
-            let mut records_appended: u64 = 0;
-            for r in &req.records {
-                let partition_id = topic
-                    .route(r.key.as_deref(), r.partition)
-                    .map_err(|e| format!("route: {}", e))?;
-
-                if let Some(pid) = &req.producer_id {
-                    let seq = r
-                        .sequence
-                        .expect("sequence must be present when producer_id is set");
-                    match broker
-                        .producers
-                        .check_and_advance(pid, &req.topic, partition_id, seq)
-                        .await
-                    {
-                        DedupeOutcome::Duplicate { prev_offset } => {
-                            results.push(WireProduceResult {
-                                partition: partition_id,
-                                offset: prev_offset,
-                                duplicate: true,
-                            });
-                            continue;
-                        }
-                        DedupeOutcome::Accept => {}
-                        DedupeOutcome::SequenceTooLow { last_seen } => {
-                            return Err(format!(
-                                "sequence_too_low: producer={} partition={} seq={} last_seen={}",
-                                pid, partition_id, seq, last_seen
-                            ));
-                        }
-                        DedupeOutcome::Gap { expected, got } => {
-                            return Err(format!(
-                                "sequence_gap: producer={} partition={} expected={} got={}",
-                                pid, partition_id, expected, got
-                            ));
-                        }
-                        DedupeOutcome::NeedsInit => {
-                            return Err(format!("producer {} state missing", pid));
-                        }
-                    }
-                }
-
-                let partition = &topic.partitions[partition_id as usize];
-                let offset = partition
-                    .append(r.key.as_deref(), &r.value)
-                    .await
-                    .map_err(|e| format!("append: {}", e))?;
-                if let Some(pid) = &req.producer_id {
-                    broker
-                        .producers
-                        .record_offset(
-                            pid,
-                            &req.topic,
-                            partition_id,
-                            r.sequence
-                                .expect("sequence must be present when producer_id is set"),
-                            offset,
-                        )
-                        .await;
-                }
-                total_appended +=
-                    r.key.as_ref().map(|k| k.len() as u64).unwrap_or(0) + r.value.len() as u64;
-                records_appended += 1;
-                results.push(WireProduceResult {
-                    partition: partition_id,
-                    offset,
-                    duplicate: false,
-                });
-            }
-
-            topic
-                .records_produced_total
-                .fetch_add(records_appended, Ordering::Relaxed);
-            topic
-                .bytes_produced_total
-                .fetch_add(total_appended, Ordering::Relaxed);
-
-            let body = encode_produce_response(&results);
-            Ok((Opcode::ProduceOk, body))
-        }
-        Opcode::Consume => {
-            let req = decode_consume_request(payload).map_err(|e| format!("decode: {}", e))?;
-            if !key.can(AclAction::Read, &req.topic) {
-                return Err(format!(
-                    "forbidden: key '{}' has no read access to '{}'",
-                    key.key_id, req.topic
-                ));
-            }
-            let topic = broker
-                .topic(&req.topic)
-                .ok_or_else(|| format!("topic '{}' not found", req.topic))?;
-            let partition = topic
-                .partitions
-                .get(req.partition as usize)
-                .ok_or_else(|| format!("partition {} out of range", req.partition))?;
-
-            let (records, next_offset, high_watermark) = partition
-                .read_records_raw(req.offset, req.max_records as usize, req.max_bytes as usize)
-                .map_err(|e| format!("read: {}", e))?;
-
-            let consumed_bytes: u64 = records
-                .iter()
-                .map(|r| r.key.as_ref().map(|k| k.len() as u64).unwrap_or(0) + r.value.len() as u64)
-                .sum();
-            let _ = broker
-                .keys
-                .check_consume(&key.key_id, consumed_bytes as u32);
-
-            topic
-                .records_consumed_total
-                .fetch_add(records.len() as u64, Ordering::Relaxed);
-            topic
-                .bytes_consumed_total
-                .fetch_add(consumed_bytes, Ordering::Relaxed);
-
-            let body =
-                encode_consume_from_records(req.partition, next_offset, high_watermark, &records);
-            Ok((Opcode::ConsumeOk, body))
-        }
-        // Server response codes should never arrive on the request side.
-        _ => Err(format!("unexpected opcode in request: {:?}", opcode)),
-    }
 }

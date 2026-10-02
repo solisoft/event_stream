@@ -57,6 +57,15 @@ impl LocalTieredStore {
     }
 }
 
+/// Copy `src` to `dst` (0600) and fsync the copy. Returns bytes copied.
+fn copy_durable(src: &Path, dst: &Path) -> Result<u64> {
+    let mut from = fs::File::open(src)?;
+    let mut to = crate::fsutil::create_private(dst)?;
+    let n = std::io::copy(&mut from, &mut to)?;
+    to.sync_all()?;
+    Ok(n)
+}
+
 impl TieredStore for LocalTieredStore {
     fn offload(
         &self,
@@ -66,17 +75,21 @@ impl TieredStore for LocalTieredStore {
         log_path: &Path,
         index_path: &Path,
     ) -> Result<u64> {
+        crate::topic::validate_topic_name(topic)?;
         let dir = self.segment_dir(topic, partition_id);
-        fs::create_dir_all(&dir).with_context(|| format!("create cold dir {:?}", dir))?;
+        crate::fsutil::create_dir_all_private(&dir)
+            .with_context(|| format!("create cold dir {:?}", dir))?;
 
         let dest_log = dir.join(Self::log_name(base_offset));
         let dest_idx = dir.join(Self::index_name(base_offset));
 
-        let log_size = fs::copy(log_path, &dest_log)
+        // The caller deletes the hot copy as soon as this returns Ok, so the
+        // cold copy must be on disk — contents and directory entries — first.
+        let log_size = copy_durable(log_path, &dest_log)
             .with_context(|| format!("offload log {:?} → {:?}", log_path, dest_log))?;
-        fs::copy(index_path, &dest_idx)
+        let idx_size = copy_durable(index_path, &dest_idx)
             .with_context(|| format!("offload index {:?} → {:?}", index_path, dest_idx))?;
-        let idx_size = fs::metadata(&dest_idx).map(|m| m.len()).unwrap_or(0);
+        crate::fsutil::fsync_dir(&dir)?;
 
         Ok(log_size + idx_size)
     }

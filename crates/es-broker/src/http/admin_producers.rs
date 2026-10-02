@@ -67,8 +67,8 @@ pub async fn reset_offsets(
             };
             broker
                 .groups
-                .commit(group, &req.topic, pid, part.start_offset())
-                .await?;
+                .reset(group, &req.topic, pid, part.start_offset())
+                .await;
             entries_reset += 1;
             any = true;
         }

@@ -69,7 +69,7 @@ async fn three_node_in_process_elects_a_leader() -> Result<()> {
     // share the same term.
     let leader = leader.unwrap();
     let leader_term = handles.get(&leader).unwrap().current_term().await;
-    for (_id, h) in handles.iter() {
+    for h in handles.values() {
         assert_eq!(h.current_term().await, leader_term, "term mismatch");
     }
 
@@ -407,8 +407,7 @@ async fn snapshot_compacts_log_and_survives_restart() -> Result<()> {
 
         // The on-disk log should now have at most 3 entries (snapshot took
         // care of the first 10).
-        let trimmed: es_broker::raft::PersistedRaft =
-            serde_json::from_slice(&std::fs::read(&store_path)?)?;
+        let trimmed = JsonStore::new(store_path.clone()).load()?;
         assert!(
             trimmed.log.len() <= 3,
             "expected log compaction; got {} entries",
@@ -446,7 +445,6 @@ async fn snapshot_compacts_log_and_survives_restart() -> Result<()> {
 /// Test that a leader with a snapshot an send it to a follower that's
 /// behind, and the follower accepts and resumes catching up.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
 async fn snapshot_sent_to_lagging_follower() -> Result<()> {
     let tmp = TempDir::new()?;
     let store_1: Arc<dyn es_broker::raft::RaftStore> =

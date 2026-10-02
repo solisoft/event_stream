@@ -163,7 +163,8 @@ async fn auto_snapshot_keeps_raft_log_bounded() -> Result<()> {
     assert_eq!(rp.partition().end_offset(), n as u64);
     // … and the on-disk Raft log has been compacted: at most one batch worth
     // of entries past the snapshot boundary.
-    let raft: es_broker::raft::PersistedRaft = serde_json::from_slice(&std::fs::read(&raft_path)?)?;
+    use es_broker::raft::RaftStore;
+    let raft = es_broker::raft::JsonStore::new(raft_path.clone()).load()?;
     assert!(
         raft.log.len() as u32 <= 50,
         "raft log not compacted: {} entries",
@@ -309,7 +310,6 @@ async fn partition_handle_raft_survives_restart() -> Result<()> {
 /// Two RaftPartitions connected via TCP: produce on the leader, read from
 /// the follower to confirm replication over the wire.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
 async fn two_node_tcp_replication() -> Result<()> {
     let tmp1 = TempDir::new()?;
     let tmp2 = TempDir::new()?;

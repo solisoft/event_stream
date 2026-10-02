@@ -53,7 +53,7 @@ pub async fn register(
     AuthedKey(key): AuthedKey,
     Json(req): Json<RegisterSchemaRequest>,
 ) -> AppResult<Json<RegisterSchemaResponse>> {
-    if !key.can(AclAction::Admin, "*") {
+    if !key.is_admin() {
         return Err(AppError::forbidden("admin access required"));
     }
     let stype = req.schema_type.unwrap_or_else(|| "json_schema".to_string());
@@ -64,26 +64,34 @@ pub async fn register(
     Ok(Json(RegisterSchemaResponse { id: entry.id }))
 }
 
+// Subjects follow the `<topic>-value` / `<topic>-key` convention, so the
+// same ACL that grants reading a topic grants reading its schemas: a prefix
+// `orders` covers `orders-value` at the `-` boundary. Every key used to be
+// able to read every tenant's schemas. A schema the caller may not read is
+// reported as not found, so ids do not reveal what exists.
+
 pub async fn get(
     State(broker): State<Arc<Broker>>,
-    AuthedKey(_key): AuthedKey,
+    AuthedKey(key): AuthedKey,
     Path(id): Path<u32>,
 ) -> AppResult<Json<SchemaResponse>> {
     let entry = broker
         .schemas
         .get(id)
+        .filter(|e| key.can(AclAction::Read, &e.subject))
         .ok_or_else(|| AppError::not_found(format!("schema {} not found", id)))?;
     Ok(Json(SchemaResponse::from(entry.as_ref())))
 }
 
 pub async fn list(
     State(broker): State<Arc<Broker>>,
-    AuthedKey(_key): AuthedKey,
+    AuthedKey(key): AuthedKey,
 ) -> Json<Vec<SchemaResponse>> {
     let schemas: Vec<SchemaResponse> = broker
         .schemas
         .list()
         .iter()
+        .filter(|e| key.can(AclAction::Read, &e.subject))
         .map(|e| SchemaResponse::from(e.as_ref()))
         .collect();
     Json(schemas)
@@ -91,12 +99,13 @@ pub async fn list(
 
 pub async fn latest_version(
     State(broker): State<Arc<Broker>>,
-    AuthedKey(_key): AuthedKey,
+    AuthedKey(key): AuthedKey,
     Path(subject): Path<String>,
 ) -> AppResult<Json<SchemaResponse>> {
     let entry = broker
         .schemas
         .latest_version(&subject)
+        .filter(|_| key.can(AclAction::Read, &subject))
         .ok_or_else(|| AppError::not_found(format!("no schema for subject '{}'", subject)))?;
     Ok(Json(SchemaResponse::from(entry.as_ref())))
 }

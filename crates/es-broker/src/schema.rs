@@ -34,6 +34,10 @@ pub struct SchemaStore {
     subjects: DashMap<String, u32>,
     next_id: AtomicU32,
     path: PathBuf,
+    /// Serializes `register`: the compatibility check, the insert and the
+    /// write to disk are one step. Two registrations racing could each pass
+    /// the check against the same previous version and both land.
+    write_lock: std::sync::Mutex<()>,
 }
 
 impl SchemaStore {
@@ -62,6 +66,7 @@ impl SchemaStore {
             subjects,
             next_id: AtomicU32::new(next_id),
             path,
+            write_lock: std::sync::Mutex::new(()),
         }))
     }
 
@@ -76,6 +81,14 @@ impl SchemaStore {
         if subject.is_empty() || subject.len() > 200 {
             return Err(anyhow!("subject must be 1..=200 chars"));
         }
+        if !subject
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+        {
+            return Err(anyhow!(
+                "subject may only contain ASCII alphanumerics, '_', '-', '.'"
+            ));
+        }
         if schema_type != "json_schema" && schema_type != "avro" && schema_type != "protobuf" {
             return Err(anyhow!(
                 "schema_type must be 'json_schema', 'avro', or 'protobuf'"
@@ -84,10 +97,12 @@ impl SchemaStore {
         if schema.is_empty() || schema.len() > 512 * 1024 {
             return Err(anyhow!("schema must be 1..=512 KiB"));
         }
-        // Cap the total number of registered schemas. Each register() rewrites
-        // the whole schemas.json, so unbounded growth is both a memory and a
+        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        // Cap the total number of registered versions — new subjects *and*
+        // new versions of existing ones. Each register() rewrites the whole
+        // schemas.json, so unbounded growth is both a memory and a
         // write-amplification concern.
-        if !self.subjects.contains_key(&subject) && self.schemas.len() >= MAX_SCHEMAS {
+        if self.schemas.len() >= MAX_SCHEMAS {
             return Err(anyhow!("schema registry limit reached ({})", MAX_SCHEMAS));
         }
 
@@ -115,9 +130,17 @@ impl SchemaStore {
             created_at_ms: now_ms(),
         });
 
-        self.subjects.insert(subject, id);
+        let previous = self.subjects.insert(subject.clone(), id);
         self.schemas.insert(id, entry.clone());
-        self.flush()?;
+        if let Err(e) = self.flush() {
+            // Don't serve what is not on disk.
+            self.schemas.remove(&id);
+            match previous {
+                Some(p) => self.subjects.insert(subject, p),
+                None => self.subjects.remove(&subject).map(|(_, v)| v),
+            };
+            return Err(e);
+        }
 
         Ok(entry)
     }

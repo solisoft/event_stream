@@ -30,6 +30,35 @@ pub struct Config {
     pub max_request_body_bytes: usize,
     pub shutdown_timeout: Duration,
 
+    /// Largest record (key + value bytes) accepted on either protocol. Records
+    /// above it are refused at produce time — anything stored must also be
+    /// readable, and fit in a Raft frame.
+    pub max_record_bytes: usize,
+    /// Upper bound on what one consume request may return, whatever it asks.
+    pub max_fetch_bytes: usize,
+    pub max_fetch_records: usize,
+    /// With `flush_every_records > 1`, fsync partitions with unsynced records
+    /// at least this often, so an idle partition does not keep acknowledged
+    /// records only in the page cache.
+    pub flush_interval: Duration,
+
+    /// Origins allowed to call the HTTP API from a browser. Empty (the
+    /// default) sends no CORS headers at all.
+    pub cors_allowed_origins: Vec<String>,
+    /// Host names (without port) the HTTP API answers to when auth is
+    /// disabled, on top of the loopback names. Guards against DNS rebinding.
+    pub allowed_hosts: Vec<String>,
+
+    /// Allow `auth_mode = Disabled` on a non-loopback bind. Off by default:
+    /// with auth disabled every caller is an admin.
+    pub allow_remote_unauthenticated: bool,
+
+    /// Binary protocol: connections allowed from one IP address.
+    pub binary_max_connections_per_ip: usize,
+    /// Binary protocol: an authenticated connection with no request for this
+    /// long is closed.
+    pub binary_idle_timeout: Duration,
+
     /// Raft cluster configuration. When `raft_node_id` is set, every topic on
     /// this broker is created with Raft-backed partitions. `raft_bind` is the
     /// TCP address this broker listens on for Raft RPCs. `raft_peer_addrs` maps
@@ -55,6 +84,20 @@ pub struct Config {
 }
 
 impl Config {
+    /// Reject limits that contradict each other.
+    pub fn validate_limits(&self) -> anyhow::Result<()> {
+        // A record must fit in one Raft frame and one binary-protocol frame,
+        // with room for headers.
+        let cap = 32 * 1024 * 1024;
+        if self.max_record_bytes == 0 || self.max_record_bytes > cap {
+            anyhow::bail!("--max-record-bytes must be 1..={cap}");
+        }
+        if self.max_fetch_bytes == 0 || self.max_fetch_bytes > cap {
+            anyhow::bail!("--max-fetch-bytes must be 1..={cap}");
+        }
+        Ok(())
+    }
+
     /// Reject Raft settings that cannot form a working cluster.
     ///
     /// Every one of these would otherwise produce a broker that starts, reports
@@ -147,6 +190,15 @@ impl Config {
             coord_expire_interval: Duration::from_secs(2),
             max_request_body_bytes: 10 * 1024 * 1024,
             shutdown_timeout: Duration::from_secs(30),
+            max_record_bytes: 8 * 1024 * 1024,
+            max_fetch_bytes: 8 * 1024 * 1024,
+            max_fetch_records: 10_000,
+            flush_interval: Duration::from_secs(1),
+            cors_allowed_origins: Vec::new(),
+            allowed_hosts: Vec::new(),
+            allow_remote_unauthenticated: false,
+            binary_max_connections_per_ip: 256,
+            binary_idle_timeout: Duration::from_secs(600),
             raft_node_id: None,
             raft_bind: None,
             raft_peer_addrs: BTreeMap::new(),

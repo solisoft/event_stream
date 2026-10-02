@@ -1,0 +1,26 @@
+# Comment soli-proxy lance ce site. Un seul fichier pour le poste et le
+# serveur : l'option --dev du proxy choisit la section [development] ou
+# [production], appliquée clé par clé par-dessus ce qui précède. En dev, le
+# proxy répond aussi sur es.solisoft.test.
+#
+# Déployé par .github/workflows/deploy-www.yml avec le reste de www/ : le
+# modifier ici, pas sur le serveur, où il serait écrasé au déploiement suivant.
+name = "es.solisoft.net"
+domain = "es.solisoft.net"
+
+start_script = "soli serve . --port $PORT --workers $WORKERS --strict-port"
+workers = 2
+
+# /up est fourni par Soli et ne répond qu'une fois les handlers chauds — pas
+# seulement quand la socket écoute.
+health_check = "/up"
+graceful_timeout = 30
+
+[development]
+start_script = "soli serve . --dev --port $PORT --workers $WORKERS --strict-port"
+workers = 1
+
+[production]
+# Le proxy du serveur tourne en root et lâche ses privilèges pour l'app.
+user = "rocky"
+group = "rocky"

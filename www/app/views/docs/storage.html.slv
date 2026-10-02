@@ -1,254 +1,158 @@
-<div class="reveal">
-  <p class="font-mono text-[11px] tracking-[0.28em] uppercase text-indigo-300/80 mb-5">§05 · Storage format</p>
-  <h1 class="font-display text-[42px] md:text-[62px] leading-[1.0] tracking-[-0.025em] text-white font-light">
-    Append-only segments,
-    <span class="font-display italic text-indigo-200/90 font-light">CRC-framed</span>
-    records.
-  </h1>
-</div>
-
-<p class="reveal d1 mt-7 text-[17px] leading-[1.7] text-slate-300 max-w-[58ch] font-light">
-  Each partition is an append-only sequence of segments. A segment is a pair of files: a <code>.log</code> holding length-prefixed records and a sibling <code>.index</code> mapping offsets to byte positions. When a segment crosses the configured size, the broker rolls to a new one whose filename is the next free offset.
+<h1>How storage works</h1>
+<p class="lede">
+  Each partition is a directory of segments. A segment is a log file of length-prefixed, CRC-checked records and an
+  index file that maps offsets to positions in it. This page covers the format, when data is durable, how a crash is
+  recovered, and how retention and compaction rewrite segments safely.
 </p>
 
-<div class="rule-x my-14"></div>
-
-<h2><span class="num">§</span>Directory layout</h2>
-<div class="codeblock">
-  <div class="codeblock-bar">
-    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
-    <span class="label">./data</span>
-    <span class="lang">tree</span>
-  </div>
+<h2>Files on disk</h2>
+<figure class="code">
+  <figcaption><span>data directory</span></figcaption>
 <pre><span class="c-em">data/</span>
-├── topics/
-│   └── orders/
-│       ├── <span class="c-fn">topic.json</span>                         <span class="c-com">{"partitions": 2}</span>
-│       ├── 0/
-│       │   ├── <span class="c-key">00000000000000000000.log</span>
-│       │   ├── <span class="c-key">00000000000000000000.index</span>
-│       │   ├── <span class="c-key">00000000000000000147.log</span>       <span class="c-com">← rolled at offset 147</span>
-│       │   └── <span class="c-key">00000000000000000147.index</span>
-│       └── 1/  ...
-└── groups/
-    └── <span class="c-fn">analytics.json</span>                         <span class="c-com">{"orders":{"0":5}}</span></pre>
-</div>
-
+├── topics/orders/
+│   ├── topic.json                       <span class="c-com"># partition count and config</span>
+│   ├── 0/
+│   │   ├── 00000000000000000000.log
+│   │   ├── 00000000000000000000.index
+│   │   ├── 00000000000000000147.log     <span class="c-com"># rolled at offset 147</span>
+│   │   └── 00000000000000000147.index
+│   └── 1/ …
+├── groups/analytics.json                <span class="c-com"># committed offsets and owner</span>
+├── producers.json, producers.journal    <span class="c-com"># idempotent producer state</span>
+├── schemas.json
+└── api_keys.json                        <span class="c-com"># key hashes, never secrets</span></pre>
+</figure>
 <p>
-  Segment filenames are the base offset of the first record, zero-padded to 20 digits — so <code>readdir</code> + <code>sort</code> gives them in offset order without any extra metadata.
+  A segment is named after the offset of its first record, padded to 20 digits, so sorting the names sorts the segments.
+  Every file and directory the broker creates is readable only by its own user.
 </p>
 
-<h2><span class="num">§</span>Record framing</h2>
+<h2>Records</h2>
 <p>
-  All multi-byte integers are big-endian. <code>record_len</code> measures the body in bytes (everything after the prefix, excluding itself). The trailing CRC covers the bytes from <code>offset</code> through the end of <code>value</code>.
+  Integers are big-endian. <code>record_len</code> counts the bytes after itself; the CRC covers everything from
+  <code>offset</code> to the end of <code>value</code>. A record is rejected unless its length is plausible and its CRC
+  matches, before anything is allocated or copied for it.
+</p>
+<figure class="code">
+  <figcaption><span>record</span><span>big-endian</span></figcaption>
+<pre>record_len     u32      bytes that follow
+offset         u64
+timestamp_ms   i64
+key_len        i32      -1 = no key
+key            [u8]
+value_len      u32
+value          [u8]
+crc32          u32      over offset … value</pre>
+</figure>
+
+<h2>Index and reads</h2>
+<p>
+  The index holds 16-byte entries, <code>(offset within segment, file position)</code>: one for the first record, then
+  one every 4&nbsp;KiB of log. A billion retained records need about 4&nbsp;MB of index in memory. A read finds the
+  segment, then the nearest entry at or before the offset, and scans forward at most 4&nbsp;KiB.
+</p>
+<p>
+  Each segment keeps its own file handle open and reads with positional reads in large windows: a read of a hundred
+  records is one or two system calls. A segment that compaction or retention removes keeps serving the readers that
+  were already using it, from the same bytes.
 </p>
 
-<div class="codeblock">
-  <div class="codeblock-bar">
-    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
-    <span class="label">record.bin</span>
-    <span class="lang">layout · BE</span>
-  </div>
-<pre><span class="c-fn">record_len</span>      <span class="c-key">u32</span>     <span class="c-com"># bytes of everything below (excluding itself + CRC trailer)</span>
-<span class="c-fn">offset</span>          <span class="c-key">u64</span>
-<span class="c-fn">timestamp_ms</span>    <span class="c-key">i64</span>
-<span class="c-fn">key_len</span>         <span class="c-key">i32</span>     <span class="c-com"># -1 means null key</span>
-<span class="c-fn">key</span>             <span class="c-key">bytes</span>   <span class="c-com"># key_len bytes (absent if key_len == -1)</span>
-<span class="c-fn">value_len</span>       <span class="c-key">u32</span>
-<span class="c-fn">value</span>           <span class="c-key">bytes</span>   <span class="c-com"># value_len bytes</span>
-<span class="c-fn">crc32</span>           <span class="c-key">u32</span>     <span class="c-com"># CRC32 of bytes from `offset` through end of `value`</span></pre>
-</div>
-
-<h2><span class="num">§</span>Sparse index</h2>
+<h2 id="durability">Writes and durability</h2>
 <p>
-  Each segment carries a 16-byte-per-entry index of <code>(relative_offset: u64, file_position: u64)</code> pairs. Offsets are relative to the segment's base offset so entries stay 16 bytes regardless of how the log grows. A consume call uses the index to seek close to the target offset and then scans forward record-by-record.
+  A produce request is one write per partition: its records are encoded into one buffer and appended with a single
+  <code>write</code>, together with their index entries. With the default <code>--flush-every-records 1</code>, the
+  response is sent only after an fsync that covers the write.
+</p>
+<p>
+  That fsync is shared. The first request to need one syncs the newest data it can see; requests waiting behind it find
+  their write already covered and return without another system call. This is group commit, and it is why durability
+  costs little under concurrent load.
+</p>
+<dl class="defs">
+  <div><dt><code>--flush-every-records 1</code></dt><dd>Default. Everything acknowledged is on disk.</dd></div>
+  <div><dt><code>--flush-every-records N</code></dt><dd>Fsync once N records are waiting, and at least every <code>--flush-interval</code> (1&nbsp;s). A crash can lose what arrived since the last fsync.</dd></div>
+</dl>
+<p>
+  If a write fails part-way (a full disk, an I/O error), the partial bytes are cut off the files before the error is
+  returned. If that is impossible, or an fsync fails, the partition stops accepting writes until a restart runs recovery:
+  after a failed fsync nothing written since the last good one can be trusted.
+</p>
+<p>
+  Metadata files (topic config, offsets, keys, schemas) are replaced atomically: written to a unique temporary file,
+  fsynced, renamed over the old one, and the directory fsynced.
 </p>
 
-<div class="grid grid-cols-1 md:grid-cols-3 gap-3 text-[13px] mt-6">
-  <div class="px-4 py-3 rounded-lg bg-white/[0.03] ring-1 ring-white/[0.06]">
-    <p class="font-mono text-[10px] tracking-[0.18em] uppercase text-indigo-300/80 mb-1">1 — Locate</p>
-    <p class="text-slate-300">Binary-search segment base offsets to pick the right segment.</p>
-  </div>
-  <div class="px-4 py-3 rounded-lg bg-white/[0.03] ring-1 ring-white/[0.06]">
-    <p class="font-mono text-[10px] tracking-[0.18em] uppercase text-indigo-300/80 mb-1">2 — Seek</p>
-    <p class="text-slate-300">Binary-search the .index for the floor entry of the target.</p>
-  </div>
-  <div class="px-4 py-3 rounded-lg bg-white/[0.03] ring-1 ring-white/[0.06]">
-    <p class="font-mono text-[10px] tracking-[0.18em] uppercase text-indigo-300/80 mb-1">3 — Scan</p>
-    <p class="text-slate-300">Read records forward until offset == target.</p>
-  </div>
-</div>
-
-<h2><span class="num">§</span>Segment roll</h2>
+<h2>Recovery after a crash</h2>
 <p>
-  The broker rolls when <code>current_size + next_record_size &gt; --segment-bytes</code>. The old segment becomes read-only; a new <code>.log</code>/<code>.index</code> pair is opened with the new base offset. Readers use an <code>ArcSwap</code>-protected segment list, so they never block on a roll — they simply pick up the newer snapshot on their next request.
+  At startup each sealed segment is checked against its index: the first record and everything after the last index
+  entry must decode, pass their CRC and end exactly at the end of the file. A segment that passes is trusted without
+  reading it all; one that does not is scanned in full and its index rebuilt. The segment being written to is always
+  scanned in full.
 </p>
-
-<h2><span class="num">§</span>Startup recovery</h2>
-<p>
-  For each partition directory the broker reads every <code>.log</code> in offset order and verifies every record's CRC. The <code>.index</code> file is treated as <em>derived</em> state and is rebuilt from the log on every boot. If a record fails its CRC or is truncated mid-frame:
-</p>
-
-<div class="mt-6 space-y-3">
-  <div class="flex items-start gap-4">
-    <span class="shrink-0 w-7 h-7 rounded-md bg-rose-400/[0.08] ring-1 ring-rose-400/20 flex items-center justify-center font-mono text-[11px] text-rose-200">01</span>
-    <p class="text-[14.5px] text-slate-300">The bad record's start position becomes the new end-of-log.</p>
-  </div>
-  <div class="flex items-start gap-4">
-    <span class="shrink-0 w-7 h-7 rounded-md bg-rose-400/[0.08] ring-1 ring-rose-400/20 flex items-center justify-center font-mono text-[11px] text-rose-200">02</span>
-    <p class="text-[14.5px] text-slate-300">The active <code>.log</code> is truncated to that position.</p>
-  </div>
-  <div class="flex items-start gap-4">
-    <span class="shrink-0 w-7 h-7 rounded-md bg-rose-400/[0.08] ring-1 ring-rose-400/20 flex items-center justify-center font-mono text-[11px] text-rose-200">03</span>
-    <p class="text-[14.5px] text-slate-300">Any segments past the corruption point are removed entirely.</p>
-  </div>
-  <div class="flex items-start gap-4">
-    <span class="shrink-0 w-7 h-7 rounded-md bg-rose-400/[0.08] ring-1 ring-rose-400/20 flex items-center justify-center font-mono text-[11px] text-rose-200">04</span>
-    <p class="text-[14.5px] text-slate-300">The next produce continues at <em>(highest valid offset)&nbsp;+&nbsp;1</em>.</p>
-  </div>
-</div>
-
-<div class="mt-6 flex items-start gap-3 p-4 rounded-xl bg-emerald-400/[0.06] ring-1 ring-emerald-400/20">
-  <span class="font-mono text-[10px] tracking-[0.2em] uppercase text-emerald-300 mt-0.5">Safe</span>
-  <p class="text-[13.5px] leading-relaxed text-slate-200">
-    The broker fsyncs the log and index after every append, so the only path that loses data is the torn-write recovery path — and it only loses records that were never acknowledged to a client.
-  </p>
-</div>
-
-<h2><span class="num">§</span>Retention &amp; compaction</h2>
-<p>
-  Two background tokio tasks &mdash; the <strong>reaper</strong> and the <strong>compactor</strong> &mdash; iterate every partition on configurable intervals. Each topic's <code>cleanup_policy</code> selects which (or both) apply.
-</p>
-
-<h3>Reaper (cleanup.policy includes <code>delete</code>)</h3>
 <ul>
-  <li><strong>Time-based</strong>: a sealed segment is dropped when its newest record's <code>timestamp_ms</code> is older than <code>retention_ms</code>.</li>
-  <li><strong>Size-based</strong>: oldest sealed segments are dropped until the partition's total size is under <code>retention_bytes</code>.</li>
-  <li>The active segment is never dropped, even if it satisfies retention.</li>
+  <li><strong>A torn tail</strong> in the active segment, from a crash mid-write, is cut off. Those records were never acknowledged.</li>
+  <li><strong>A corrupt record in a sealed segment</strong> is not a torn write. The rest of that segment is skipped and reported, the file is left in place, and no other segment is touched.</li>
+  <li><strong>The next offset</strong> continues after the highest valid record.</li>
 </ul>
 
-<h3>Compactor (cleanup.policy includes <code>compact</code>)</h3>
-<ul>
-  <li>Scans every sealed segment, keeps only the latest record per key (records without a key pass through unchanged with original offsets).</li>
-  <li>Empty-value records are <strong>tombstones</strong>: emitted during compaction so consumers see the deletion marker, then dropped once they exceed <code>tombstone_retention_ms</code>.</li>
-  <li>Offsets are preserved &mdash; compacted logs are sparse, and the consume path scans forward past missing offsets.</li>
-</ul>
-
-<h3>The swap dance</h3>
+<h2>Retention and compaction</h2>
 <p>
-  Both reaper and compactor follow the same safety pattern:
+  Two background tasks visit every partition. Each topic's cleanup policy decides which runs. The segment being written
+  to is never deleted or compacted.
 </p>
+<h3>Retention</h3>
+<ul>
+  <li>By age: a sealed segment goes once its newest record is older than <code>retention_ms</code>.</li>
+  <li>By size: the oldest sealed segments go until the partition is under <code>retention_bytes</code>.</li>
+  <li>With <code>--cold-storage-dir</code>, a segment is copied there and fsynced first. If the copy fails, the segment stays and is retried.</li>
+</ul>
+<h3>Compaction</h3>
+<ul>
+  <li>Keeps the newest record of each key across the sealed segments, and every record without a key, at its original offset.</li>
+  <li>An empty value is a tombstone: it deletes its key and is itself dropped after <code>tombstone_retention_ms</code>.</li>
+  <li>Two streaming passes: the first remembers only each key's newest offset, the second copies the survivors. Memory grows with the number of keys, not the size of the data.</li>
+  <li>A pass that would drop nothing is skipped. An unreadable record aborts the pass rather than losing what follows it.</li>
+</ul>
+<h3>Replacing segments safely</h3>
+<ol class="steps">
+  <li><p><strong>Write the result</strong> to temporary files and fsync them.</p></li>
+  <li><p><strong>Check nothing moved.</strong> Under the partition's write lock, the sealed segments must be exactly the ones that were read; a roll or a retention pass in the meantime cancels the swap.</p></li>
+  <li><p><strong>Record the plan</strong> in <code>compaction.marker</code> and fsync it. From here a crash is finished at the next start, so the new segment and the ones it replaces never coexist.</p></li>
+  <li><p><strong>Swap.</strong> Rename the result into place, delete the replaced segments, fsync the directory, and publish the new segment list. Readers already in progress keep their old files.</p></li>
+</ol>
+
+<h2 id="throughput">Throughput</h2>
+<p>
+  Measured with <code>crates/es-broker/tests/bench.rs</code>: 256-byte records over loopback, release build with full
+  link-time optimisation, on a 32-core server with NVMe storage. Every case runs with fsync before acknowledgement.
+  The earlier figures are version 0.2.0 running the same bench.
+</p>
+<table>
+  <thead><tr><th>Case</th><th>v0.2.0</th><th>Now</th></tr></thead>
+  <tbody>
+    <tr><td>Binary produce, 8 connections, batches of 500, 1 partition</td><td>15k/s</td><td>4.6M/s</td></tr>
+    <tr><td>Binary produce, 8 connections, batches of 500, 4 partitions</td><td>34k/s</td><td>4.0M/s</td></tr>
+    <tr><td>HTTP produce, 8 clients, batches of 500, 4 partitions</td><td>18k/s</td><td>3.7M/s</td></tr>
+    <tr><td>Binary consume, 1 connection, 4 MiB fetches</td><td>1.6M/s</td><td>3.0M/s</td></tr>
+    <tr><td>64 pipelined requests of 10 records, 1 connection</td><td>15k/s</td><td>118k/s</td></tr>
+    <tr><td>Raft partition, single node, 4 connections, batches of 100</td><td>5k/s</td><td>1.0M/s</td></tr>
+  </tbody>
+</table>
+<p>
+  The runs are short; compare ratios rather than digits, and run the bench on your own hardware:
+</p>
+<figure class="code">
+  <figcaption><span>shell</span></figcaption>
+<pre>cargo test --release -p es-broker --test bench -- --ignored --nocapture</pre>
+</figure>
+<p>What made the difference, largest first:</p>
 <ol>
-  <li>Briefly take <code>Partition::appender</code> &mdash; the only place where the segment list is mutated, including the writer's roll path. This makes "drop a segment" race-free against an in-flight append.</li>
-  <li>Swap the new segment vector into the <code>ArcSwap</code> snapshot. Producers and consumers see it on their next access.</li>
-  <li>Release the lock. Then sleep for <code>segment_delete_grace</code>.</li>
-  <li>Only then <code>unlink</code> the old segment files. In-flight readers that captured the old snapshot still hold an <code>Arc&lt;Segment&gt;</code>; on Linux the kernel keeps their open file descriptors alive even after the path is removed.</li>
+  <li>One write and at most one fsync per request, instead of two fsyncs per record under the partition lock.</li>
+  <li>One Raft entry per request, on an append-only Raft log, instead of rewriting the whole log as JSON per record.</li>
+  <li>Group commit and concurrent request handling, so small requests share fsyncs.</li>
+  <li>Windowed positional reads instead of opening the file and making four system calls per record.</li>
 </ol>
-<p class="text-[14px] text-slate-400">
-  Belt-and-braces: <code>Segment::read_from</code> treats <code>ENOENT</code> on open as &ldquo;segment vanished, return empty&rdquo;, so a reader stalled past the grace window advances cleanly to the next segment.
+<p class="small">
+  Batch size dominates: small requests each pay for an fsync. More partitions stop helping once one partition is no
+  longer the bottleneck.
 </p>
-
-<h3>Live config updates</h3>
-<p>
-  <code>PUT /topics/:name/config</code> rewrites <code>topic.json</code> via the same atomic-rename pattern used for group offsets, then swaps the in-memory <code>Arc&lt;TopicConfig&gt;</code>. The next produce sees the new <code>segment_bytes</code>; the next reaper/compactor pass sees the new policy.
-</p>
-
-<h2><span class="num">§</span>Concurrency model</h2>
-<ul>
-  <li>Each partition has a <code>tokio::sync::Mutex</code> over its <code>SegmentAppender</code>. Different partitions append in parallel.</li>
-  <li>Readers don't take the appender mutex. They load an <code>arc_swap</code> snapshot of the segment list, open their own file handle, and read.</li>
-  <li>The partition's high watermark is an <code>AtomicU64</code>. Readers use <code>Acquire</code> loads to see records the writer has fully published with <code>Release</code>.</li>
-</ul>
-
-<h2 id="throughput"><span class="num">§</span>Throughput &amp; flush policy</h2>
-<p>
-  By default the broker <code>fsync</code>s the active <code>.log</code> + <code>.index</code> after every appended record. That makes every acknowledged write durable but caps throughput at the disk's fsync rate &mdash; typically a few hundred records per second on consumer SSDs. Set <code>--flush-every-records N</code> to batch fsyncs:
-</p>
-<ul>
-  <li><code>N = 1</code> (default) &mdash; every record is durable before the producer is acked.</li>
-  <li><code>N = 200</code> &mdash; one fsync per 200 records. ~100&times; higher throughput; up to 199 records of un-acked work can be lost on a crash.</li>
-</ul>
-<p class="text-[14px] text-slate-400">
-  Visibility to other in-process readers is independent &mdash; that always happens after each append via <code>BufWriter::flush()</code> into the OS page cache. The fsync only governs <em>durability across a process crash or power loss</em>.
-</p>
-
-<h3>Bench numbers</h3>
-<p class="text-[14px] text-slate-400">
-  <em>From <code>crates/es-broker/tests/bench.rs</code></em> — 200,000 records of 256 bytes in batches of 1000, <code>--flush-every-records 1000</code>, 8 concurrent producers, loopback.
-</p>
-<div class="codeblock">
-  <div class="codeblock-bar">
-    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
-    <span class="label">bench / 8 concurrent binary producers</span>
-    <span class="lang">throughput</span>
-  </div>
-<pre>binary / 1 partition  : 21.0 MB/s    86 k records/s
-binary / 4 partitions : 27.1 MB/s   111 k records/s</pre>
-</div>
-<p class="text-[14px] text-slate-400">
-  Three honest takeaways:
-</p>
-<ol class="text-[14px] text-slate-400 list-decimal list-inside space-y-1">
-  <li><strong>Concurrent producers are the key.</strong> Sequential HTTP round-trips cap at ~23k rec/s regardless of protocol. With 8 concurrent binary producers, throughput jumps to 86k on a single partition and 111k across 4 partitions.</li>
-  <li><strong>Partitions scale linearly.</strong> Each partition has its own appender mutex. 4 partitions running 8 concurrent producers gets ~30% more throughput than 1 partition — the extra partitions absorb contention.</li>
-  <li><strong>The binary protocol matters.</strong> It avoids JSON serialization overhead and UTF-8 validation. Combined with fire-and-forget produce (no response parsing), it's the path to high throughput.</li>
-</ol>
-
-<h2 id="replication-early"><span class="num">§</span>Replication (Raft)</h2>
-<div class="mb-4 flex items-start gap-3 p-4 rounded-xl bg-emerald-400/[0.06] ring-1 ring-emerald-400/20">
-  <span class="font-mono text-[10px] tracking-[0.2em] uppercase text-emerald-300 mt-0.5">Shipped</span>
-  <p class="text-[13.5px] leading-relaxed text-slate-200">
-    Raft consensus is fully integrated into the partition write path via <code>RaftPartition</code>. Topics can be configured with Raft peers; produces go through the Raft leader; multi-node replication works over TCP transport.
-  </p>
-</div>
-
-<h3>What works today</h3>
-<ul>
-  <li><strong>Leader election</strong> (<code>raft/state.rs</code>): Follower → Candidate → Leader transitions; per-term vote semantics; higher-term step-down; up-to-date check from §5.4.1.</li>
-  <li><strong>Log replication</strong>: leader tracks <code>next_index</code>/<code>match_index</code> per peer; AppendEntries ships real entries with prev-log-index/term consistency check; conflicting follower entries are truncated; commit advances when an entry of the current term is replicated to a majority (§5.4.2).</li>
-  <li><strong>InstallSnapshot RPC</strong> (<code>raft/messages.rs</code>): leader sends snapshots to lagging followers who have fallen behind the compacted log prefix.</li>
-  <li><strong>Membership changes</strong> (<code>raft/state.rs</code>): add/remove peers via config log entries; committed entries reconfigure the cluster.</li>
-  <li><strong>Persistent store</strong> (<code>raft/log.rs</code>): <code>RaftStore</code> trait with JSON-file (atomic-rename + fsync) and in-memory implementations.</li>
-  <li><strong>TCP transport</strong> (<code>raft/transport.rs</code>): per-peer persistent connections with length-prefixed Message frames.</li>
-  <li><strong>RaftPartition</strong> (<code>raft_partition.rs</code>): wraps a <code>Partition</code> behind a Raft node; appends are proposed through Raft, committed entries are applied to the underlying segmented log; <code>connect_transport()</code> sets up peer mesh.</li>
-  <li><strong>PartitionHandle</strong> (<code>partition_handle.rs</code>): enum over <code>Partition</code> and <code>RaftPartition</code>; <code>Topic::partitions</code> uses this uniformly.</li>
-</ul>
-
-<h3>Tests</h3>
-<ul>
-  <li>3-node leader election (in-process and TCP transport)</li>
-  <li>Log replication across 3 nodes</li>
-  <li>Propose to follower → NotLeader error</li>
-  <li>Persistent store survives restart</li>
-  <li>Snapshot compacts log and survives restart</li>
-  <li>Leader sends snapshot to lagging follower via InstallSnapshot</li>
-  <li>2-node RaftPartition with TCP transport: produce on leader, read from follower</li>
-  <li>Single-node RaftPartition: append roundtrip, state survives restart, auto-snapshot keeps log bounded</li>
-</ul>
-<h2><span class="num">§</span>Source map</h2>
-<div class="grid grid-cols-1 md:grid-cols-2 gap-2 mt-4 text-[13px]">
-  <div class="flex items-center gap-3 px-4 py-2.5 rounded-md bg-white/[0.025] ring-1 ring-white/[0.06]">
-    <span class="font-mono text-[10.5px] tracking-[0.16em] uppercase text-indigo-300/80">storage/record.rs</span>
-    <span class="ml-auto text-slate-400 text-[12.5px]">framing + CRC</span>
-  </div>
-  <div class="flex items-center gap-3 px-4 py-2.5 rounded-md bg-white/[0.025] ring-1 ring-white/[0.06]">
-    <span class="font-mono text-[10.5px] tracking-[0.16em] uppercase text-indigo-300/80">storage/segment.rs</span>
-    <span class="ml-auto text-slate-400 text-[12.5px]">.log + .index pair</span>
-  </div>
-  <div class="flex items-center gap-3 px-4 py-2.5 rounded-md bg-white/[0.025] ring-1 ring-white/[0.06]">
-    <span class="font-mono text-[10.5px] tracking-[0.16em] uppercase text-indigo-300/80">storage/recover.rs</span>
-    <span class="ml-auto text-slate-400 text-[12.5px]">startup scan + truncation</span>
-  </div>
-  <div class="flex items-center gap-3 px-4 py-2.5 rounded-md bg-white/[0.025] ring-1 ring-white/[0.06]">
-    <span class="font-mono text-[10.5px] tracking-[0.16em] uppercase text-indigo-300/80">partition.rs</span>
-    <span class="ml-auto text-slate-400 text-[12.5px]">append mutex + ArcSwap snapshot</span>
-  </div>
-  <div class="flex items-center gap-3 px-4 py-2.5 rounded-md bg-white/[0.025] ring-1 ring-white/[0.06]">
-    <span class="font-mono text-[10.5px] tracking-[0.16em] uppercase text-indigo-300/80">groups.rs</span>
-    <span class="ml-auto text-slate-400 text-[12.5px]">offset store, atomic rename</span>
-  </div>
-  <div class="flex items-center gap-3 px-4 py-2.5 rounded-md bg-white/[0.025] ring-1 ring-white/[0.06]">
-    <span class="font-mono text-[10.5px] tracking-[0.16em] uppercase text-indigo-300/80">http/mod.rs</span>
-    <span class="ml-auto text-slate-400 text-[12.5px]">router + handlers</span>
-  </div>
-</div>

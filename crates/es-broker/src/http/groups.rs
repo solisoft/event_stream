@@ -27,9 +27,20 @@ pub async fn commit(
             key.key_id, req.topic
         )));
     }
+    // Only real partitions: arbitrary topic names and partition numbers used
+    // to be stored as given, growing the group's file without limit.
+    let topic = broker
+        .topic(&req.topic)
+        .ok_or_else(|| AppError::not_found(format!("topic '{}' not found", req.topic)))?;
+    if req.partition as usize >= topic.partitions.len() {
+        return Err(AppError::bad_request(format!(
+            "partition {} out of range",
+            req.partition
+        )));
+    }
     broker
         .groups
-        .commit(&group, &req.topic, req.partition, req.offset)
+        .commit(&group, &key, &req.topic, req.partition, req.offset)
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -38,13 +49,13 @@ pub async fn offsets(
     State(broker): State<Arc<Broker>>,
     AuthedKey(key): AuthedKey,
     Path(group): Path<String>,
-) -> Json<GroupOffsetsResponse> {
+) -> AppResult<Json<GroupOffsetsResponse>> {
+    broker.groups.check_access(&group, &key).await?;
     let snapshot = broker.groups.snapshot(&group).await;
-    // Only expose committed offsets for topics the caller can read, so one
-    // principal can't enumerate another tenant's group positions.
+    // Only expose committed offsets for topics the caller can read.
     let offsets = snapshot
         .into_iter()
         .filter(|(topic, _)| key.can(AclAction::Read, topic))
         .collect();
-    Json(GroupOffsetsResponse { offsets })
+    Ok(Json(GroupOffsetsResponse { offsets }))
 }

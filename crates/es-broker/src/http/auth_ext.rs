@@ -4,13 +4,13 @@ use axum::async_trait;
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 
-use crate::auth::{AclAction, AclRule, ApiKey, AuthMode};
+use crate::auth::{ApiKey, AuthMode, ANONYMOUS_ADMIN};
 use crate::broker::Broker;
 
 use super::error::AppError;
 
 /// The authenticated principal for the current request. Always present in
-/// handlers: when auth is disabled, an "anonymous admin" key is fabricated so
+/// handlers: when auth is disabled, the shared anonymous admin key is used so
 /// the rest of the code can call `.can()` uniformly.
 pub struct AuthedKey(pub Arc<ApiKey>);
 
@@ -20,7 +20,7 @@ impl FromRequestParts<Arc<Broker>> for AuthedKey {
 
     async fn from_request_parts(parts: &mut Parts, broker: &Arc<Broker>) -> Result<Self, AppError> {
         match broker.config.auth_mode {
-            AuthMode::Disabled => Ok(AuthedKey(Arc::new(anon_admin()))),
+            AuthMode::Disabled => Ok(AuthedKey(ANONYMOUS_ADMIN.clone())),
             AuthMode::Required => {
                 let token = extract_bearer(parts)?;
                 let key = broker
@@ -54,19 +54,4 @@ fn extract_bearer(parts: &Parts) -> Result<String, AppError> {
     Err(AppError::unauthorized(
         "missing Authorization or X-Es-Key header",
     ))
-}
-
-fn anon_admin() -> ApiKey {
-    ApiKey {
-        key_id: "anonymous".to_string(),
-        name: "anonymous (auth disabled)".to_string(),
-        acls: vec![AclRule {
-            action: AclAction::Admin,
-            topic_prefix: "*".to_string(),
-        }],
-        produce_bytes_per_sec: None,
-        consume_bytes_per_sec: None,
-        created_at_ms: 0,
-        disabled: false,
-    }
 }

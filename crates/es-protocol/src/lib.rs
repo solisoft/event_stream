@@ -222,6 +222,10 @@ pub struct ConsumeResponse {
     pub records: Vec<RecordDto>,
     pub next_offset: u64,
     pub high_watermark: u64,
+    /// `"base64"` when keys and values are base64-encoded (requested with
+    /// `?encoding=base64`); absent for text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

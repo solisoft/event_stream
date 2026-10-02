@@ -1,13 +1,21 @@
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::Path;
 
 pub const INDEX_ENTRY_LEN: usize = 16; // u64 rel_offset + u64 file_pos
 
+/// Log bytes between two index entries.
+///
+/// One entry per record cost 16 bytes of RAM per record retained — a billion
+/// records was 16 GB of index before a single byte of data was read. A lookup
+/// now lands at most this many bytes before its target and scans forward, which
+/// one `pread` window covers anyway.
+pub const INDEX_INTERVAL_BYTES: u64 = 4096;
+
 /// In-memory sparse index for one segment.
 ///
-/// Entries are sorted by `relative_offset` (ascending). For "basic" mode we
-/// write one entry per record — still tiny and makes lookups exact.
+/// Entries are sorted by `relative_offset` (ascending), one per
+/// [`INDEX_INTERVAL_BYTES`] of log (plus the first record of the segment).
 #[derive(Debug, Default)]
 pub struct SparseIndex {
     entries: Vec<(u64, u64)>,
@@ -54,12 +62,12 @@ impl SparseIndex {
         file.write_all(&buf)
     }
 
+    pub fn last(&self) -> Option<(u64, u64)> {
+        self.entries.last().copied()
+    }
+
     pub fn write_all_to(path: &Path, entries: &[(u64, u64)]) -> io::Result<()> {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(path)?;
+        let mut file = crate::fsutil::create_private(path)?;
         let mut buf = Vec::with_capacity(entries.len() * INDEX_ENTRY_LEN);
         for (rel, pos) in entries {
             buf.extend_from_slice(&rel.to_be_bytes());
@@ -81,7 +89,7 @@ impl SparseIndex {
             ));
         }
         let mut entries = Vec::with_capacity(buf.len() / INDEX_ENTRY_LEN);
-        for chunk in buf.chunks_exact(INDEX_ENTRY_LEN) {
+        for chunk in buf.as_chunks::<INDEX_ENTRY_LEN>().0 {
             let rel = u64::from_be_bytes(chunk[0..8].try_into().unwrap());
             let pos = u64::from_be_bytes(chunk[8..16].try_into().unwrap());
             entries.push((rel, pos));
