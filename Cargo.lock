@@ -438,6 +438,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "es-client"
+version = "0.2.0"
+dependencies = [
+ "es-broker",
+ "es-protocol",
+ "flate2",
+ "reqwest",
+ "rustls",
+ "rustls-pki-types",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "es-protocol"
 version = "0.2.0"
 dependencies = [

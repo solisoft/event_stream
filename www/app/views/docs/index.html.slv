@@ -22,7 +22,7 @@
   <tbody>
     <tr><td>Storage</td><td>CRC-checked segment files with a sparse index. Nothing is acknowledged before it is fsynced, one fsync per request shared between concurrent requests. Crash recovery trims a torn tail and leaves every other segment alone.</td></tr>
     <tr><td>Cleanup</td><td>Retention by age or size, key compaction with tombstones, and tiered storage that moves expired segments to a cold directory instead of deleting them.</td></tr>
-    <tr><td>Clients</td><td>An HTTP and JSON API for everything, a binary protocol with pipelining and gzip for the hot path, and the <code>es</code> CLI.</td></tr>
+    <tr><td>Clients</td><td>An HTTP and JSON API for everything, a binary protocol with pipelining and gzip for the hot path, the <code>es</code> CLI, and <a href="<%= docs_clients_path() %>">libraries</a> for Soli and Rust.</td></tr>
     <tr><td>Delivery</td><td>Consumer groups with explicit commits, a coordinator with sticky partition assignment, and idempotent producers whose retries are written once.</td></tr>
     <tr><td>Replication</td><td>Raft per partition: leader election, batched replication, snapshot transfer to late replicas, and a mutually authenticated transport between brokers.</td></tr>
     <tr><td>Security</td><td>TLS, API keys with grants by topic prefix, per-key byte-rate quotas, and groups and producer ids owned by the key that created them.</td></tr>
@@ -51,6 +51,7 @@
 │   ├── <span class="c-key">es-broker</span>          <span class="c-com"># the broker: storage, HTTP, binary protocol, Raft</span>
 │   ├── <span class="c-key">es-protocol</span>        <span class="c-com"># request and response types, binary wire format</span>
 │   ├── <span class="c-key">es-cli</span>             <span class="c-com"># the es command</span>
+│   ├── <span class="c-key">es-client</span>          <span class="c-com"># blocking binary-protocol client, no tokio</span>
 │   └── <span class="c-key">es-tools</span>           <span class="c-com"># offline dump and restore</span>
 └── data/                  <span class="c-com"># created at runtime</span>
     ├── topics/&lt;topic&gt;/&lt;partition&gt;/*.log, *.index
