@@ -51,6 +51,7 @@
 │   ├── <span class="c-key">es-broker</span>          <span class="c-com"># the broker: storage, HTTP, binary protocol, Raft</span>
 │   ├── <span class="c-key">es-protocol</span>        <span class="c-com"># request and response types, binary wire format</span>
 │   ├── <span class="c-key">es-cli</span>             <span class="c-com"># the es command</span>
+│   ├── <span class="c-key">es-client</span>          <span class="c-com"># blocking binary-protocol client, no tokio</span>
 │   └── <span class="c-key">es-tools</span>           <span class="c-com"># offline dump and restore</span>
 └── data/                  <span class="c-com"># created at runtime</span>
     ├── topics/&lt;topic&gt;/&lt;partition&gt;/*.log, *.index

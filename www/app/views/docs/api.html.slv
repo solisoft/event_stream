@@ -359,7 +359,9 @@ X-Es-Key: esk_AbCdEf…</pre>
   With <code>--bind-binary 127.0.0.1:9001</code> the broker also listens for a length-prefixed binary protocol over a
   long-lived connection. Keys and values travel as raw bytes, with the same keys, grants, quotas and idempotency as HTTP.
   The Rust clients are <code>es_broker::binary::BinaryClient</code> and the pipelined
-  <code>PipelinedClient</code>.
+  <code>PipelinedClient</code>, both on tokio, and the blocking <code>es_client::Client</code> &mdash; plain
+  <code>std::net</code>, one request at a time, with no dependency on the broker; it is what Soli's <code>ES</code>
+  class speaks.
 </p>
 <ul>
   <li><strong>TLS</strong> is on whenever the broker has a certificate; connect with <code>ClientOptions { tls: Some(…), .. }</code>.</li>
