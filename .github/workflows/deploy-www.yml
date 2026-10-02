@@ -135,6 +135,14 @@ jobs:
               echo "$p -> $c"
               [ "$c" = "200" ] || fail=1
             done
+            # La 404 du site, pas celle de Soli : si app/views/errors/404
+            # lève, Soli rend sa page intégrée en silence, toujours en 404.
+            c="$(curl -s -o /tmp/404.html -w '%{http_code}' -m 5 "http://127.0.0.1:19555/no-such-page" || echo 000)"
+            echo "/no-such-page -> $c"
+            if [ "$c" != "404" ] || ! grep -q 'Nothing at this offset' /tmp/404.html; then
+              echo "une adresse inconnue n'affiche pas app/views/errors/404.html.slv" >&2
+              fail=1
+            fi
           else
             echo "/up a répondu $code, pas 200" >&2
             fail=1

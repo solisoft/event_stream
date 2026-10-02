@@ -18,3 +18,14 @@ end
 def site_url()
     "https://es.solisoft.net"
 end
+
+# Every page, in the order of config/pages.json: the 404 lists them as the
+# records of the site's log, offset by offset.
+def site_pages()
+    pages = JSON.parse(File.read("config/pages.json"))
+    pages.keys.map do |key|
+        page = pages[key]
+        page["key"] = key
+        page
+    end
+end

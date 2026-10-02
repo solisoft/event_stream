@@ -1,0 +1,78 @@
+<%# Soli renders errors/<status> without a layout, for any address no route
+    answers, so this is a whole document. It shows when something has already
+    gone wrong: nothing here touches a request or a model. If it raises anyway,
+    Soli falls back to its built-in page.
+
+    The site's pages are drawn as the records of a log, at offsets 0 to 7; the
+    request asked for offset 404, past the end. %>
+<% pages = site_pages() %>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="robots" content="noindex">
+  <title>404, page not found — es</title>
+  <meta name="theme-color" content="#F3F4F1">
+  <link rel="icon" href="<%= public_path("favicon.svg") %>" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@600;700&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&display=swap">
+  <link rel="stylesheet" href="<%= public_path("css/application.css") %>">
+</head>
+<body>
+  <%- partial("layouts/header", {"current": ""}) %>
+  <main id="main" class="wrap missing">
+    <div class="missing-head">
+      <div>
+        <p class="missing-code"><span>404</span> Page not found</p>
+        <h1>Nothing at this offset.</h1>
+      </div>
+      <div>
+        <p class="lede">
+          There is no page at this address. It may have moved when the docs were rewritten, or the link has a typo.
+          Every page on the site is listed below.
+        </p>
+        <div class="actions">
+          <a class="btn btn-primary" href="<%= root_path() %>">Go to the home page</a>
+          <a class="btn btn-secondary" href="<%= docs_path() %>">Read the docs</a>
+        </div>
+      </div>
+    </div>
+
+    <figure class="log missing-log" aria-labelledby="missing-caption">
+      <div class="log-head">
+        <span>Topic <strong>pages</strong>, 1 partition</span>
+        <span>High watermark <strong><%= pages.length %></strong></span>
+      </div>
+      <ol class="pages">
+        <% for page, offset in pages %>
+        <li>
+          <a href="<%= page["path"] %>">
+            <span class="pages-offset"><%= offset %></span>
+            <span class="pages-cell" aria-hidden="true"></span>
+            <span class="pages-title"><%= page["key"] == "home" ? "Home" : page["title"] %></span>
+            <span class="pages-path"><%= page["path"] %></span>
+          </a>
+        </li>
+        <% end %>
+        <li class="pages-gap" aria-hidden="true">
+          <span class="pages-offset">⋮</span>
+          <span></span>
+          <span>Offsets <%= pages.length %> to 403: nothing was ever written</span>
+        </li>
+        <li class="pages-miss">
+          <span class="pages-offset">404</span>
+          <span class="pages-cell" aria-hidden="true"></span>
+          <span class="pages-title">The page you asked for</span>
+          <span class="pages-path">past the end</span>
+        </li>
+      </ol>
+      <figcaption class="log-foot" id="missing-caption">
+        A consume past the end of a partition comes back empty. So did this request.
+      </figcaption>
+    </figure>
+  </main>
+  <%- partial("layouts/footer", {}) %>
+</body>
+</html>
