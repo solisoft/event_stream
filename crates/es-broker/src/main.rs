@@ -11,7 +11,7 @@ use es_broker::auth::AuthMode;
 use es_broker::{spawn, Config};
 
 #[derive(Parser, Debug)]
-#[command(name = "es-broker", about = "Basic event-streaming broker")]
+#[command(name = "es-broker", version, about = "Basic event-streaming broker")]
 struct Args {
     #[arg(long, default_value = "./data")]
     data_dir: PathBuf,

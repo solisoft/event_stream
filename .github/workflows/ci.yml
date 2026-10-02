@@ -6,6 +6,9 @@ on:
     tags: ['v*']
   pull_request:
     branches: [main]
+  # Builds the release binaries without releasing anything (they land as run
+  # artifacts): the way to try a change to build-binaries before a tag does.
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -76,7 +79,19 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+
+      # A tag that disagrees with Cargo.toml would publish binaries whose
+      # --version names another release.
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::Tag version ($TAG_VERSION) does not match Cargo.toml version ($CARGO_VERSION)"
+            exit 1
+          fi
+          echo "Version check passed: $TAG_VERSION"
 
       - name: Create GitHub Release
         env:
@@ -85,71 +100,144 @@ jobs:
 
   build-binaries:
     needs: release
+    # After the release job on a tag; on its own (release skipped) when run by
+    # hand.
+    if: ${{ !cancelled() && (needs.release.result == 'success' || (github.event_name == 'workflow_dispatch' && needs.release.result == 'skipped')) }}
     strategy:
+      fail-fast: false
       matrix:
         include:
+          # Linux builds on 22.04 for its older glibc (2.35): a binary linked on
+          # a newer runner refuses to start on Debian 12 — the Docker base below
+          # — or Ubuntu 22.04, with "GLIBC_2.39 not found".
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-22.04
             artifact: es-linux-amd64
+          # Native arm64 runner rather than a cross linker: ring's C code then
+          # builds with the system compiler, and the smoke test below runs.
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+            artifact: es-linux-arm64
           - target: aarch64-apple-darwin
             os: macos-latest
             artifact: es-darwin-arm64
+          # Intel Mac, cross-built on the Apple-silicon runner (the SDK covers
+          # both); Rosetta runs it for the smoke test.
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            artifact: es-darwin-amd64
+          # No Windows build: the broker's storage and file permissions are
+          # written for Unix, and a broker that half-works there is worse than
+          # none.
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install system dependencies (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
-
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --profile dist --locked --target ${{ matrix.target }} --bin es-broker --bin es --bin es-tools
 
+      # Each binary starts and reports the Cargo.toml version (which the release
+      # job has matched to the tag): a tarball whose binaries cannot run on
+      # their own platform must not reach a release.
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.target }}" = "x86_64-apple-darwin" ]; then
+            softwareupdate --install-rosetta --agree-to-license >/dev/null 2>&1 || true
+          fi
+          version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          for bin in es-broker es es-tools; do
+            out="$(target/${{ matrix.target }}/dist/$bin --version)"
+            echo "$out"
+            [ "$out" = "$bin $version" ] || { echo "::error::$bin reports '$out', expected '$bin $version'"; exit 1; }
+          done
+
+      # Plus a .sha256 sibling per tarball, as for soli: install scripts and
+      # users can check the download before running it. macOS has `shasum`
+      # but not `sha256sum`.
       - name: Package binaries
         run: |
-          tar -czf ${{ matrix.artifact }}.tar.gz -C target/${{ matrix.target }}/release es-broker es
+          set -euo pipefail
+          tar -czf ${{ matrix.artifact }}.tar.gz -C target/${{ matrix.target }}/dist es-broker es es-tools
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum ${{ matrix.artifact }}.tar.gz | awk '{print $1}' > ${{ matrix.artifact }}.tar.gz.sha256
+          else
+            shasum -a 256 ${{ matrix.artifact }}.tar.gz | awk '{print $1}' > ${{ matrix.artifact }}.tar.gz.sha256
+          fi
+          ls -l ${{ matrix.artifact }}.tar.gz
+          cat ${{ matrix.artifact }}.tar.gz.sha256
 
       - name: Upload to release
+        if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload --clobber ${{ github.ref_name }} ${{ matrix.artifact }}.tar.gz
+        run: |
+          gh release upload --clobber ${{ github.ref_name }} ${{ matrix.artifact }}.tar.gz
+          gh release upload --clobber ${{ github.ref_name }} ${{ matrix.artifact }}.tar.gz.sha256
+
+      - name: Keep as run artifact
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}.tar.gz
+            ${{ matrix.artifact }}.tar.gz.sha256
+          retention-days: 7
 
   publish-release:
     needs: [build-binaries]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release edit ${{ github.ref_name }} --draft=false
 
+  # Multi-arch image from the release's own tarballs: the image runs exactly the
+  # binaries users download, for amd64 and arm64.
   docker:
     needs: publish-release
     runs-on: ubuntu-latest
     permissions:
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+
+      - name: Download the Linux binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            gh release download ${{ github.ref_name }} --pattern "es-linux-$arch.tar.gz*"
+            echo "$(cat es-linux-$arch.tar.gz.sha256)  es-linux-$arch.tar.gz" | sha256sum -c -
+            mkdir -p bin/$arch
+            tar -xzf es-linux-$arch.tar.gz -C bin/$arch
+          done
 
       - name: Create Dockerfile
         run: |
           cat > Dockerfile << 'EOF'
           FROM debian:bookworm-slim
+          ARG TARGETARCH
           RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
-          COPY es-broker /usr/local/bin/es-broker
-          COPY es /usr/local/bin/es
+          COPY bin/${TARGETARCH}/es-broker bin/${TARGETARCH}/es bin/${TARGETARCH}/es-tools /usr/local/bin/
           ENTRYPOINT ["/usr/local/bin/es-broker"]
           EOF
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -161,17 +249,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Download linux-amd64 binaries
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release download ${{ github.ref_name }} --pattern 'es-linux-amd64.tar.gz'
-          tar -xzf es-linux-amd64.tar.gz
-
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
+          platforms: linux/amd64,linux/arm64
           push: true
           cache-from: type=gha
           cache-to: type=gha,mode=max

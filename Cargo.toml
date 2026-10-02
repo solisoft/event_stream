@@ -49,3 +49,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# The shipped binaries: tag builds (`build-binaries` in ci.yml) and the Docker
+# image. Fat LTO optimizes the whole crate graph as one unit — the last few
+# percent, and the build the README's throughput figures were measured on.
+# Stripped: the tarballs are for running, not for debugging.
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+strip = "symbols"

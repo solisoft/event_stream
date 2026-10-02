@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand};
 #[derive(Parser, Debug)]
 #[command(
     name = "es-tools",
+    version,
     about = "Offline backup/restore tools for es event log"
 )]
 struct Cli {

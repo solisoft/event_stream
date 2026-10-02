@@ -13,7 +13,7 @@ use es_protocol::{
 };
 
 #[derive(Parser, Debug)]
-#[command(name = "es", about = "CLI for the es event-streaming broker")]
+#[command(name = "es", version, about = "CLI for the es event-streaming broker")]
 struct Cli {
     #[arg(long, env = "ES_BROKER", default_value = "http://127.0.0.1:9000")]
     broker: String,
