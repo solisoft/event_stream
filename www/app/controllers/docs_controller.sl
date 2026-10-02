@@ -8,49 +8,49 @@ class DocsController < Controller
     # GET /docs
     def index
         @section = "overview"
-        @title = "es — basic event streaming in Rust"
+        @title = "Docs overview — es"
         render("docs/index", { "layout": "docs" })
     end
 
     # GET /docs/demo
     def demo
         @section = "demo"
-        @title = "Quickstart demo — es"
+        @title = "Quickstart — es"
         render("docs/demo", { "layout": "docs" })
     end
 
     # GET /docs/api
     def api
         @section = "api"
-        @title = "HTTP API — es"
+        @title = "HTTP and binary API — es"
         render("docs/api", { "layout": "docs" })
     end
 
     # GET /docs/cli
     def cli
         @section = "cli"
-        @title = "CLI reference — es"
+        @title = "CLI and broker flags — es"
         render("docs/cli", { "layout": "docs" })
     end
 
     # GET /docs/storage
     def storage
         @section = "storage"
-        @title = "Storage format — es"
+        @title = "How storage works — es"
         render("docs/storage", { "layout": "docs" })
     end
 
     # GET /docs/cluster
     def cluster
         @section = "cluster"
-        @title = "Cluster setup — es"
+        @title = "Clustering with Raft — es"
         render("docs/cluster", { "layout": "docs" })
     end
 
     # GET /docs/tools
     def tools
         @section = "tools"
-        @title = "Backup & restore — es"
+        @title = "Backup and restore — es"
         render("docs/tools", { "layout": "docs" })
     end
 end

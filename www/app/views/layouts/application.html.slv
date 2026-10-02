@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <%- partial("layouts/head", {"title": title}) %>
+  <%- partial("layouts/head", {"title": title, "meta_key": "home"}) %>
 </head>
 <body>
   <%- partial("layouts/header", {"current": "home"}) %>

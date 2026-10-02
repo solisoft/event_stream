@@ -73,6 +73,18 @@ jobs:
           [ "$got" = "$SOLI_VERSION" ] || { echo "soli $got installée, $SOLI_VERSION attendue" >&2; exit 1; }
           echo "soli $got"
 
+      # Chaque page de config/pages.json annonce public/og/<clé>.png dans ses
+      # balises Open Graph. Une page ajoutée sans relancer scripts/og/build.sh
+      # partagerait une image en 404.
+      - name: Chaque page a son image de partage
+        run: |
+          set -euo pipefail
+          missing=0
+          for key in $(jq -r 'keys[]' config/pages.json); do
+            [ -s "public/og/$key.png" ] || { echo "public/og/$key.png manque : lancer scripts/og/build.sh dans www/" >&2; missing=1; }
+          done
+          exit $missing
+
       # Tailwind se compile sur le poste (`npm run build:css`) et le résultat est
       # versionné ; la production sert public/ tel quel. Un fichier vide ici, et
       # le site partirait sans style.
@@ -233,11 +245,11 @@ jobs:
       # --delete-delay : ce qui quitte le dépôt quitte le serveur. Les exclusions
       # protègent ce qui appartient au serveur — un .env éventuel et le
       # déclencheur du proxy (restart.txt) — plus ce qui n'a rien à y faire :
-      # node_modules (entrée de build, 200 Mo inutiles là-bas), les specs et les
-      # notes pour agents. config.toml, run/ et sites/ sont des artefacts root
-      # qu'un passage du proxy peut laisser dans le dossier du site : exclus
-      # plutôt que supprimés, un déploiement automatique n'étant pas le bon
-      # endroit pour faucher des fichiers root.
+      # node_modules (entrée de build, 200 Mo inutiles là-bas), les specs, les
+      # scripts de génération et les notes pour agents. config.toml, run/ et
+      # sites/ sont des artefacts root qu'un passage du proxy peut laisser dans
+      # le dossier du site : exclus plutôt que supprimés, un déploiement
+      # automatique n'étant pas le bon endroit pour faucher des fichiers root.
       - name: Synchroniser les fichiers
         if: steps.cfg.outputs.configured == 'true'
         run: |
@@ -252,6 +264,7 @@ jobs:
             --exclude='tmp/' \
             --exclude='coverage/' \
             --exclude='tests/' \
+            --exclude='scripts/' \
             --exclude='config.toml' \
             --exclude='run/' \
             --exclude='sites/' \
