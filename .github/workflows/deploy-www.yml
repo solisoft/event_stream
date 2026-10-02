@@ -7,9 +7,10 @@
 #
 # Pas de migrations : le site n'a ni base ni modèle.
 #
-# Le dossier du site doit déjà exister sur le serveur avec son app.infos (le
-# proxy le lit pour savoir comment lancer l'app). Ce workflow ne crée rien et ne
-# touche à aucun autre dossier.
+# Le dossier du site doit déjà exister sur le serveur : ce workflow ne crée
+# aucun site et ne touche à aucun autre dossier. L'app.infos, lui, vient du
+# dépôt (www/app.infos, sections [development]/[production]) et part avec le
+# reste ; le proxy relit sa configuration quand il change.
 name: deploy www
 
 on:
@@ -219,18 +220,19 @@ jobs:
           printf '%s\n' "${{ secrets.SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
 
-      # app.infos seulement : le site n'a pas de .env, il n'en lit aucune
-      # variable.
+      # Le dossier seulement : rsync le créerait, et un site qui apparaît sur un
+      # serveur partagé doit être une décision, pas l'effet d'une variable mal
+      # renseignée. Pas de .env non plus : le site n'en lit aucune variable.
       - name: Le site existe sur le serveur
         if: steps.cfg.outputs.configured == 'true'
         run: |
           set -euo pipefail
-          ssh "$USER@$HOST" "test -f '$SITES_DIR/$SITE_DIR/app.infos'" \
-            || { echo "$SITES_DIR/$SITE_DIR doit contenir un app.infos (voir l'en-tête de ce fichier)" >&2; exit 1; }
+          ssh "$USER@$HOST" "test -d '$SITES_DIR/$SITE_DIR'" \
+            || { echo "$SITES_DIR/$SITE_DIR n'existe pas : le créer à la main (voir l'en-tête de ce fichier)" >&2; exit 1; }
 
       # --delete-delay : ce qui quitte le dépôt quitte le serveur. Les exclusions
-      # protègent ce qui appartient au serveur — un .env éventuel et les fichiers
-      # du proxy (app.infos, restart.txt) — plus ce qui n'a rien à y faire :
+      # protègent ce qui appartient au serveur — un .env éventuel et le
+      # déclencheur du proxy (restart.txt) — plus ce qui n'a rien à y faire :
       # node_modules (entrée de build, 200 Mo inutiles là-bas), les specs et les
       # notes pour agents. config.toml, run/ et sites/ sont des artefacts root
       # qu'un passage du proxy peut laisser dans le dossier du site : exclus
@@ -246,7 +248,6 @@ jobs:
             --exclude='node_modules/' \
             --exclude='.env' \
             --exclude='.env.*' \
-            --exclude='app.infos' \
             --exclude='restart.txt' \
             --exclude='tmp/' \
             --exclude='coverage/' \
