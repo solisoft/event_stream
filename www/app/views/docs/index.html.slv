@@ -1,175 +1,69 @@
-<div class="reveal">
-  <p class="font-mono text-[11px] tracking-[0.28em] uppercase text-indigo-300/80 mb-5">§01 · Overview</p>
-  <h1 class="font-display text-[44px] md:text-[68px] leading-[0.98] tracking-[-0.025em] text-white font-light">
-    A minimal,
-    <span class="font-display italic font-light text-indigo-200/90 [font-feature-settings:'ss01']">crash-safe</span><br>
-    event log,
-    written
-    <span class="font-display italic font-light text-indigo-200/90">from scratch</span>
-    in Rust.
-  </h1>
-</div>
-
-<p class="reveal d1 mt-8 text-[18px] leading-[1.7] text-slate-300 max-w-[58ch] font-light">
-  <span class="font-display italic text-slate-200">es</span> is a Kafka-shaped event-streaming broker built entirely in Rust — one binary for the broker, one for the CLI, append-only segment files on disk. No Kafka libraries, no ZooKeeper, no broker dependency. Production-hardened: TLS, auth, Raft consensus, schema registry, tiered storage, CI pipeline.
+<h1>Overview</h1>
+<p class="lede">
+  es is an event-streaming broker written in Rust. It stores records in append-only, partitioned topics,
+  hands each one an offset, and lets consumers read from any offset or resume through a consumer group.
+  It runs as a single binary, alone or as a Raft cluster.
 </p>
 
-<div class="reveal d2 mt-10 grid grid-cols-2 lg:grid-cols-5 gap-3 text-[12.5px]">
-  <div class="px-4 py-3 rounded-lg bg-white/[0.03] ring-1 ring-white/[0.06]">
-    <p class="font-mono text-[10px] tracking-[0.18em] uppercase text-indigo-300/70 mb-1.5">Lang</p>
-    <p class="text-slate-200 font-display text-[17px] tracking-tight">Rust 1.95</p>
-  </div>
-  <div class="px-4 py-3 rounded-lg bg-white/[0.03] ring-1 ring-white/[0.06]">
-    <p class="font-mono text-[10px] tracking-[0.18em] uppercase text-indigo-300/70 mb-1.5">Wire</p>
-    <p class="text-slate-200 font-display text-[17px] tracking-tight">HTTP + binary</p>
-  </div>
-  <div class="px-4 py-3 rounded-lg bg-white/[0.03] ring-1 ring-white/[0.06]">
-    <p class="font-mono text-[10px] tracking-[0.18em] uppercase text-indigo-300/70 mb-1.5">Storage</p>
-    <p class="text-slate-200 font-display text-[17px] tracking-tight">Segmented log</p>
-  </div>
-  <a href="<%= docs_storage_path() %>#throughput" class="px-4 py-3 rounded-lg bg-indigo-500/[0.06] ring-1 ring-indigo-400/20 hover:ring-indigo-400/45 transition">
-    <p class="font-mono text-[10px] tracking-[0.18em] uppercase text-indigo-300/85 mb-1.5">Throughput →</p>
-    <p class="text-slate-100 font-display text-[17px] tracking-tight">111 k rec/s</p>
-  </a>
-  <div class="px-4 py-3 rounded-lg bg-white/[0.03] ring-1 ring-white/[0.06]">
-    <p class="font-mono text-[10px] tracking-[0.18em] uppercase text-indigo-300/70 mb-1.5">Tests</p>
-    <p class="text-slate-200 font-display text-[17px] tracking-tight">71 passing</p>
-  </div>
-</div>
+<h2>The model</h2>
+<p>
+  If you have used Kafka, you already know it. A <strong>topic</strong> is split into <strong>partitions</strong>.
+  Each partition is an ordered log: a record appended to it gets the next <strong>offset</strong>, and the order
+  never changes afterwards. Producers choose a partition explicitly or let the broker pick one from the record's key,
+  so records with the same key stay in order. Consumers read a partition from any offset; a
+  <strong>consumer group</strong> stores how far it has read, so a restarted consumer resumes where it stopped.
+</p>
 
-<div class="rule-x my-16"></div>
+<h2>What it does</h2>
+<table>
+  <thead>
+    <tr><th>Area</th><th>What you get</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Storage</td><td>CRC-checked segment files with a sparse index. Nothing is acknowledged before it is fsynced, one fsync per request shared between concurrent requests. Crash recovery trims a torn tail and leaves every other segment alone.</td></tr>
+    <tr><td>Cleanup</td><td>Retention by age or size, key compaction with tombstones, and tiered storage that moves expired segments to a cold directory instead of deleting them.</td></tr>
+    <tr><td>Clients</td><td>An HTTP and JSON API for everything, a binary protocol with pipelining and gzip for the hot path, and the <code>es</code> CLI.</td></tr>
+    <tr><td>Delivery</td><td>Consumer groups with explicit commits, a coordinator with sticky partition assignment, and idempotent producers whose retries are written once.</td></tr>
+    <tr><td>Replication</td><td>Raft per partition: leader election, batched replication, snapshot transfer to late replicas, and a mutually authenticated transport between brokers.</td></tr>
+    <tr><td>Security</td><td>TLS, API keys with grants by topic prefix, per-key byte-rate quotas, and groups and producer ids owned by the key that created them.</td></tr>
+    <tr><td>Operations</td><td>Health and readiness endpoints, Prometheus metrics, a schema registry, offline dump and restore, and graceful shutdown.</td></tr>
+  </tbody>
+</table>
 
-<div class="reveal d3">
-  <h2><span class="num">§</span>What you get</h2>
-  <div class="grid grid-cols-1 md:grid-cols-2 gap-px bg-white/[0.05] rounded-2xl overflow-hidden mt-6">
-    <div class="p-6 bg-slate-950/40 hover:bg-white/[0.02] transition">
-      <div class="flex items-center gap-2 mb-3">
-        <span class="font-mono text-[10px] tracking-[0.2em] uppercase text-emerald-300/85">P / C</span>
-      </div>
-      <p class="font-display text-[20px] text-white tracking-tight mb-1.5">Producer + consumer</p>
-      <p class="text-[13.5px] text-slate-400 leading-relaxed">HTTP/JSON endpoints. Records carry key, value, timestamp, and offset. Binary protocol for high-throughput workloads with gzip handshake and pipelining.</p>
-    </div>
-    <div class="p-6 bg-slate-950/40 hover:bg-white/[0.02] transition">
-      <div class="flex items-center gap-2 mb-3">
-        <span class="font-mono text-[10px] tracking-[0.2em] uppercase text-indigo-300/85">TOPIC</span>
-      </div>
-      <p class="font-display text-[20px] text-white tracking-tight mb-1.5">Topics &amp; partitions</p>
-      <p class="text-[13.5px] text-slate-400 leading-relaxed">Per-topic partition count. FNV-1a key-hash routing. Configurable retention (time/size), compaction, segment sizing.</p>
-    </div>
-    <div class="p-6 bg-slate-950/40 hover:bg-white/[0.02] transition">
-      <div class="flex items-center gap-2 mb-3">
-        <span class="font-mono text-[10px] tracking-[0.2em] uppercase text-amber-300/85">GROUP</span>
-      </div>
-      <p class="font-display text-[20px] text-white tracking-tight mb-1.5">Consumer groups</p>
-      <p class="text-[13.5px] text-slate-400 leading-relaxed">Explicit offset commits, stored as atomic-rename JSON. Coordinator with join/heartbeat/leave, sticky partition assignment, and timeout-based eviction.</p>
-    </div>
-    <div class="p-6 bg-slate-950/40 hover:bg-white/[0.02] transition">
-      <div class="flex items-center gap-2 mb-3">
-        <span class="font-mono text-[10px] tracking-[0.2em] uppercase text-rose-300/85">SAFE</span>
-      </div>
-      <p class="font-display text-[20px] text-white tracking-tight mb-1.5">Crash-safe storage</p>
-      <p class="text-[13.5px] text-slate-400 leading-relaxed">Every record is CRC32-framed. Torn writes detected and truncated on boot. Atomic file writes. Configurable fsync policy.</p>
-    </div>
-    <div class="p-6 bg-slate-950/40 hover:bg-white/[0.02] transition">
-      <div class="flex items-center gap-2 mb-3">
-        <span class="font-mono text-[10px] tracking-[0.2em] uppercase text-purple-300/85">RAFT</span>
-      </div>
-      <p class="font-display text-[20px] text-white tracking-tight mb-1.5">Raft consensus</p>
-      <p class="text-[13.5px] text-slate-400 leading-relaxed">Leader election, log replication, InstallSnapshot RPC, membership changes. RaftPartition integrates consensus directly into the partition write path with TCP transport between brokers.</p>
-    </div>
-    <div class="p-6 bg-slate-950/40 hover:bg-white/[0.02] transition">
-      <div class="flex items-center gap-2 mb-3">
-        <span class="font-mono text-[10px] tracking-[0.2em] uppercase text-teal-300/85">SEC</span>
-      </div>
-      <p class="font-display text-[20px] text-white tracking-tight mb-1.5">Security + ops</p>
-      <p class="text-[13.5px] text-slate-400 leading-relaxed">TLS, bearer-token auth, ACL grammar, per-key rate limiting. /healthz, /readyz, /metrics (Prometheus). SIGTERM graceful shutdown. CORS + body limits + panic recovery.</p>
-    </div>
-    <div class="p-6 bg-slate-950/40 hover:bg-white/[0.02] transition">
-      <div class="flex items-center gap-2 mb-3">
-        <span class="font-mono text-[10px] tracking-[0.2em] uppercase text-cyan-300/85">SCHEMA</span>
-      </div>
-      <p class="font-display text-[20px] text-white tracking-tight mb-1.5">Schema registry</p>
-      <p class="text-[13.5px] text-slate-400 leading-relaxed">Register JSON Schemas by subject. Backward-compatibility enforcement on upgrade. Fetch by ID or latest version per subject. Admin-level access control.</p>
-    </div>
-    <div class="p-6 bg-slate-950/40 hover:bg-white/[0.02] transition">
-      <div class="flex items-center gap-2 mb-3">
-        <span class="font-mono text-[10px] tracking-[0.2em] uppercase text-orange-300/85">TIER</span>
-      </div>
-      <p class="font-display text-[20px] text-white tracking-tight mb-1.5">Tiered storage</p>
-      <p class="text-[13.5px] text-slate-400 leading-relaxed">Sealed segments offloaded to cold storage on retention. Pluggable <code>TieredStore</code> trait. Local filesystem backend included; S3/GCS via the trait.</p>
-    </div>
-  </div>
-</div>
-
-<h2 class="mt-12"><span class="num">§</span>What <em>isn't</em> here</h2>
-<p>Deliberate omissions — Kafka features that don't fit a single-broker, read-in-an-afternoon design:</p>
+<h2>What it does not do</h2>
+<p>These Kafka features are deliberately left out:</p>
 <ul>
-  <li><strong>Cross-partition transactions</strong> — requires transaction coordinator, epochs, fencing</li>
-  <li><strong>Linearizable reads</strong> — needs read-index or leases; at-least-once is the standard for event streams</li>
-  <li><strong>S3/GCS tiered storage backend</strong> — <code>TieredStore</code> trait is pluggable; local backend shipped</li>
-  <li><strong>Consumer offset internal topic</strong> (<code>__consumer_offsets</code>) — file-based atomic writes instead</li>
-  <li><strong>Disk compression</strong> — segments stored uncompressed; gzip available at the protocol layer</li>
-  <li><strong>Message headers</strong> — records carry key + value only</li>
+  <li><strong>Transactions across partitions.</strong> They need a coordinator, epochs and fencing.</li>
+  <li><strong>Linearizable reads.</strong> A replica serves what it has applied; delivery is at least once.</li>
+  <li><strong>Record headers.</strong> A record carries a key, a value and a timestamp.</li>
+  <li><strong>Compression on disk.</strong> Segments are stored as written; gzip is available on the binary protocol.</li>
+  <li><strong>Object-store tiering.</strong> The cold-storage interface is pluggable, but only the local-directory backend ships.</li>
 </ul>
 
-<div class="flex items-start gap-3 p-4 rounded-xl bg-emerald-400/[0.06] ring-1 ring-emerald-400/20 mt-6">
-  <span class="font-mono text-[10px] tracking-[0.2em] uppercase text-emerald-300 mt-0.5">Shipped</span>
-  <p class="text-[13.5px] leading-relaxed text-slate-200">
-    CRC-framed segmented log, time/size retention + log compaction, topic deletion, Prometheus /metrics (14 series), TLS, bearer-token auth + ACLs + per-key rate limits, idempotent producer, binary protocol with gzip + pipelining, zero-copy consume encoding, <strong>Raft consensus</strong> (leader election, log replication, InstallSnapshot, membership changes), <strong>RaftPartition</strong> with TCP transport + multi-node replication, consumer-group coordinator with sticky assignment, /healthz + /readyz, SIGTERM + drain shutdown, CORS + body limits + panic recovery, <strong>schema registry</strong> with backward-compatibility + CLI, <strong>tiered storage</strong> with cold offload + admin API + CLI, <strong>CI pipeline</strong> (fmt, clippy, test, cargo-deny, cross-compile, Docker).
-  </p>
-</div>
-
-<h2><span class="num">§</span>Workspace at a glance</h2>
-<div class="codeblock">
-  <div class="codeblock-bar">
-    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
-    <span class="label">tree</span>
-    <span class="lang">layout</span>
-  </div>
+<h2>The workspace</h2>
+<figure class="code">
+  <figcaption><span>Repository layout</span></figcaption>
 <pre><span class="c-em">es/</span>
-├── <span class="c-fn">Cargo.toml</span>           <span class="c-com"># workspace</span>
-├── <span class="c-fn">Makefile</span>             <span class="c-com"># build · run-broker · demo · test · lint · fmt · audit · clean</span>
-├── <span class="c-fn">.github/workflows/</span>   <span class="c-com"># CI: fmt, clippy, test, cargo-deny</span>
-├── scripts/
-│   └── <span class="c-fn">demo.sh</span>          <span class="c-com"># end-to-end smoke run</span>
+├── Cargo.toml             <span class="c-com"># workspace</span>
+├── Makefile               <span class="c-com"># build, run-broker, demo, test, lint, audit</span>
+├── scripts/demo.sh        <span class="c-com"># end-to-end run, ends with DEMO OK</span>
 ├── crates/
-│   ├── <span class="c-key">es-protocol</span>      <span class="c-com"># serde DTOs + binary wire format</span>
-│   ├── <span class="c-key">es-broker</span>        <span class="c-com"># broker engine (30 files, ~10k lines)</span>
-│   │   ├── src/
-│   │   │   ├── <span class="c-fn">raft/</span>       <span class="c-com"># Raft consensus (leader election, log, snapshots, transport)</span>
-│   │   │   ├── <span class="c-fn">storage/</span>    <span class="c-com"># segment log, CRC records, sparse index, recovery</span>
-│   │   │   ├── <span class="c-fn">schema.rs</span>   <span class="c-com"># schema registry + compatibility checks</span>
-│   │   │   ├── <span class="c-fn">tiered_storage.rs</span> <span class="c-com"># cold storage offload trait + local backend</span>
-│   │   │   └── <span class="c-fn">http/</span>       <span class="c-com"># axum router + handlers (13 endpoints)</span>
-│   │   └── tests/         <span class="c-com"># 71 integration tests</span>
-│   └── <span class="c-key">es-cli</span>           <span class="c-com"># the `es` binary (reqwest wrapper)</span>
-└── data/                  <span class="c-com"># runtime, gitignored</span>
-    ├── topics/&lt;name&gt;/&lt;partition&gt;/*.{log,index}
+│   ├── <span class="c-key">es-broker</span>          <span class="c-com"># the broker: storage, HTTP, binary protocol, Raft</span>
+│   ├── <span class="c-key">es-protocol</span>        <span class="c-com"># request and response types, binary wire format</span>
+│   ├── <span class="c-key">es-cli</span>             <span class="c-com"># the es command</span>
+│   └── <span class="c-key">es-tools</span>           <span class="c-com"># offline dump and restore</span>
+└── data/                  <span class="c-com"># created at runtime</span>
+    ├── topics/&lt;topic&gt;/&lt;partition&gt;/*.log, *.index
     ├── groups/&lt;group&gt;.json
-    ├── schemas.json
-    └── api_keys.json</pre>
-</div>
+    ├── raft/&lt;topic&gt;/      <span class="c-com"># only on cluster members</span>
+    └── api_keys.json      <span class="c-com"># only with --auth required</span></pre>
+</figure>
 
-<h2><span class="num">§</span>Pick a direction</h2>
-<div class="grid grid-cols-1 sm:grid-cols-3 gap-3 mt-2">
-  <a href="<%= docs_demo_path() %>" class="group block p-5 rounded-xl bg-gradient-to-br from-indigo-500/[0.10] to-transparent ring-1 ring-indigo-400/20 hover:ring-indigo-400/50 transition">
-    <p class="font-mono text-[10px] tracking-[0.2em] uppercase text-indigo-300/85 mb-2">§02</p>
-    <p class="font-display text-[19px] tracking-tight text-white">Run the demo →</p>
-    <p class="text-[12.5px] text-slate-400 mt-1">From source to a working broker in one command.</p>
-  </a>
-  <a href="<%= docs_api_path() %>" class="group block p-5 rounded-xl bg-white/[0.03] ring-1 ring-white/[0.08] hover:bg-white/[0.05] hover:ring-white/20 transition">
-    <p class="font-mono text-[10px] tracking-[0.2em] uppercase text-slate-400 mb-2">§03</p>
-    <p class="font-display text-[19px] tracking-tight text-white">HTTP API →</p>
-    <p class="text-[12.5px] text-slate-400 mt-1">30 endpoints: topics, produce, consume, groups, schemas, admin.</p>
-  </a>
-  <a href="<%= docs_cli_path() %>" class="group block p-5 rounded-xl bg-white/[0.03] ring-1 ring-white/[0.08] hover:bg-white/[0.05] hover:ring-white/20 transition">
-    <p class="font-mono text-[10px] tracking-[0.2em] uppercase text-slate-400 mb-2">§04</p>
-    <p class="font-display text-[19px] tracking-tight text-white">CLI →</p>
-    <p class="text-[12.5px] text-slate-400 mt-1">`es` binary: topic, produce, consume, group, key, schema, tiered.</p>
-  </a>
-  <a href="<%= docs_storage_path() %>" class="group block p-5 rounded-xl bg-white/[0.03] ring-1 ring-white/[0.08] hover:bg-white/[0.05] hover:ring-white/20 transition">
-    <p class="font-mono text-[10px] tracking-[0.2em] uppercase text-slate-400 mb-2">§05</p>
-    <p class="font-display text-[19px] tracking-tight text-white">Storage format →</p>
-    <p class="text-[12.5px] text-slate-400 mt-1">Records, segments, indexes, recovery.</p>
-  </a>
-</div>
+<h2>Where to go next</h2>
+<ul>
+  <li><a href="<%= docs_demo_path() %>">Quickstart</a> takes you from source to a running broker and a consumer group in a few minutes.</li>
+  <li><a href="<%= docs_api_path() %>">HTTP and binary API</a> lists every endpoint, the binary frames, auth and limits.</li>
+  <li><a href="<%= docs_cli_path() %>">CLI and broker flags</a> covers the <code>es</code> command and every <code>es-broker</code> option.</li>
+  <li><a href="<%= docs_storage_path() %>">How storage works</a> explains segments, durability, recovery and the benchmark.</li>
+  <li><a href="<%= docs_cluster_path() %>">Clustering with Raft</a> sets up a three-node cluster and explains replication.</li>
+</ul>

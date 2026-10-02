@@ -1,0 +1,25 @@
+<footer class="site-footer">
+  <div class="wrap">
+    <div>
+      <a class="wordmark" href="<%= root_path() %>"><span class="wordmark-mark" aria-hidden="true"><i></i><i></i><i></i></span>es</a>
+      <p class="mt-3 max-w-[44ch]">An event-streaming broker in one Rust binary. MIT licensed. These pages are served by a small Soli app.</p>
+    </div>
+    <nav aria-label="Documentation">
+      <h2>Learn</h2>
+      <ul>
+        <li><a href="<%= docs_path() %>">Overview</a></li>
+        <li><a href="<%= docs_demo_path() %>">Quickstart</a></li>
+        <li><a href="<%= docs_storage_path() %>">How storage works</a></li>
+        <li><a href="<%= docs_cluster_path() %>">Clustering with Raft</a></li>
+      </ul>
+    </nav>
+    <nav aria-label="Reference">
+      <h2>Reference</h2>
+      <ul>
+        <li><a href="<%= docs_api_path() %>">HTTP and binary API</a></li>
+        <li><a href="<%= docs_cli_path() %>">CLI and broker flags</a></li>
+        <li><a href="<%= docs_tools_path() %>">Backup and restore</a></li>
+      </ul>
+    </nav>
+  </div>
+</footer>

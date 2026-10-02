@@ -1,0 +1,15 @@
+<a class="skip" href="#main">Skip to content</a>
+<header class="site-header">
+  <div class="wrap">
+    <a class="wordmark" href="<%= root_path() %>" aria-label="es home">
+      <span class="wordmark-mark" aria-hidden="true"><i></i><i></i><i></i></span>es
+    </a>
+    <nav class="site-nav" aria-label="Main">
+      <a href="<%= docs_path() %>" <% if current == "docs" %>aria-current="page"<% end %>>Docs</a>
+      <a href="<%= docs_demo_path() %>" <% if current == "demo" %>aria-current="page"<% end %>>Quickstart</a>
+      <a href="<%= docs_api_path() %>" <% if current == "api" %>aria-current="page"<% end %>>HTTP API</a>
+      <a href="<%= docs_cluster_path() %>" <% if current == "cluster" %>aria-current="page"<% end %>>Clustering</a>
+    </nav>
+    <span class="version">v0.2.0</span>
+  </div>
+</header>

@@ -1,121 +1,78 @@
-<div class="reveal">
-  <p class="font-mono text-[11px] tracking-[0.28em] uppercase text-indigo-300/80 mb-5">§02 · Quickstart</p>
-  <h1 class="font-display text-[42px] md:text-[62px] leading-[1.0] tracking-[-0.025em] text-white font-light">
-    From source to a
-    <span class="font-display italic text-indigo-200/90 font-light">working broker</span>
-    in one command.
-  </h1>
-</div>
-
-<p class="reveal d1 mt-7 text-[17px] leading-[1.7] text-slate-300 max-w-[58ch] font-light">
-  The demo script builds the workspace, boots the broker with a deliberately tiny segment size so log rolls are visible, produces 200&nbsp;records into a two-partition topic, consumes through a consumer group, restarts the broker mid-stream, and verifies that the offsets survived.
+<h1>Quickstart</h1>
+<p class="lede">
+  Build es from source, start a broker on your machine, and write and read records with the CLI.
+  Or let one command do all of it, including a restart, retention and compaction.
 </p>
 
-<div class="reveal d2 mt-8 codeblock">
-  <div class="codeblock-bar">
-    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
-    <span class="label">bash</span>
-    <span class="lang">one-shot</span>
-  </div>
-<pre><span class="c-fn">$</span> make demo</pre>
-</div>
-
-<p class="text-[13.5px] text-slate-400 -mt-3 mb-2"><em>Equivalent to <code>bash scripts/demo.sh</code>.</em> The script ends with <code class="text-emerald-300">DEMO OK</code> on success.</p>
-
-<div class="rule-x my-14"></div>
-
-<h2><span class="num">§</span>Prerequisites</h2>
+<h2>Before you start</h2>
 <ul>
-  <li><strong>Rust 1.75+</strong> (this project is developed on 1.95).</li>
-  <li>A free TCP port — default <code>127.0.0.1:9876</code>; override with <code>ES_PORT</code>.</li>
-  <li>Optional: <code>curl</code> if you want to poke the API by hand.</li>
+  <li>A Rust toolchain. The repository pins the version in <code>rust-toolchain.toml</code>; <code>rustup</code> installs it on first build.</li>
+  <li>A free port on localhost. The examples use <code>9000</code>; the demo script uses <code>9876</code> (change it with <code>ES_PORT</code>).</li>
 </ul>
 
-<h2><span class="num">§</span>What the script actually does</h2>
-<div class="mt-6 space-y-4">
-  <div class="flex items-start gap-4">
-    <span class="shrink-0 w-7 h-7 rounded-md bg-white/[0.05] ring-1 ring-white/[0.1] flex items-center justify-center font-mono text-[11px] text-indigo-200">01</span>
-    <div>
-      <p class="font-display text-[17px] text-white tracking-tight">Reset</p>
-      <p class="text-[14px] text-slate-400">Wipes <code>./data</code> so the run is reproducible.</p>
-    </div>
-  </div>
-  <div class="flex items-start gap-4">
-    <span class="shrink-0 w-7 h-7 rounded-md bg-white/[0.05] ring-1 ring-white/[0.1] flex items-center justify-center font-mono text-[11px] text-indigo-200">02</span>
-    <div>
-      <p class="font-display text-[17px] text-white tracking-tight">Build</p>
-      <p class="text-[14px] text-slate-400">Compiles the workspace in release mode.</p>
-    </div>
-  </div>
-  <div class="flex items-start gap-4">
-    <span class="shrink-0 w-7 h-7 rounded-md bg-white/[0.05] ring-1 ring-white/[0.1] flex items-center justify-center font-mono text-[11px] text-indigo-200">03</span>
-    <div>
-      <p class="font-display text-[17px] text-white tracking-tight">Boot the broker</p>
-      <p class="text-[14px] text-slate-400">Starts <code>es-broker</code> in the background with <code>--segment-bytes 1024</code>, then polls <code>/healthz</code> until it's ready.</p>
-    </div>
-  </div>
-  <div class="flex items-start gap-4">
-    <span class="shrink-0 w-7 h-7 rounded-md bg-white/[0.05] ring-1 ring-white/[0.1] flex items-center justify-center font-mono text-[11px] text-indigo-200">04</span>
-    <div>
-      <p class="font-display text-[17px] text-white tracking-tight">Produce 200 records</p>
-      <p class="text-[14px] text-slate-400">Creates topic <code>orders</code> with two partitions, then writes <code>v0…v199</code>. The tiny segment size guarantees multiple log rolls per partition.</p>
-    </div>
-  </div>
-  <div class="flex items-start gap-4">
-    <span class="shrink-0 w-7 h-7 rounded-md bg-white/[0.05] ring-1 ring-white/[0.1] flex items-center justify-center font-mono text-[11px] text-indigo-200">05</span>
-    <div>
-      <p class="font-display text-[17px] text-white tracking-tight">Consume + commit + restart</p>
-      <p class="text-[14px] text-slate-400">Reads 5 records as group <code>analytics</code>, commits offset 5, kills the broker, restarts it, confirms the offset survived, then resumes from 5.</p>
-    </div>
-  </div>
-</div>
+<h2>Run the demo</h2>
+<figure class="code">
+  <figcaption><span>shell</span></figcaption>
+<pre>make demo</pre>
+</figure>
+<p>The script runs these steps and stops at the first failure. It ends with <code>DEMO OK</code>.</p>
+<ol class="steps">
+  <li><p><strong>Reset.</strong> Deletes <code>./data</code> so every run starts the same way.</p></li>
+  <li><p><strong>Build.</strong> Compiles the workspace in release mode.</p></li>
+  <li><p><strong>Start the broker</strong> with <code>--segment-bytes 1024</code>, a deliberately tiny segment size, and waits for <code>/healthz</code>.</p></li>
+  <li><p><strong>Produce 200 records</strong> into <code>orders</code>, two partitions. The small segments make several rolls per partition visible in <code>es topic describe</code>.</p></li>
+  <li><p><strong>Consume through a group.</strong> Group <code>analytics</code> reads five records and commits offset 5.</p></li>
+  <li><p><strong>Restart.</strong> Stops the broker, starts it again, and checks the group resumes at offset 5.</p></li>
+  <li><p><strong>Retention and compaction.</strong> A topic with a 1.5-second retention loses its old segments; a compacted topic keeps only the latest value per key.</p></li>
+</ol>
 
-<h2><span class="num">§</span>Driving it manually</h2>
-<p>Two terminals — broker on one side, CLI on the other:</p>
-
-<div class="codeblock">
-  <div class="codeblock-bar">
-    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
-    <span class="label">terminal 1</span>
-    <span class="lang">broker</span>
-  </div>
-<pre><span class="c-fn">$</span> cargo build <span class="c-key">--release</span>
-<span class="c-fn">$</span> ./target/release/es-broker <span class="c-key">\</span>
-    <span class="c-key">--data-dir</span> ./data <span class="c-key">\</span>
-    <span class="c-key">--bind</span> <span class="c-str">127.0.0.1:9876</span> <span class="c-key">\</span>
-    <span class="c-key">--segment-bytes</span> <span class="c-num">1024</span></pre>
-</div>
-
-<div class="codeblock">
-  <div class="codeblock-bar">
-    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
-    <span class="label">terminal 2</span>
-    <span class="lang">cli</span>
-  </div>
-<pre><span class="c-fn">$</span> <span class="c-key">export</span> ES_BROKER=<span class="c-str">http://127.0.0.1:9876</span>
-<span class="c-fn">$</span> es topic create <span class="c-key">--name</span> orders <span class="c-key">--partitions</span> <span class="c-num">2</span>
-<span class="c-fn">$</span> es produce <span class="c-key">--topic</span> orders <span class="c-key">--key</span> k1 <span class="c-key">--value</span> <span class="c-str">'{"id":1}'</span>
-<span class="c-fn">$</span> es consume <span class="c-key">--topic</span> orders <span class="c-key">--partition</span> <span class="c-num">0</span> <span class="c-key">--offset</span> <span class="c-num">0</span></pre>
-</div>
-
-<h2><span class="num">§</span>The test suite</h2>
+<h2>Run it by hand</h2>
+<p>Start a broker in one terminal:</p>
+<figure class="code">
+  <figcaption><span>terminal 1</span></figcaption>
+<pre>cargo build --release
+./target/release/es-broker \
+  --data-dir ./data \
+  --bind 127.0.0.1:9000</pre>
+</figure>
+<p>Then create a topic, write a record and read it back in another:</p>
+<figure class="code">
+  <figcaption><span>terminal 2</span></figcaption>
+<pre><span class="c-key">export</span> ES_BROKER=http://127.0.0.1:9000
+./target/release/es topic create --name orders --partitions 2
+./target/release/es produce --topic orders --key k1 --value <span class="c-str">'{"id":1}'</span>
+./target/release/es consume --topic orders --partition 0 --offset 0</pre>
+</figure>
 <p>
-  The in-process integration tests at <code>crates/es-broker/tests/end_to_end.rs</code> spawn the broker on an ephemeral port (<code>127.0.0.1:0</code>) and drive it via <code>reqwest</code>. They cover segment rolls, group resume, restart-persistence, torn-write recovery, and stable key routing.
+  The record lands on the partition its key hashes to, so with two partitions it may be in partition 1.
+  <code>es topic describe --name orders</code> shows each partition's end offset.
 </p>
 
-<div class="codeblock">
-  <div class="codeblock-bar">
-    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
-    <span class="label">tests</span>
-    <span class="lang">cargo</span>
-  </div>
-<pre><span class="c-fn">$</span> cargo test <span class="c-key">--workspace</span>
-<span class="c-com">test storage::record::tests::roundtrip_with_key       ...</span> <span class="c-add">ok</span>
-<span class="c-com">test storage::record::tests::detects_corruption       ...</span> <span class="c-add">ok</span>
-<span class="c-com">test produce_then_consume_with_segment_rolls          ...</span> <span class="c-add">ok</span>
-<span class="c-com">test group_resume_and_restart_persistence             ...</span> <span class="c-add">ok</span>
-<span class="c-com">test recovers_from_torn_write                         ...</span> <span class="c-add">ok</span>
-<span class="c-com">test key_routing_is_stable                            ...</span> <span class="c-add">ok</span>
+<aside class="note warn">
+  <p>Authentication is off in these examples</p>
+  <p>
+    Without <code>--auth required</code> every caller is an admin. The broker therefore refuses to start that way on
+    anything but a loopback address. Before exposing it, read <a href="<%= docs_api_path() %>#authentication">Authentication</a>.
+  </p>
+</aside>
 
-<span class="c-em">test result:</span> <span class="c-add">ok.</span> 11 passed; 0 failed</pre>
-</div>
+<h2>Call the HTTP API directly</h2>
+<p>Everything the CLI does is a plain HTTP call:</p>
+<figure class="code">
+  <figcaption><span>shell</span></figcaption>
+<pre>curl -s -X POST localhost:9000/topics/orders/produce \
+  -H <span class="c-str">'content-type: application/json'</span> \
+  -d <span class="c-str">'{"records":[{"key":"k2","value":"hello"}]}'</span>
+
+curl -s <span class="c-str">'localhost:9000/topics/orders/consume?partition=0&amp;offset=0'</span></pre>
+</figure>
+
+<h2>Run the tests</h2>
+<p>
+  The suite boots real brokers on ephemeral ports and drives them over HTTP, the binary protocol and the Raft transport:
+  durability and recovery, retention and compaction, auth and quotas, consumer groups, replication and snapshot catch-up.
+</p>
+<figure class="code">
+  <figcaption><span>shell</span></figcaption>
+<pre>cargo test --workspace</pre>
+</figure>
