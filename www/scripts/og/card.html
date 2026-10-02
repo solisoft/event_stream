@@ -1,0 +1,99 @@
+<!doctype html>
+<!--
+  Template for the Open Graph images in public/og/. Not served: build.sh opens
+  it in headless Chromium with ?kicker=…&title=…&desc=…&seed=… and saves a
+  1200×630 screenshot.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@600;700&family=IBM+Plex+Sans:wght@400;500&display=block">
+<style>
+  :root {
+    --paper: #F3F4F1; --surface: #FFFFFF; --ink: #141821; --graphite: #4B5361;
+    --rule: #D9DCD7; --cobalt: #2340D8; --cobalt-soft: #E4E8FB; --commit: #17845A;
+    --f-display: "IBM Plex Sans Condensed", "Arial Narrow", sans-serif;
+    --f-sans: "IBM Plex Sans", system-ui, sans-serif;
+    --f-mono: "IBM Plex Mono", ui-monospace, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { width: 1200px; height: 630px; overflow: hidden; }
+  body {
+    background: var(--paper); color: var(--ink); font-family: var(--f-sans);
+    display: grid; grid-template-rows: auto 1fr auto; padding: 52px 72px 0;
+  }
+
+  .top { display: flex; align-items: center; justify-content: space-between; }
+  .wordmark { display: flex; align-items: center; gap: 14px; font-family: var(--f-display); font-weight: 700; font-size: 46px; letter-spacing: -0.01em; line-height: 1; }
+  .mark { display: flex; gap: 5px; }
+  .mark i { display: block; width: 9px; height: 30px; background: var(--ink); }
+  .mark i:last-child { background: var(--cobalt); }
+  .host { font-family: var(--f-mono); font-size: 22px; color: var(--graphite); }
+
+  .main { align-self: center; max-width: 1000px; }
+  .kicker { font-size: 26px; font-weight: 500; color: var(--cobalt); margin-bottom: 14px; }
+  .kicker:empty { display: none; }
+  h1 { font-family: var(--f-display); font-weight: 600; font-size: 92px; line-height: .98; letter-spacing: -0.018em; text-wrap: balance; }
+  .desc { margin-top: 22px; font-size: 29px; line-height: 1.35; color: var(--graphite); max-width: 940px; text-wrap: pretty; }
+
+  /* The log from the home page: partitions as lanes, records as cells. */
+  .log { margin: 0 -72px; border-top: 1px solid var(--rule); background: var(--surface); }
+  .lane { display: grid; grid-template-columns: 150px 1fr 80px; align-items: center; gap: 24px; padding: 5px 72px; border-bottom: 1px solid var(--rule); }
+  .lane:last-child { border-bottom: 0; }
+  .name, .offset { font-family: var(--f-mono); font-size: 20px; color: var(--graphite); font-variant-numeric: tabular-nums; }
+  .offset { text-align: right; color: var(--ink); font-weight: 500; }
+  .track { display: flex; justify-content: flex-end; gap: 5px; height: 44px; align-items: center; overflow: hidden;
+    -webkit-mask-image: linear-gradient(to right, transparent, #000 18%); mask-image: linear-gradient(to right, transparent, #000 18%); }
+  .cell { flex: 0 0 18px; height: 30px; background: var(--ink); }
+  .cell.pending { background: var(--cobalt-soft); box-shadow: inset 0 0 0 2px var(--cobalt); }
+  /* The group's committed position: a bar taller than the records, between two of them. */
+  .cell.cursor { position: relative; }
+  .cell.cursor::before { content: ""; position: absolute; left: -5px; top: -7px; bottom: -7px; width: 5px; background: var(--commit); }
+</style>
+</head>
+<body>
+  <div class="top">
+    <div class="wordmark"><span class="mark"><i></i><i></i><i></i></span>es</div>
+    <div class="host">es.solisoft.net</div>
+  </div>
+
+  <div class="main">
+    <p class="kicker" id="kicker"></p>
+    <h1 id="title"></h1>
+    <p class="desc" id="desc"></p>
+  </div>
+
+  <div class="log" id="log"></div>
+
+<script>
+  const q = new URLSearchParams(location.search);
+  document.getElementById("kicker").textContent = q.get("kicker") || "";
+  document.getElementById("title").textContent = q.get("title") || "es";
+  document.getElementById("desc").textContent = q.get("desc") || "";
+
+  // Deterministic per card, so a rebuild changes nothing it was not asked to.
+  let s = Number(q.get("seed") || 1);
+  const rand = () => (s = (s * 16807) % 2147483647) / 2147483647;
+
+  const lanes = [["orders/0", 1204], ["orders/1", 983], ["orders/2", 1117]];
+  const log = document.getElementById("log");
+  lanes.forEach(([name, base], i) => {
+    const offset = base + Math.floor(rand() * 400);
+    const pending = Math.floor(rand() * 3) + (i === 0 ? 2 : 0);
+    const lane = document.createElement("div");
+    lane.className = "lane";
+    let cells = "";
+    for (let c = 46; c >= 1; c--) {
+      let cls = "cell";
+      if (c <= pending) cls += " pending";
+      else if (i === 0 && c === pending + 9) cls += " cursor";
+      cells += `<span class="${cls}"></span>`;
+    }
+    lane.innerHTML = `<span class="name">${name}</span><span class="track">${cells}</span><span class="offset">${offset}</span>`;
+    log.appendChild(lane);
+  });
+</script>
+</body>
+</html>

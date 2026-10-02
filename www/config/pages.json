@@ -1,0 +1,42 @@
+{
+  "home": {
+    "kicker": "",
+    "title": "Events on disk, in order.",
+    "description": "An event-streaming broker in one Rust binary. Durable by default, and it still moves millions of records a second."
+  },
+  "overview": {
+    "kicker": "Docs",
+    "title": "Overview",
+    "description": "Topics, partitions, offsets and consumer groups in one Rust binary, alone or as a Raft cluster."
+  },
+  "demo": {
+    "kicker": "Docs",
+    "title": "Quickstart",
+    "description": "Build es, start a broker on your machine, and write and read your first records."
+  },
+  "api": {
+    "kicker": "Docs",
+    "title": "HTTP and binary API",
+    "description": "Every operation over HTTP and JSON, with produce and consume also over a binary protocol."
+  },
+  "cli": {
+    "kicker": "Docs",
+    "title": "CLI and broker flags",
+    "description": "The es command-line client, and every es-broker flag with its default."
+  },
+  "storage": {
+    "kicker": "Docs",
+    "title": "How storage works",
+    "description": "Segments and CRCs, group commit, crash recovery, retention and compaction."
+  },
+  "cluster": {
+    "kicker": "Docs",
+    "title": "Clustering with Raft",
+    "description": "Three brokers, every partition replicated, each write acknowledged once a majority has it."
+  },
+  "tools": {
+    "kicker": "Docs",
+    "title": "Backup and restore",
+    "description": "Copy a broker's data into one archive and restore it on any machine, checked before anything is replaced."
+  }
+}
