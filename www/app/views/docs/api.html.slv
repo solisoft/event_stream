@@ -354,7 +354,7 @@ X-Es-Key: esk_AbCdEf…</pre>
 <span class="c-dim">400 {"error":"backward-incompatible: new schema adds required field 'phone'"}</span></pre>
 </figure>
 
-<h2>Binary protocol</h2>
+<h2 id="binary-protocol">Binary protocol</h2>
 <p>
   With <code>--bind-binary 127.0.0.1:9001</code> the broker also listens for a length-prefixed binary protocol over a
   long-lived connection. Keys and values travel as raw bytes, with the same keys, grants, quotas and idempotency as HTTP.
