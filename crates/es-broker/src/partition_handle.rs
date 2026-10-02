@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::Result;
 use tokio_util::sync::CancellationToken;
 
-use crate::partition::Partition;
+use crate::partition::{AppendRecord, Durability, Partition};
 use crate::raft::{RaftHub, Timing};
 use crate::raft_partition::{RaftPartition, RaftPartitionConfig, RaftTransportConfig};
 use crate::storage::record::Record;
@@ -92,10 +92,67 @@ impl PartitionHandle {
     }
 
     pub async fn append(&self, key: Option<&[u8]>, value: &[u8]) -> Result<u64> {
-        match self {
-            Self::Plain(p) => p.append(key, value).await,
-            Self::Raft(p) => p.append(key, value).await,
+        let offsets = self
+            .append_batch(vec![AppendRecord::new(
+                key.map(|k| k.to_vec()),
+                value.to_vec(),
+            )])
+            .await?;
+        offsets
+            .first()
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("append returned no offset"))
+    }
+
+    /// Append records in order; returns one offset per record.
+    ///
+    /// A plain partition writes the whole batch with one write per segment and
+    /// at most one fsync, on a blocking thread. A Raft partition proposes the
+    /// batch as a single log entry.
+    pub async fn append_batch(&self, records: Vec<AppendRecord>) -> Result<Vec<u64>> {
+        if records.is_empty() {
+            return Ok(Vec::new());
         }
+        match self {
+            Self::Plain(p) => {
+                let p = p.clone();
+                tokio::task::spawn_blocking(move || p.append_batch(&records, Durability::Policy))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("append task failed: {}", e))?
+            }
+            Self::Raft(p) => p.append_batch(records).await,
+        }
+    }
+
+    /// [`Self::read_records_raw`] on a blocking thread.
+    pub async fn read_raw(
+        &self,
+        target_offset: u64,
+        max_records: usize,
+        max_bytes: usize,
+    ) -> Result<(Vec<Record>, u64, u64)> {
+        let p = self.inner().clone();
+        tokio::task::spawn_blocking(move || {
+            p.read_records_raw(target_offset, max_records, max_bytes)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("read task failed: {}", e))?
+    }
+
+    /// [`Self::read_records`] on a blocking thread.
+    pub async fn read(
+        &self,
+        target_offset: u64,
+        max_records: usize,
+        max_bytes: usize,
+        base64: bool,
+    ) -> Result<(Vec<RecordDto>, u64, u64)> {
+        let p = self.inner().clone();
+        tokio::task::spawn_blocking(move || {
+            p.read_records(target_offset, max_records, max_bytes, base64)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("read task failed: {}", e))?
     }
 
     pub fn read_records_raw(
@@ -117,13 +174,10 @@ impl PartitionHandle {
         target_offset: u64,
         max_records: usize,
         max_bytes: usize,
+        base64: bool,
     ) -> Result<(Vec<RecordDto>, u64, u64)> {
-        match self {
-            Self::Plain(p) => p.read_records(target_offset, max_records, max_bytes),
-            Self::Raft(p) => p
-                .partition()
-                .read_records(target_offset, max_records, max_bytes),
-        }
+        self.inner()
+            .read_records(target_offset, max_records, max_bytes, base64)
     }
 
     pub async fn drop_sealed_segments(

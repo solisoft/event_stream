@@ -23,13 +23,25 @@ use dashmap::DashMap;
 use rand::RngCore;
 use tokio::sync::Mutex;
 
+use crate::auth::ApiKey;
 use crate::broker::Broker;
+use crate::groups::GroupError;
+
+/// Topics one member may subscribe to.
+pub const MAX_TOPICS_PER_MEMBER: usize = 100;
 
 #[derive(Debug, Clone)]
 pub struct Member {
     pub id: String,
     pub topics: Vec<String>,
     pub last_heartbeat: Instant,
+    /// `key_id` that joined this member. Only it may heartbeat, leave, read
+    /// the assignment, or re-join under this id.
+    pub owner: String,
+}
+
+fn member_forbidden(member_id: &str) -> anyhow::Error {
+    GroupError::Forbidden(format!("member '{}' belongs to another key", member_id)).into()
 }
 
 #[derive(Debug, Clone, Default)]
@@ -74,8 +86,9 @@ impl GroupCoordinator {
         &self,
         broker: &Arc<Broker>,
         group: &str,
+        key: &ApiKey,
         member_id: Option<String>,
-        topics: Vec<String>,
+        mut topics: Vec<String>,
     ) -> Result<JoinReply> {
         validate_group_name(group)?;
         let mid = member_id
@@ -83,12 +96,28 @@ impl GroupCoordinator {
             .unwrap_or_else(generate_member_id);
         validate_member_id(&mid)?;
 
+        // A member subscribes to something. An empty list used to pass the
+        // per-topic read check vacuously, so a key with no grants at all could
+        // join any group and take a share of its partitions.
+        if topics.is_empty() {
+            return Err(anyhow!("topics must contain at least one topic"));
+        }
+        topics.sort();
+        topics.dedup();
+        if topics.len() > MAX_TOPICS_PER_MEMBER {
+            return Err(anyhow!(
+                "a member may subscribe to at most {} topics",
+                MAX_TOPICS_PER_MEMBER
+            ));
+        }
         // Validate all subscribed topics exist.
         for t in &topics {
             if broker.topic(t).is_none() {
                 return Err(anyhow!("topic '{}' not found", t));
             }
         }
+        // The group must be this key's (or new, and then it becomes this key's).
+        broker.groups.authorize_or_claim(group, key).await?;
 
         // Cap the number of distinct groups to bound memory. `join` is the only
         // path that creates a group slot.
@@ -107,6 +136,11 @@ impl GroupCoordinator {
             ));
         }
         let now = Instant::now();
+        if let Some(existing) = state.members.get(&mid) {
+            if existing.owner != key.key_id && !key.is_admin() {
+                return Err(member_forbidden(&mid));
+            }
+        }
         let inserted_or_changed = match state.members.get_mut(&mid) {
             Some(existing) => {
                 let changed = existing.topics != topics;
@@ -121,6 +155,7 @@ impl GroupCoordinator {
                         id: mid.clone(),
                         topics: topics.clone(),
                         last_heartbeat: now,
+                        owner: key.key_id.clone(),
                     },
                 );
                 true
@@ -142,6 +177,7 @@ impl GroupCoordinator {
     pub async fn heartbeat(
         &self,
         group: &str,
+        key: &ApiKey,
         member_id: &str,
         generation: u64,
     ) -> Result<HeartbeatReply> {
@@ -157,6 +193,7 @@ impl GroupCoordinator {
             None => Ok(HeartbeatReply::UnknownMember {
                 current_generation: state.generation,
             }),
+            Some(m) if m.owner != key.key_id && !key.is_admin() => Err(member_forbidden(member_id)),
             Some(m) => {
                 m.last_heartbeat = Instant::now();
                 if generation != state.generation {
@@ -172,33 +209,55 @@ impl GroupCoordinator {
         }
     }
 
-    pub async fn leave(&self, broker: &Arc<Broker>, group: &str, member_id: &str) -> Result<()> {
+    pub async fn leave(
+        &self,
+        broker: &Arc<Broker>,
+        group: &str,
+        key: &ApiKey,
+        member_id: &str,
+    ) -> Result<()> {
         let Some(slot) = self.state.get(group).map(|s| s.clone()) else {
             return Ok(());
         };
         let mut state = slot.lock().await;
+        if let Some(m) = state.members.get(member_id) {
+            if m.owner != key.key_id && !key.is_admin() {
+                return Err(member_forbidden(member_id));
+            }
+        }
         if state.members.remove(member_id).is_some() {
             recompute_assignment(broker, &mut state);
         }
         Ok(())
     }
 
-    pub async fn assignment(&self, group: &str, member_id: &str) -> AssignmentReply {
+    pub async fn assignment(
+        &self,
+        group: &str,
+        key: &ApiKey,
+        member_id: &str,
+    ) -> Result<AssignmentReply> {
         let Some(slot) = self.state.get(group).map(|s| s.clone()) else {
-            return AssignmentReply::UnknownMember {
+            return Ok(AssignmentReply::UnknownMember {
                 current_generation: 0,
-            };
+            });
         };
         let state = slot.lock().await;
-        if !state.members.contains_key(member_id) {
-            return AssignmentReply::UnknownMember {
-                current_generation: state.generation,
-            };
+        match state.members.get(member_id) {
+            None => {
+                return Ok(AssignmentReply::UnknownMember {
+                    current_generation: state.generation,
+                })
+            }
+            Some(m) if m.owner != key.key_id && !key.is_admin() => {
+                return Err(member_forbidden(member_id));
+            }
+            Some(_) => {}
         }
-        AssignmentReply::Ok {
+        Ok(AssignmentReply::Ok {
             generation: state.generation,
             assignment: state.assignment.get(member_id).cloned().unwrap_or_default(),
-        }
+        })
     }
 
     /// Sweep expired members across all groups. Each eviction triggers a
@@ -207,7 +266,9 @@ impl GroupCoordinator {
         let now = Instant::now();
         let groups: Vec<String> = self.group_names();
         for g in groups {
-            let slot = self.slot(&g);
+            let Some(slot) = self.state.get(&g).map(|s| s.clone()) else {
+                continue;
+            };
             let mut state = slot.lock().await;
             let stale: Vec<String> = state
                 .members
@@ -378,24 +439,19 @@ fn recompute_assignment(broker: &Arc<Broker>, state: &mut GroupState) {
 /// Upper bound on distinct consumer groups tracked by the coordinator.
 const MAX_GROUPS: usize = 100_000;
 /// Upper bound on members within a single group.
-const MAX_MEMBERS_PER_GROUP: usize = 10_000;
+const MAX_MEMBERS_PER_GROUP: usize = 1_000;
 
-fn validate_group_name(name: &str) -> Result<()> {
-    if name.is_empty() || name.len() > 200 {
-        anyhow::bail!("group name length must be 1..=200");
-    }
-    let ok = name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.');
-    if !ok {
-        anyhow::bail!("group name may only contain ASCII alphanumerics, '_', '-', '.'");
-    }
-    Ok(())
-}
+use crate::groups::validate_group_name;
 
 fn validate_member_id(id: &str) -> Result<()> {
     if id.is_empty() || id.len() > 200 {
         anyhow::bail!("member_id length must be 1..=200");
+    }
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+    {
+        anyhow::bail!("member_id may only contain ASCII alphanumerics, '_', '-', '.'");
     }
     Ok(())
 }

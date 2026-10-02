@@ -1,4 +1,3 @@
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use axum::{
@@ -11,6 +10,8 @@ use es_protocol::ConsumeResponse;
 
 use crate::auth::AclAction;
 use crate::broker::Broker;
+use crate::dataplane::{self, Fetched};
+use crate::partition::records_to_dtos;
 
 use super::auth_ext::AuthedKey;
 use super::error::{AppError, AppResult};
@@ -23,6 +24,11 @@ pub struct ConsumeQuery {
     pub max_records: usize,
     #[serde(default = "default_max_bytes")]
     pub max_bytes: usize,
+    /// `base64` to receive keys and values base64-encoded — the only way to
+    /// read bytes that are not UTF-8 (e.g. produced over the binary protocol)
+    /// without them being replaced.
+    #[serde(default)]
+    pub encoding: Option<String>,
 }
 
 fn default_max_records() -> usize {
@@ -32,52 +38,44 @@ fn default_max_bytes() -> usize {
     1 << 20
 }
 
+fn wants_base64(encoding: Option<&str>) -> AppResult<bool> {
+    match encoding {
+        None | Some("utf8") | Some("utf-8") => Ok(false),
+        Some("base64") => Ok(true),
+        Some(other) => Err(AppError::bad_request(format!(
+            "unknown encoding '{}' (use 'utf8' or 'base64')",
+            other
+        ))),
+    }
+}
+
+fn respond(f: Fetched, partition: u32, base64: bool) -> Json<ConsumeResponse> {
+    Json(ConsumeResponse {
+        records: records_to_dtos(partition, f.records, base64),
+        next_offset: f.next_offset,
+        high_watermark: f.high_watermark,
+        encoding: base64.then(|| "base64".to_string()),
+    })
+}
+
 pub async fn consume(
     State(broker): State<Arc<Broker>>,
     AuthedKey(key): AuthedKey,
     Path(topic_name): Path<String>,
     Query(q): Query<ConsumeQuery>,
 ) -> AppResult<Json<ConsumeResponse>> {
-    if !key.can(AclAction::Read, &topic_name) {
-        return Err(AppError::forbidden(format!(
-            "key '{}' does not have read access to topic '{}'",
-            key.key_id, topic_name
-        )));
-    }
-
-    let topic = broker
-        .topic(&topic_name)
-        .ok_or_else(|| AppError::not_found(format!("topic '{}' not found", topic_name)))?;
-    let partition = topic
-        .partitions
-        .get(q.partition as usize)
-        .ok_or_else(|| AppError::bad_request(format!("partition {} out of range", q.partition)))?;
-
-    let (records, next_offset, high_watermark) =
-        partition.read_records(q.offset, q.max_records, q.max_bytes)?;
-    let consumed_bytes: u64 = records
-        .iter()
-        .map(|r| r.key.as_ref().map(|k| k.len() as u64).unwrap_or(0) + r.value.len() as u64)
-        .sum();
-
-    // Post-charge consume bytes. If this overdrew the bucket, the *next* call
-    // will be rejected — we don't reject this one mid-flight.
-    let _ = broker
-        .keys
-        .check_consume(&key.key_id, consumed_bytes as u32);
-
-    topic
-        .records_consumed_total
-        .fetch_add(records.len() as u64, Ordering::Relaxed);
-    topic
-        .bytes_consumed_total
-        .fetch_add(consumed_bytes, Ordering::Relaxed);
-
-    Ok(Json(ConsumeResponse {
-        records,
-        next_offset,
-        high_watermark,
-    }))
+    let base64 = wants_base64(q.encoding.as_deref())?;
+    let f = dataplane::consume(
+        &broker,
+        &key,
+        &topic_name,
+        q.partition,
+        q.offset,
+        q.max_records,
+        q.max_bytes,
+    )
+    .await?;
+    Ok(respond(f, q.partition, base64))
 }
 
 #[derive(Debug, Deserialize)]
@@ -88,6 +86,8 @@ pub struct GroupConsumeQuery {
     pub max_records: usize,
     #[serde(default = "default_max_bytes")]
     pub max_bytes: usize,
+    #[serde(default)]
+    pub encoding: Option<String>,
 }
 
 pub async fn group_consume(
@@ -96,13 +96,14 @@ pub async fn group_consume(
     Path(group): Path<String>,
     Query(q): Query<GroupConsumeQuery>,
 ) -> AppResult<Json<ConsumeResponse>> {
+    let base64 = wants_base64(q.encoding.as_deref())?;
     if !key.can(AclAction::Read, &q.topic) {
         return Err(AppError::forbidden(format!(
             "key '{}' does not have read access to topic '{}'",
             key.key_id, q.topic
         )));
     }
-
+    broker.groups.check_access(&group, &key).await?;
     let topic = broker
         .topic(&q.topic)
         .ok_or_else(|| AppError::not_found(format!("topic '{}' not found", q.topic)))?;
@@ -110,33 +111,20 @@ pub async fn group_consume(
         .partitions
         .get(q.partition as usize)
         .ok_or_else(|| AppError::bad_request(format!("partition {} out of range", q.partition)))?;
-
     let committed = broker
         .groups
         .fetch(&group, &q.topic, q.partition)
         .await
         .unwrap_or(partition.start_offset());
-
-    let (records, next_offset, high_watermark) =
-        partition.read_records(committed, q.max_records, q.max_bytes)?;
-    let consumed_bytes: u64 = records
-        .iter()
-        .map(|r| r.key.as_ref().map(|k| k.len() as u64).unwrap_or(0) + r.value.len() as u64)
-        .sum();
-    let _ = broker
-        .keys
-        .check_consume(&key.key_id, consumed_bytes as u32);
-
-    topic
-        .records_consumed_total
-        .fetch_add(records.len() as u64, Ordering::Relaxed);
-    topic
-        .bytes_consumed_total
-        .fetch_add(consumed_bytes, Ordering::Relaxed);
-
-    Ok(Json(ConsumeResponse {
-        records,
-        next_offset,
-        high_watermark,
-    }))
+    let f = dataplane::consume(
+        &broker,
+        &key,
+        &q.topic,
+        q.partition,
+        committed,
+        q.max_records,
+        q.max_bytes,
+    )
+    .await?;
+    Ok(respond(f, q.partition, base64))
 }

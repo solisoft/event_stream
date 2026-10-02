@@ -41,8 +41,13 @@ impl Broker {
         let config = Arc::new(config);
         let topics_root = topics_root(&config.data_dir);
         let groups_root = groups_root(&config.data_dir);
-        std::fs::create_dir_all(&topics_root)
+        crate::fsutil::create_dir_all_private(&topics_root)
             .with_context(|| format!("create dir {:?}", topics_root))?;
+        sweep_leftover_dirs(&topics_root);
+        sweep_leftover_dirs(&config.data_dir.join("raft"));
+        for f in ["api_keys.json", "schemas.json", "producers.json"] {
+            sweep_tmp_files(&config.data_dir, f);
+        }
 
         let topics = DashMap::new();
         for entry in std::fs::read_dir(&topics_root)? {
@@ -54,6 +59,17 @@ impl Broker {
                 Ok(s) => s,
                 Err(_) => continue,
             };
+            if crate::topic::validate_topic_name(&name).is_err() {
+                tracing::warn!(dir = %name, "ignoring a directory that is not a valid topic name");
+                continue;
+            }
+            if !entry.path().join("topic.json").exists() {
+                // Not something this broker could have left behind since
+                // creation became atomic, but older versions could. Keep the
+                // data, skip the topic, say so.
+                tracing::error!(topic = %name, "topic directory has no topic.json; skipping it");
+                continue;
+            }
             let topic = Topic::open(&topics_root, &name, &config)
                 .with_context(|| format!("open topic {}", name))?;
             topics.insert(name, topic);
@@ -151,10 +167,14 @@ impl Broker {
             self.shutdown.clone(),
         );
         let coord_expire = spawn_coord_expire(self.clone(), self.config.coord_expire_interval);
+        let group_flusher = crate::groups::spawn_flusher(self, self.shutdown.clone());
+        let partition_flusher = spawn_partition_flusher(self.clone(), self.config.flush_interval);
         guard.push(reaper);
         guard.push(compactor);
         guard.push(flusher);
         guard.push(coord_expire);
+        guard.push(group_flusher);
+        guard.push(partition_flusher);
     }
 
     pub async fn shutdown_background(&self) {
@@ -221,29 +241,127 @@ impl Broker {
         names
     }
 
-    pub fn delete_topic(&self, name: &str) -> Result<Arc<Topic>> {
-        let topic = self
-            .topic(name)
+    pub async fn delete_topic(&self, name: &str) -> Result<Arc<Topic>> {
+        let (_, topic) = self
+            .topics
+            .remove(name)
             .ok_or_else(|| anyhow!("topic '{}' not found", name))?;
-        self.topics.remove(name);
         if let Some(hub) = self.raft_hub() {
             topic.detach_raft(&hub);
         }
-        if let Err(e) = std::fs::remove_dir_all(topics_root(&self.config.data_dir).join(name)) {
-            tracing::warn!(topic = %name, error = %e, "failed to clean up topic directory");
+        // Stop the Raft node and apply loops before touching their files. A
+        // node loop left running wrote its state again a moment later —
+        // recreating the raft directory that had just been deleted.
+        for p in &topic.partitions {
+            p.shutdown().await;
         }
-        // The Raft state directory too. Leaving it behind would give a topic
-        // later recreated under this name a log whose term and index run ahead
-        // of its empty partition, and the apply loop would replay the deleted
-        // topic's entries into it.
-        let raft_dir = self.config.data_dir.join("raft").join(name);
-        if raft_dir.exists() {
-            if let Err(e) = std::fs::remove_dir_all(&raft_dir) {
-                tracing::warn!(topic = %name, error = %e, "failed to clean up raft state directory");
+        // Rename first, delete second: a crash part-way leaves a `~deleting-`
+        // directory that the next boot sweeps, never a half-deleted topic
+        // that the next boot tries (and fails) to open.
+        let dirs = [
+            topics_root(&self.config.data_dir),
+            self.config.data_dir.join("raft"),
+        ];
+        let name_owned = name.to_string();
+        tokio::task::spawn_blocking(move || {
+            for root in dirs {
+                let src = root.join(&name_owned);
+                if !src.exists() {
+                    continue;
+                }
+                let doomed = root.join(format!(
+                    "{}{}-{:08x}",
+                    crate::topic::DELETING_PREFIX,
+                    name_owned,
+                    rand::random::<u32>()
+                ));
+                match std::fs::rename(&src, &doomed) {
+                    Ok(()) => {
+                        let _ = crate::fsutil::fsync_dir(&root);
+                        if let Err(e) = std::fs::remove_dir_all(&doomed) {
+                            tracing::warn!(dir = ?doomed, error = %e, "failed to remove deleted topic data; it will be retried at startup");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(dir = ?src, error = %e, "failed to clean up topic directory")
+                    }
+                }
             }
-        }
+        })
+        .await
+        .map_err(|e| anyhow!("delete task: {e}"))?;
         Ok(topic)
     }
+}
+
+/// Remove `~creating-*` / `~deleting-*` directories left by a crash.
+fn sweep_leftover_dirs(root: &std::path::Path) {
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(crate::topic::CREATING_PREFIX)
+            || name.starts_with(crate::topic::DELETING_PREFIX)
+        {
+            tracing::warn!(dir = ?entry.path(), "removing leftover of an interrupted topic create/delete");
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// Remove temp files `write_atomic` left next to `file` in `dir`.
+fn sweep_tmp_files(dir: &std::path::Path, file: &str) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(file) && crate::fsutil::is_atomic_tmp_leftover(&name) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// With `flush_every_records > 1`, fsync partitions holding unsynced records
+/// every `interval`.
+fn spawn_partition_flusher(broker: Arc<Broker>, interval: std::time::Duration) -> JoinHandle<()> {
+    let cancel = broker.shutdown.clone();
+    let weak = Arc::downgrade(&broker);
+    drop(broker);
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => {}
+                _ = tokio::time::sleep(interval) => {}
+            }
+            let Some(b) = weak.upgrade() else { return };
+            let parts: Vec<Arc<crate::partition::Partition>> = b
+                .topics
+                .iter()
+                .flat_map(|t| {
+                    t.value()
+                        .partitions
+                        .iter()
+                        .map(|p| p.inner().clone())
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            drop(b);
+            let _ = tokio::task::spawn_blocking(move || {
+                for p in parts {
+                    if let Err(e) = p.sync_pending() {
+                        tracing::error!(partition = p.id, error = %e, "interval fsync failed");
+                    }
+                }
+            })
+            .await;
+            // One last pass after shutdown was requested, then stop.
+            if cancel.is_cancelled() {
+                return;
+            }
+        }
+    })
 }
 
 pub fn topics_root(data_dir: &std::path::Path) -> PathBuf {

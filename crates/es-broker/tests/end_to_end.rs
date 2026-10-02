@@ -902,7 +902,7 @@ async fn auth_required_rejects_missing_token() -> Result<()> {
     let resp = unauthed.get(format!("{}/topics", base)).send().await?;
     assert_eq!(resp.status().as_u16(), 401);
 
-    // /healthz and /metrics stay public.
+    // /healthz stays public.
     assert_eq!(
         unauthed
             .get(format!("{}/healthz", base))
@@ -912,8 +912,19 @@ async fn auth_required_rejects_missing_token() -> Result<()> {
             .as_u16(),
         200
     );
+    // /metrics names every topic, group and offset: it needs a key.
     assert_eq!(
         unauthed
+            .get(format!("{}/metrics", base))
+            .send()
+            .await?
+            .status()
+            .as_u16(),
+        401
+    );
+    let admin = bearer(&read_bootstrap_secret(&tmp)?);
+    assert_eq!(
+        admin
             .get(format!("{}/metrics", base))
             .send()
             .await?
@@ -1725,7 +1736,15 @@ async fn binary_gzip_roundtrip_preserves_bytes() -> Result<()> {
     create_topic(&http, &base, "gz", 1).await?;
 
     let bin_addr = handle.binary_addr.unwrap();
-    let mut client = BinaryClient::connect_with(bin_addr, "", ClientOptions { gzip: true }).await?;
+    let mut client = BinaryClient::connect_with(
+        bin_addr,
+        "",
+        ClientOptions {
+            gzip: true,
+            ..Default::default()
+        },
+    )
+    .await?;
     assert!(client.gzip_enabled(), "server must accept gzip negotiation");
 
     // Big payload that benefits from gzip — repeating bytes compress well.

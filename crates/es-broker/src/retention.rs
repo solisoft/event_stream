@@ -32,52 +32,72 @@ pub fn spawn_reaper(
     })
 }
 
+/// Offload `victims` to cold storage when tiered storage is configured.
+///
+/// Returns the victims that may now be deleted. Without a cold store that is
+/// all of them; with one, only those whose copy succeeded. A failed offload
+/// used to fall through to deletion — tiered storage existed precisely so the
+/// data would not be lost, and then it was.
 async fn offload_victims(
     broker: &Arc<Broker>,
     topic_name: &str,
     partition_id: u32,
-    victims: &[u64],
-) {
+    victims: Vec<u64>,
+) -> Vec<u64> {
     let store = match &broker.tiered_store {
         Some(s) => s.clone(),
-        None => return,
+        None => return victims,
     };
-    for &base in victims {
-        if let Some(topic) = broker.topic(topic_name) {
-            if let Some(ph) = topic.partitions.get(partition_id as usize) {
-                let inner = ph.inner();
-                let snapshot = inner.segments_snapshot();
-                if let Some(seg) = snapshot.iter().find(|s| s.base_offset == base) {
-                    match store.offload(
-                        topic_name,
-                        partition_id,
-                        base,
-                        &seg.log_path,
-                        &seg.index_path,
-                    ) {
-                        Ok(bytes) => {
-                            tracing::info!(
-                                topic = %topic_name,
-                                partition = partition_id,
-                                base_offset = base,
-                                bytes,
-                                "reaper: segment offloaded to cold storage"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                topic = %topic_name,
-                                partition = partition_id,
-                                base_offset = base,
-                                error = %e,
-                                "reaper: offload failed, segment will be deleted instead"
-                            );
-                        }
-                    }
-                }
+    let Some(topic) = broker.topic(topic_name) else {
+        return Vec::new();
+    };
+    let Some(ph) = topic.partitions.get(partition_id as usize) else {
+        return Vec::new();
+    };
+    let snapshot = ph.inner().segments_snapshot();
+    let mut deletable = Vec::with_capacity(victims.len());
+    for base in victims {
+        let Some(seg) = snapshot.iter().find(|s| s.base_offset == base).cloned() else {
+            continue;
+        };
+        let store = store.clone();
+        let topic_owned = topic_name.to_string();
+        let res = tokio::task::spawn_blocking(move || {
+            store.offload(
+                &topic_owned,
+                partition_id,
+                base,
+                &seg.log_path,
+                &seg.index_path,
+            )
+        })
+        .await;
+        match res {
+            Ok(Ok(bytes)) => {
+                tracing::info!(
+                    topic = %topic_name,
+                    partition = partition_id,
+                    base_offset = base,
+                    bytes,
+                    "reaper: segment offloaded to cold storage"
+                );
+                deletable.push(base);
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    topic = %topic_name,
+                    partition = partition_id,
+                    base_offset = base,
+                    error = %e,
+                    "reaper: offload failed; segment kept and retried on the next pass"
+                );
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "reaper: offload task panicked; segment kept");
             }
         }
     }
+    deletable
 }
 
 pub async fn run_pass(broker: &Arc<Broker>, grace: Duration, cancel: &CancellationToken) {
@@ -103,7 +123,10 @@ pub async fn run_pass(broker: &Arc<Broker>, grace: Duration, cancel: &Cancellati
                 continue;
             }
             // Offload to cold storage before deleting (if configured).
-            offload_victims(broker, &name, partition.id(), &victims).await;
+            let victims = offload_victims(broker, &name, partition.id(), victims).await;
+            if victims.is_empty() {
+                continue;
+            }
             let victim_count = victims.len() as u64;
             match partition
                 .drop_sealed_segments(&victims, grace, cancel)

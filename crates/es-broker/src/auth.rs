@@ -1,16 +1,11 @@
-use std::num::NonZeroU32;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use base64::Engine;
 use dashmap::DashMap;
-use governor::{
-    clock::DefaultClock,
-    state::{InMemoryState, NotKeyed},
-    Quota, RateLimiter,
-};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -70,6 +65,9 @@ pub struct AclRule {
     pub topic_prefix: String,
 }
 
+/// Characters that separate the components of a hierarchical topic name.
+const NAME_SEPARATORS: [char; 3] = ['.', '-', '_'];
+
 impl AclRule {
     fn matches(&self, action: AclAction, topic: &str) -> bool {
         let action_ok = match (self.action, action) {
@@ -79,12 +77,52 @@ impl AclRule {
             (AclAction::Write, AclAction::Read) => true,
             _ => false,
         };
-        if !action_ok {
-            return false;
-        }
-        // "*" matches every topic.
-        self.topic_prefix == "*" || topic.starts_with(&self.topic_prefix)
+        action_ok && prefix_matches(&self.topic_prefix, topic)
     }
+}
+
+/// Whether an ACL prefix covers `topic`.
+///
+/// `*` covers everything. Otherwise the prefix covers the topic of that exact
+/// name and the topics below it — where "below" starts at a name separator
+/// (`.`, `-`, `_`). A plain `starts_with` let a grant on `orders` cover
+/// `ordersarchive` and every other tenant whose name happened to begin with
+/// the same letters. A prefix that itself ends in a separator (`orders.`)
+/// covers exactly the names that start with it.
+pub fn prefix_matches(prefix: &str, topic: &str) -> bool {
+    if prefix == "*" {
+        return true;
+    }
+    if prefix.is_empty() || !topic.starts_with(prefix) {
+        return false;
+    }
+    if topic.len() == prefix.len() || prefix.ends_with(NAME_SEPARATORS) {
+        return true;
+    }
+    topic[prefix.len()..].starts_with(NAME_SEPARATORS)
+}
+
+/// Validate an ACL prefix supplied by an admin. An empty prefix used to match
+/// every topic *and* make `is_admin` true — an easy way to mint a super-admin
+/// by accident. Global grants are spelled `*`.
+fn validate_prefix(prefix: &str) -> Result<()> {
+    if prefix == "*" {
+        return Ok(());
+    }
+    if prefix.is_empty() || prefix.len() > 200 {
+        return Err(anyhow!(
+            "topic_prefix must be '*' or 1..=200 characters (an empty prefix is not allowed)"
+        ));
+    }
+    if !prefix
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+    {
+        return Err(anyhow!(
+            "topic_prefix may only contain ASCII alphanumerics, '_', '-', '.' (or be '*')"
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -126,16 +164,33 @@ impl ApiKey {
         self.acls.iter().any(|r| r.matches(action, topic))
     }
 
-    /// Convenience: any admin grant means "broker-wide ops".
+    /// A global admin grant (`admin` on `*`): broker-wide operations.
     pub fn is_admin(&self) -> bool {
         if self.disabled {
             return false;
         }
-        self.acls.iter().any(|r| {
-            r.action == AclAction::Admin && (r.topic_prefix == "*" || r.topic_prefix.is_empty())
-        })
+        self.acls
+            .iter()
+            .any(|r| r.action == AclAction::Admin && r.topic_prefix == "*")
     }
 }
+
+/// The principal every request runs as when auth is disabled. Built once:
+/// constructing it per request cost an `Arc` and four allocations each time.
+pub static ANONYMOUS_ADMIN: LazyLock<Arc<ApiKey>> = LazyLock::new(|| {
+    Arc::new(ApiKey {
+        key_id: "anonymous".to_string(),
+        name: "anonymous (auth disabled)".to_string(),
+        acls: vec![AclRule {
+            action: AclAction::Admin,
+            topic_prefix: "*".to_string(),
+        }],
+        produce_bytes_per_sec: None,
+        consume_bytes_per_sec: None,
+        created_at_ms: 0,
+        disabled: false,
+    })
+});
 
 #[derive(Debug, Serialize, Deserialize)]
 struct PersistedAcl {
@@ -163,11 +218,71 @@ struct PersistedKeyStore {
     keys: Vec<PersistedKey>,
 }
 
-type Limiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
+/// A byte-rate token bucket holding at most one second of budget.
+///
+/// Unlike `governor`'s GCRA it can go into debt: consume quotas are charged
+/// *after* the read, when the size is known, and the next read is refused
+/// until the debt is repaid. With `governor` a denied post-charge consumed
+/// nothing and the next call was not refused either, so consume quotas never
+/// limited anything.
+struct Bucket {
+    rate: f64,
+    tokens: f64,
+    last: Instant,
+}
+
+impl Bucket {
+    fn new(rate: u32) -> Self {
+        Self {
+            rate: rate as f64,
+            tokens: rate as f64,
+            last: Instant::now(),
+        }
+    }
+
+    fn refill(&mut self) {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last).as_secs_f64();
+        self.last = now;
+        self.tokens = (self.tokens + elapsed * self.rate).min(self.rate);
+    }
+
+    /// Take `n` now if the budget has it. A request larger than a whole
+    /// second of budget can never fit and is refused outright.
+    fn try_take(&mut self, n: u64) -> Result<(), f64> {
+        self.refill();
+        let n = n as f64;
+        if n > self.rate {
+            return Err(1.0);
+        }
+        if n <= self.tokens {
+            self.tokens -= n;
+            Ok(())
+        } else {
+            Err((n - self.tokens) / self.rate)
+        }
+    }
+
+    /// Refuse while in debt.
+    fn check_credit(&mut self) -> Result<(), f64> {
+        self.refill();
+        if self.tokens > 0.0 {
+            Ok(())
+        } else {
+            Err((-self.tokens + 1.0) / self.rate)
+        }
+    }
+
+    /// Charge `n`, going into debt if need be (bounded at ten seconds' worth).
+    fn charge(&mut self, n: u64) {
+        self.refill();
+        self.tokens = (self.tokens - n as f64).max(-10.0 * self.rate);
+    }
+}
 
 struct KeyLimiters {
-    produce: Option<Arc<Limiter>>,
-    consume: Option<Arc<Limiter>>,
+    produce: Option<Mutex<Bucket>>,
+    consume: Option<Mutex<Bucket>>,
 }
 
 pub struct KeyStore {
@@ -175,6 +290,14 @@ pub struct KeyStore {
     keys: DashMap<String, Arc<ApiKey>>,
     by_hash: DashMap<[u8; 32], String>,
     limiters: DashMap<String, KeyLimiters>,
+    /// Serializes `persist`: the snapshot is taken under it, so the last
+    /// writer always writes the newest state. Without it a create and a revoke
+    /// racing could persist in the wrong order and bring a revoked key back
+    /// after a restart.
+    persist_lock: Mutex<()>,
+    /// Bumped on every revocation, so long-lived connections can tell cheaply
+    /// that they must re-check their key.
+    revocations: AtomicU64,
 }
 
 impl KeyStore {
@@ -182,13 +305,16 @@ impl KeyStore {
     /// empty, generate a bootstrap admin key and write it to
     /// `<dir>/bootstrap.key` (plain text, deletable after first use).
     pub fn open(dir: PathBuf, auth_required: bool) -> Result<(Arc<Self>, Option<String>)> {
-        std::fs::create_dir_all(&dir).with_context(|| format!("create dir {:?}", dir))?;
+        crate::fsutil::create_dir_all_private(&dir)
+            .with_context(|| format!("create dir {:?}", dir))?;
         let file_path = dir.join("api_keys.json");
         let store = Self {
             file_path: file_path.clone(),
             keys: DashMap::new(),
             by_hash: DashMap::new(),
             limiters: DashMap::new(),
+            persist_lock: Mutex::new(()),
+            revocations: AtomicU64::new(0),
         };
         let persisted: PersistedKeyStore = match std::fs::read(&file_path) {
             Ok(bytes) => serde_json::from_slice(&bytes)
@@ -206,9 +332,17 @@ impl KeyStore {
                 .acls
                 .iter()
                 .map(|a| {
+                    // An empty prefix used to mean "everything"; keep keys
+                    // issued that way working under the explicit spelling.
+                    let topic_prefix = if a.topic_prefix.is_empty() {
+                        tracing::warn!(key = %pk.key_id, "ACL with an empty topic prefix loaded as '*'");
+                        "*".to_string()
+                    } else {
+                        a.topic_prefix.clone()
+                    };
                     Ok(AclRule {
                         action: AclAction::from_str(&a.action)?,
-                        topic_prefix: a.topic_prefix.clone(),
+                        topic_prefix,
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -243,12 +377,17 @@ impl KeyStore {
             };
             let (_key, secret) = store.create_key(&req)?;
             let path = dir.join("bootstrap.key");
-            std::fs::write(&path, &secret)
-                .with_context(|| format!("write bootstrap key to {:?}", path))?;
-            #[cfg(unix)]
+            // Born 0600 (O_EXCL + mode). Writing first and chmod-ing after left
+            // the admin secret readable under the umask in between — and the
+            // chmod's error was ignored.
+            let _ = std::fs::remove_file(&path);
             {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+                use std::io::Write;
+                let mut f = crate::fsutil::create_new_private(&path)
+                    .with_context(|| format!("create bootstrap key file {:?}", path))?;
+                f.write_all(secret.as_bytes())
+                    .with_context(|| format!("write bootstrap key to {:?}", path))?;
+                f.sync_all()?;
             }
             tracing::warn!(
                 bootstrap_key_path = ?path,
@@ -261,6 +400,7 @@ impl KeyStore {
     }
 
     fn persist(&self) -> Result<()> {
+        let _guard = self.persist_lock.lock().unwrap_or_else(|e| e.into_inner());
         let snapshot: Vec<PersistedKey> = self
             .keys
             .iter()
@@ -298,8 +438,14 @@ impl KeyStore {
     }
 
     pub fn create_key(&self, req: &CreateKeyRequest) -> Result<(Arc<ApiKey>, String)> {
-        if req.name.is_empty() {
-            return Err(anyhow!("name must be non-empty"));
+        if req.name.is_empty() || req.name.len() > 200 {
+            return Err(anyhow!("name must be 1..=200 characters"));
+        }
+        if req.acls.len() > 100 {
+            return Err(anyhow!("a key may carry at most 100 ACL rules"));
+        }
+        for a in &req.acls {
+            validate_prefix(&a.topic_prefix)?;
         }
         let mut secret_bytes = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut secret_bytes);
@@ -353,8 +499,21 @@ impl KeyStore {
             ..(*key).clone()
         });
         self.keys.insert(key_id.to_string(), new_key);
+        self.revocations.fetch_add(1, Ordering::AcqRel);
         self.persist()?;
         Ok(())
+    }
+
+    /// Current revocation generation. A connection that authenticated at
+    /// generation `g` must re-check its key once this moves past `g`.
+    pub fn revocation_epoch(&self) -> u64 {
+        self.revocations.load(Ordering::Acquire)
+    }
+
+    /// The current state of a key, if it is still enabled.
+    pub fn get_enabled(&self, key_id: &str) -> Option<Arc<ApiKey>> {
+        let k = self.keys.get(key_id)?.value().clone();
+        (!k.disabled).then_some(k)
     }
 
     /// Look up an `ApiKey` by its plaintext secret. Returns `None` if the secret
@@ -369,46 +528,38 @@ impl KeyStore {
         Some(key)
     }
 
-    /// Pre-check whether `n_bytes` would fit in the produce rate-limit budget
-    /// for this key. Returns Ok if allowed (and consumes the tokens), Err with
-    /// a retry hint in seconds if denied.
-    pub fn check_produce(&self, key_id: &str, n_bytes: u32) -> Result<(), f64> {
-        check_against(
-            self.limiters
-                .get(key_id)
-                .and_then(|l| l.value().produce.clone()),
-            n_bytes,
-        )
-    }
-
-    pub fn check_consume(&self, key_id: &str, n_bytes: u32) -> Result<(), f64> {
-        check_against(
-            self.limiters
-                .get(key_id)
-                .and_then(|l| l.value().consume.clone()),
-            n_bytes,
-        )
-    }
-}
-
-fn check_against(limiter: Option<Arc<Limiter>>, n: u32) -> Result<(), f64> {
-    let Some(limiter) = limiter else {
-        return Ok(());
-    };
-    let weight = match NonZeroU32::new(n.max(1)) {
-        Some(w) => w,
-        None => return Ok(()),
-    };
-    match limiter.check_n(weight) {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(neg)) => {
-            // `neg` is a NotUntil; convert to a wait duration.
-            let wait = neg.wait_time_from(governor::clock::Clock::now(&DefaultClock::default()));
-            Err(wait.as_secs_f64())
+    /// Take `n_bytes` from the produce budget before the write. Err carries a
+    /// retry hint in seconds.
+    pub fn check_produce(&self, key_id: &str, n_bytes: u64) -> Result<(), f64> {
+        match self.limiters.get(key_id) {
+            Some(l) => match &l.produce {
+                Some(b) => b
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .try_take(n_bytes),
+                None => Ok(()),
+            },
+            None => Ok(()),
         }
-        Err(_insufficient_quota) => {
-            // The request was larger than the bucket capacity. Reject outright.
-            Err(1.0)
+    }
+
+    /// Before a read: refuse while the consume budget is in debt.
+    pub fn check_consume(&self, key_id: &str) -> Result<(), f64> {
+        match self.limiters.get(key_id) {
+            Some(l) => match &l.consume {
+                Some(b) => b.lock().unwrap_or_else(|e| e.into_inner()).check_credit(),
+                None => Ok(()),
+            },
+            None => Ok(()),
+        }
+    }
+
+    /// After a read: charge what was actually returned.
+    pub fn charge_consume(&self, key_id: &str, n_bytes: u64) {
+        if let Some(l) = self.limiters.get(key_id) {
+            if let Some(b) = &l.consume {
+                b.lock().unwrap_or_else(|e| e.into_inner()).charge(n_bytes);
+            }
         }
     }
 }
@@ -417,12 +568,12 @@ fn make_limiters(key: &ApiKey) -> KeyLimiters {
     KeyLimiters {
         produce: key
             .produce_bytes_per_sec
-            .and_then(NonZeroU32::new)
-            .map(|n| Arc::new(RateLimiter::direct(Quota::per_second(n)))),
+            .filter(|n| *n > 0)
+            .map(|n| Mutex::new(Bucket::new(n))),
         consume: key
             .consume_bytes_per_sec
-            .and_then(NonZeroU32::new)
-            .map(|n| Arc::new(RateLimiter::direct(Quota::per_second(n)))),
+            .filter(|n| *n > 0)
+            .map(|n| Mutex::new(Bucket::new(n))),
     }
 }
 
@@ -474,5 +625,66 @@ mod hex {
             b'A'..=b'F' => b - b'A' + 10,
             _ => return Err(anyhow!("bad hex nibble {:#x}", b)),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefixes_match_at_name_boundaries_only() {
+        assert!(prefix_matches("*", "anything"));
+        assert!(prefix_matches("orders", "orders"));
+        assert!(prefix_matches("orders", "orders.eu"));
+        assert!(prefix_matches("orders", "orders-archive"));
+        assert!(prefix_matches("orders.", "orders.eu"));
+        assert!(!prefix_matches("orders", "ordersarchive"));
+        assert!(!prefix_matches("orders.", "orders"));
+        assert!(!prefix_matches("", "orders"));
+    }
+
+    #[test]
+    fn empty_and_odd_prefixes_are_refused_at_creation() {
+        assert!(validate_prefix("").is_err());
+        assert!(validate_prefix("a/b").is_err());
+        assert!(validate_prefix("*").is_ok());
+        assert!(validate_prefix("orders.").is_ok());
+    }
+
+    #[test]
+    fn consume_debt_blocks_the_next_read() {
+        let mut b = Bucket::new(100);
+        assert!(b.check_credit().is_ok());
+        b.charge(1000);
+        assert!(
+            b.check_credit().is_err(),
+            "a debt must refuse the next read"
+        );
+    }
+
+    #[test]
+    fn produce_bucket_refuses_oversized_and_overdrawn_requests() {
+        let mut b = Bucket::new(64);
+        assert!(b.try_take(1000).is_err());
+        assert!(b.try_take(40).is_ok());
+        assert!(b.try_take(40).is_err());
+    }
+
+    #[test]
+    fn bootstrap_key_file_is_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_s, secret) = KeyStore::open(dir.path().to_path_buf(), true).unwrap();
+        assert!(secret.is_some());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.path().join("bootstrap.key"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
     }
 }

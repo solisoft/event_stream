@@ -1,5 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs::{self, File};
+#[cfg(test)]
+use std::io::Write;
 use std::io::{self, BufWriter, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -85,9 +87,19 @@ pub fn dump(
         total_bytes,
     };
 
-    // Create output file
-    let out_file =
-        File::create(output).with_context(|| format!("create output file '{}'", output))?;
+    // The archive holds every tenant's data (and with --include-keys, key
+    // hashes): created 0600, not under the umask.
+    let out_file = {
+        let mut o = fs::OpenOptions::new();
+        o.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            o.mode(0o600);
+        }
+        o.open(output)
+            .with_context(|| format!("create output file '{}'", output))?
+    };
     let encoder = GzEncoder::new(BufWriter::new(out_file), Compression::default());
     let mut tar = tar::Builder::new(encoder);
 
@@ -111,6 +123,10 @@ pub fn dump(
             .replace('\\', "/");
         add_file_to_tar(&mut tar, meta_path, &rel)?;
     }
+    eprintln!(
+        "note: segments of a running broker are copied up to the length each had when it was \
+         opened; files are not captured at one instant. Stop the broker for a point-in-time backup."
+    );
 
     // Write segment log + index files
     for log_entry in &entries.log_files {
@@ -131,7 +147,9 @@ pub fn dump(
             verify_segment(&log_entry.path)?;
         }
 
-        add_file_to_tar(&mut tar, &log_entry.path, &rel_log)?;
+        if !add_file_to_tar(&mut tar, &log_entry.path, &rel_log)? {
+            continue;
+        }
         if log_entry.index_path.exists() {
             add_file_to_tar(&mut tar, &log_entry.index_path, &rel_index)?;
         }
@@ -263,17 +281,29 @@ fn discover_files(
         metadata_files.push(schemas_path);
     }
 
-    // Producer registry
-    let producers_path = data_dir.join("producers.json");
-    if producers_path.exists() {
-        metadata_files.push(producers_path);
+    // Producer registry: the compacted state and the journal of what was
+    // accepted since (both are needed to restore it exactly).
+    for name in [
+        "producers.json",
+        "producers.journal.old",
+        "producers.journal",
+    ] {
+        let p = data_dir.join(name);
+        if p.exists() {
+            metadata_files.push(p);
+        }
     }
 
-    // Auth keys (only if --include-keys)
+    // Auth keys (only if --include-keys). The broker's file is
+    // `api_keys.json`; the tool looked for `keys.json`, found nothing, and
+    // still wrote `includes_keys: true` into the manifest. `bootstrap.key`
+    // (a plaintext secret) is never included.
     if include_keys {
-        let keys_path = data_dir.join("keys.json");
+        let keys_path = data_dir.join("api_keys.json");
         if keys_path.exists() {
             metadata_files.push(keys_path);
+        } else {
+            eprintln!("warning: --include-keys given but no api_keys.json in the data dir");
         }
     }
 
@@ -284,20 +314,67 @@ fn discover_files(
     })
 }
 
+/// A reader that yields exactly `len` bytes: the file's bytes up to `len`,
+/// zero-padded if the file turned out shorter.
+///
+/// The tar header carries a size; tar copies whatever the reader yields. A
+/// segment that grew between `metadata()` and the copy (the broker is
+/// appending) wrote more bytes than its header declared and every following
+/// entry became unreadable.
+struct Exactly<R> {
+    inner: io::Take<R>,
+    pad: u64,
+}
+
+impl<R: Read> Read for Exactly<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 || buf.is_empty() {
+            return Ok(n);
+        }
+        let remaining = self.inner.limit() + self.pad;
+        if remaining == 0 {
+            return Ok(0);
+        }
+        // The file ended early: account for what is missing, then pad.
+        if self.inner.limit() > 0 {
+            self.pad += self.inner.limit();
+            self.inner.set_limit(0);
+        }
+        let k = (self.pad as usize).min(buf.len());
+        buf[..k].fill(0);
+        self.pad -= k as u64;
+        Ok(k)
+    }
+}
+
+/// Add one file. Returns `false` (and warns) if it vanished before it could
+/// be opened — retention or compaction removed it mid-dump.
 fn add_file_to_tar<W: io::Write>(
     tar: &mut tar::Builder<W>,
     src_path: &Path,
     archive_path: &str,
-) -> Result<()> {
-    let mut file = File::open(src_path).with_context(|| format!("open {:?}", src_path))?;
+) -> Result<bool> {
+    let file = match File::open(src_path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            eprintln!(
+                "warning: {:?} disappeared during the dump; skipped",
+                src_path
+            );
+            return Ok(false);
+        }
+        Err(e) => return Err(e).with_context(|| format!("open {:?}", src_path)),
+    };
     let meta = file
         .metadata()
         .with_context(|| format!("metadata {:?}", src_path))?;
+    let len = meta.len();
 
     let mut header = tar::Header::new_gnu();
     header.set_path(archive_path)?;
-    header.set_size(meta.len());
-    header.set_mode(0o644);
+    header.set_size(len);
+    header.set_mode(0o600);
     header.set_mtime(
         meta.modified()
             .ok()
@@ -305,9 +382,13 @@ fn add_file_to_tar<W: io::Write>(
             .unwrap_or(0),
     );
     header.set_cksum();
-    tar.append_data(&mut header, archive_path, &mut file)?;
+    let reader = Exactly {
+        inner: file.take(len),
+        pad: 0,
+    };
+    tar.append_data(&mut header, archive_path, reader)?;
 
-    Ok(())
+    Ok(true)
 }
 
 fn timestamp_from_systime(t: SystemTime) -> Option<u64> {
@@ -352,6 +433,7 @@ const HEADER_LEN: usize = 8 + 8 + 4;
 const VALUE_LEN_FIELD: usize = 4;
 const CRC_LEN: usize = 4;
 const RECORD_LEN_FIELD: usize = 4;
+const MAX_RECORD_BODY_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -416,6 +498,14 @@ fn read_record<R: Read + Seek>(reader: &mut R) -> Result<Record, RecordErr> {
         return Err(RecordErr::Invalid {
             at,
             reason: "body_len below minimum",
+        });
+    }
+    // Same cap as the broker: a corrupt length must not become a 4 GiB
+    // allocation.
+    if body_len > MAX_RECORD_BODY_BYTES {
+        return Err(RecordErr::Invalid {
+            at,
+            reason: "body_len exceeds maximum",
         });
     }
 
@@ -484,4 +574,71 @@ fn read_record<R: Read + Seek>(reader: &mut R) -> Result<Record, RecordErr> {
         _key: key,
         _value: value,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exactly_truncates_and_pads() {
+        let mut long = Exactly {
+            inner: (&b"abcdef"[..]).take(3),
+            pad: 0,
+        };
+        let mut out = Vec::new();
+        long.read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"abc");
+
+        let mut short = Exactly {
+            inner: (&b"ab"[..]).take(5),
+            pad: 0,
+        };
+        let mut out = Vec::new();
+        short.read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"ab\0\0\0");
+    }
+
+    #[test]
+    fn a_growing_file_does_not_corrupt_the_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("a.log");
+        std::fs::write(&src, vec![1u8; 1000]).unwrap();
+        let mut buf = Vec::new();
+        {
+            let mut tar = tar::Builder::new(&mut buf);
+            // Size captured at open...
+            let file = File::open(&src).unwrap();
+            let len = file.metadata().unwrap().len();
+            // ...then the broker appends.
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&src)
+                .unwrap()
+                .write_all(&[2u8; 700])
+                .unwrap();
+            let mut header = tar::Header::new_gnu();
+            header.set_path("a.log").unwrap();
+            header.set_size(len);
+            header.set_cksum();
+            tar.append_data(
+                &mut header,
+                "a.log",
+                Exactly {
+                    inner: file.take(len),
+                    pad: 0,
+                },
+            )
+            .unwrap();
+            add_file_to_tar(&mut tar, &src, "b.log").unwrap();
+            tar.finish().unwrap();
+        }
+        let mut ar = tar::Archive::new(&buf[..]);
+        let names: Vec<String> = ar
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["a.log", "b.log"]);
+    }
 }

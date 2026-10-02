@@ -8,15 +8,26 @@ use axum::{
     response::IntoResponse,
 };
 
+use crate::auth::{AclAction, ApiKey};
 use crate::broker::Broker;
+
+use super::auth_ext::AuthedKey;
 
 /// Prometheus text-exposition handler.
 ///
 /// Format: `metric{label="v"} value\n`. Labels are escaped per the Prometheus spec
 /// (only `"`, `\`, and `\n` need handling — topic/group names pass `validate_name`
 /// which already restricts the alphabet, but we escape defensively).
-pub async fn metrics(State(broker): State<Arc<Broker>>) -> impl IntoResponse {
-    let body = render_metrics(&broker).await;
+///
+/// With auth required this needs a key (scrapers send it as a bearer token),
+/// and only reports what that key could see anyway: topics it can read and
+/// groups it owns. It used to answer anyone with every topic name, offset and
+/// consumer group of every tenant.
+pub async fn metrics(
+    State(broker): State<Arc<Broker>>,
+    AuthedKey(key): AuthedKey,
+) -> impl IntoResponse {
+    let body = render_metrics(&broker, &key).await;
     let mut headers = HeaderMap::new();
     headers.insert(
         header::CONTENT_TYPE,
@@ -25,12 +36,16 @@ pub async fn metrics(State(broker): State<Arc<Broker>>) -> impl IntoResponse {
     (headers, body)
 }
 
-async fn render_metrics(broker: &Arc<Broker>) -> String {
+async fn render_metrics(broker: &Arc<Broker>, key: &ApiKey) -> String {
     let mut out = String::with_capacity(4096);
 
     out.push_str("# HELP es_partition_start_offset Earliest offset retained in the partition.\n");
     out.push_str("# TYPE es_partition_start_offset gauge\n");
-    let topic_names = broker.list_topics();
+    let topic_names: Vec<String> = broker
+        .list_topics()
+        .into_iter()
+        .filter(|t| key.can(AclAction::Read, t))
+        .collect();
     for name in &topic_names {
         let Some(topic) = broker.topic(name) else {
             continue;
@@ -240,8 +255,14 @@ async fn render_metrics(broker: &Arc<Broker>) -> String {
     out.push_str("# TYPE es_group_lag gauge\n");
     let group_names: Vec<String> = broker.groups.iter_group_names().into_iter().collect();
     for g in &group_names {
+        if !key.is_admin() && broker.groups.owner(g).await.as_deref() != Some(key.key_id.as_str()) {
+            continue;
+        }
         let snapshot = broker.groups.snapshot(g).await;
         for (topic_name, parts) in snapshot {
+            if !key.can(AclAction::Read, &topic_name) {
+                continue;
+            }
             let Some(topic) = broker.topic(&topic_name) else {
                 continue;
             };

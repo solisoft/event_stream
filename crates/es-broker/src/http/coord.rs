@@ -31,14 +31,14 @@ fn check_read_on_all(key: &crate::auth::ApiKey, topics: &[String]) -> AppResult<
     Ok(())
 }
 
-/// Authorize a group operation: the caller must have read access to every topic
-/// the group is subscribed to. Prevents an unrelated principal from disrupting
-/// or inspecting another tenant's consumer group.
+/// Authorize a group operation: the caller must own the group and have read
+/// access to every topic it is subscribed to.
 async fn check_group_access(
     broker: &Arc<Broker>,
     key: &crate::auth::ApiKey,
     group: &str,
 ) -> AppResult<()> {
+    broker.groups.check_access(group, key).await?;
     let topics = broker.coordinator.group_topics(group).await;
     check_read_on_all(key, &topics)
 }
@@ -58,7 +58,7 @@ pub async fn join(
     check_read_on_all(&key, &req.topics)?;
     let reply = broker
         .coordinator
-        .join(&broker, &group, req.member_id, req.topics)
+        .join(&broker, &group, &key, req.member_id, req.topics)
         .await?;
     Ok(Json(JoinGroupResponse {
         member_id: reply.member_id,
@@ -76,7 +76,7 @@ pub async fn heartbeat(
     check_group_access(&broker, &key, &group).await?;
     let reply = broker
         .coordinator
-        .heartbeat(&group, &req.member_id, req.generation)
+        .heartbeat(&group, &key, &req.member_id, req.generation)
         .await?;
     Ok(Json(match reply {
         HeartbeatReply::Ok { generation } => HeartbeatResponse::Ok { generation },
@@ -98,7 +98,7 @@ pub async fn leave(
     check_group_access(&broker, &key, &group).await?;
     broker
         .coordinator
-        .leave(&broker, &group, &req.member_id)
+        .leave(&broker, &group, &key, &req.member_id)
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -115,7 +115,10 @@ pub async fn assignment(
     Query(q): Query<AssignmentQuery>,
 ) -> AppResult<Json<AssignmentResponse>> {
     check_group_access(&broker, &key, &group).await?;
-    let reply = broker.coordinator.assignment(&group, &q.member_id).await;
+    let reply = broker
+        .coordinator
+        .assignment(&group, &key, &q.member_id)
+        .await?;
     match reply {
         AssignmentReply::Ok {
             generation,

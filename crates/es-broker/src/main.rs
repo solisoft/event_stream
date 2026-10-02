@@ -62,6 +62,47 @@ struct Args {
     #[arg(long, default_value_t = 10 * 1024 * 1024)]
     max_request_body_bytes: usize,
 
+    /// Largest record (key + value bytes) accepted on either protocol.
+    #[arg(long, default_value_t = 8 * 1024 * 1024)]
+    max_record_bytes: usize,
+
+    /// Most bytes one consume request returns, whatever it asks for.
+    #[arg(long, default_value_t = 8 * 1024 * 1024)]
+    max_fetch_bytes: usize,
+
+    /// Most records one consume request returns.
+    #[arg(long, default_value_t = 10_000)]
+    max_fetch_records: usize,
+
+    /// With --flush-every-records > 1: fsync unsynced records at least this
+    /// often, so an idle partition does not hold acknowledged records only in
+    /// memory.
+    #[arg(long, default_value = "1s", value_parser = parse_duration)]
+    flush_interval: Duration,
+
+    /// Origin allowed to call the HTTP API from a browser (repeatable). None
+    /// by default: no CORS headers are sent.
+    #[arg(long = "cors-origin")]
+    cors_origins: Vec<String>,
+
+    /// Extra host name the HTTP API answers to while auth is disabled
+    /// (repeatable). Loopback names are always accepted.
+    #[arg(long = "allowed-host")]
+    allowed_hosts: Vec<String>,
+
+    /// Permit --auth disabled on a non-loopback address. Every caller is then
+    /// an admin; only for networks where that is acceptable.
+    #[arg(long)]
+    allow_remote_unauthenticated: bool,
+
+    /// Binary protocol: most connections from one IP address.
+    #[arg(long, default_value_t = 256)]
+    binary_max_connections_per_ip: usize,
+
+    /// Binary protocol: close a connection idle for this long.
+    #[arg(long, default_value = "10m", value_parser = parse_duration)]
+    binary_idle_timeout: Duration,
+
     /// Maximum time to wait for graceful shutdown before forcing exit.
     #[arg(long, default_value = "30s", value_parser = parse_duration)]
     shutdown_timeout: Duration,
@@ -129,6 +170,35 @@ impl AuthFlag {
     }
 }
 
+/// Raise the soft open-file limit to the hard one. Every segment holds a read
+/// handle and every binary connection a socket; the common default soft limit
+/// of 1024 is reached long before either budget is.
+fn raise_fd_limit() {
+    let mut rl = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: plain libc calls on a stack struct.
+    unsafe {
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) != 0 {
+            return;
+        }
+        if rl.rlim_cur < rl.rlim_max {
+            let wanted = libc::rlimit {
+                rlim_cur: rl.rlim_max,
+                rlim_max: rl.rlim_max,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &wanted) == 0 {
+                tracing::info!(
+                    from = rl.rlim_cur,
+                    to = rl.rlim_max,
+                    "raised open-file limit"
+                );
+            }
+        }
+    }
+}
+
 fn parse_duration(s: &str) -> Result<Duration, String> {
     humantime::parse_duration(s).map_err(|e| format!("invalid duration '{}': {}", s, e))
 }
@@ -176,6 +246,15 @@ async fn main() -> Result<()> {
     config.max_request_body_bytes = args.max_request_body_bytes;
     config.shutdown_timeout = args.shutdown_timeout;
     config.cold_storage_dir = args.cold_storage_dir;
+    config.max_record_bytes = args.max_record_bytes;
+    config.max_fetch_bytes = args.max_fetch_bytes;
+    config.max_fetch_records = args.max_fetch_records.max(1);
+    config.flush_interval = args.flush_interval;
+    config.cors_allowed_origins = args.cors_origins;
+    config.allowed_hosts = args.allowed_hosts;
+    config.allow_remote_unauthenticated = args.allow_remote_unauthenticated;
+    config.binary_max_connections_per_ip = args.binary_max_connections_per_ip;
+    config.binary_idle_timeout = args.binary_idle_timeout;
     config.raft_shared_secret = args.raft_shared_secret;
     config.raft_node_id = args.raft_node_id;
     config.raft_bind = args.raft_bind;
@@ -198,10 +277,17 @@ async fn main() -> Result<()> {
     }
     if config.bind_binary.is_some() && config.tls_cert_path.is_none() {
         tracing::warn!(
-            "binary protocol listener is plaintext (no TLS): API tokens and record data are \
-             sent unencrypted. Restrict it to a trusted network."
+            "binary protocol listener is plaintext (no --tls-cert/--tls-key): API tokens and \
+             record data are sent unencrypted. Restrict it to a trusted network."
         );
     }
+    if config.raft_node_id.is_some() {
+        tracing::warn!(
+            "raft replication traffic is authenticated but not encrypted: keep --raft-bind on a \
+             private network"
+        );
+    }
+    raise_fd_limit();
 
     let handle = spawn(config).await?;
     tracing::info!(addr = %handle.addr, scheme = handle.scheme, "broker listening");

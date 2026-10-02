@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -11,6 +12,16 @@ use crate::config::Config;
 use crate::partition_handle::{PartitionHandle, RaftConfig};
 use crate::raft::{group_key, RaftHub, Timing};
 use es_protocol::{CleanupPolicyDto, TopicConfigDto, TopicConfigPatch};
+
+/// Most partitions one topic may have. Each holds open files, and with Raft a
+/// node loop and two tasks.
+pub const MAX_PARTITIONS: u32 = 10_000;
+
+/// Prefix of a topic directory being created. `~` cannot appear in a topic
+/// name, so these never collide with a real topic and are swept on startup.
+pub const CREATING_PREFIX: &str = "~creating-";
+/// Prefix of a topic directory being deleted.
+pub const DELETING_PREFIX: &str = "~deleting-";
 
 /// Raft applies between snapshots when the operator has not set a value.
 /// Snapshotting on every apply would rewrite the whole partition state per
@@ -244,14 +255,19 @@ impl Topic {
         if partitions == 0 {
             return Err(anyhow!("topic must have at least 1 partition"));
         }
+        if partitions > MAX_PARTITIONS {
+            return Err(anyhow!(
+                "a topic may have at most {} partitions",
+                MAX_PARTITIONS
+            ));
+        }
         validate_topic_name(name)?;
+        if let Some(p) = patch {
+            validate_patch(p)?;
+        }
 
         let topic_dir = root.join(name);
-        std::fs::create_dir_all(&topic_dir)
-            .with_context(|| format!("create dir {:?}", topic_dir))?;
-
-        let meta_path = topic_dir.join("topic.json");
-        if meta_path.exists() {
+        if topic_dir.exists() {
             return Err(anyhow!("topic '{}' already exists", name));
         }
 
@@ -264,12 +280,39 @@ impl Topic {
             partitions,
             config: persisted.clone(),
         };
-        write_json_atomic(&meta_path, &meta)?;
+
+        // Build the whole directory under a staging name and rename it into
+        // place: a crash part-way leaves a `~creating-` directory the next
+        // boot sweeps, never a topic directory without its metadata (which
+        // used to stop the broker from starting at all).
+        let staging = root.join(format!(
+            "{}{}-{:08x}",
+            CREATING_PREFIX,
+            name,
+            rand::random::<u32>()
+        ));
+        let build = || -> Result<()> {
+            for id in 0..partitions {
+                crate::fsutil::create_dir_all_private(&staging.join(id.to_string()))?;
+            }
+            write_json_atomic(staging.join("topic.json"), &meta)?;
+            crate::fsutil::fsync_dir(&staging)?;
+            if topic_dir.exists() {
+                return Err(anyhow!("topic '{}' already exists", name));
+            }
+            std::fs::rename(&staging, &topic_dir)?;
+            crate::fsutil::fsync_dir(root)?;
+            Ok(())
+        };
+        if let Err(e) = build() {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(e);
+        }
+        let meta_path = topic_dir.join("topic.json");
 
         let mut parts = Vec::with_capacity(partitions as usize);
         for id in 0..partitions {
             let dir = topic_dir.join(id.to_string());
-            std::fs::create_dir_all(&dir)?;
             parts.push(PartitionHandle::open(
                 dir,
                 id,
@@ -371,19 +414,22 @@ impl Topic {
         patch: &TopicConfigPatch,
         broker: &Config,
     ) -> Result<Arc<TopicConfig>> {
-        let new_persisted = {
-            let mut guard = self.persisted.lock().unwrap();
-            guard.merge_patch(patch);
-            guard.clone()
-        };
+        validate_patch(patch)?;
+        // Merge, persist and publish under one lock, so two concurrent updates
+        // cannot write their files in one order and publish in the other.
+        let mut guard = self.persisted.lock().unwrap_or_else(|e| e.into_inner());
+        let mut new_persisted = guard.clone();
+        new_persisted.merge_patch(patch);
         let resolved = new_persisted.resolve(broker)?;
         let meta = TopicMeta {
             partitions: self.partitions.len() as u32,
-            config: new_persisted,
+            config: new_persisted.clone(),
         };
         write_json_atomic(&self.meta_path, &meta)?;
+        *guard = new_persisted;
         let resolved = Arc::new(resolved);
         self.config.store(resolved.clone());
+        drop(guard);
 
         for p in &self.partitions {
             p.set_segment_bytes(resolved.segment_bytes);
@@ -410,6 +456,16 @@ impl Topic {
         let n = self.rr_counter.fetch_add(1, Ordering::Relaxed);
         Ok((n % self.partitions.len() as u64) as u32)
     }
+}
+
+/// Reject config values the broker cannot honour.
+fn validate_patch(p: &TopicConfigPatch) -> Result<()> {
+    if let Some(sb) = p.segment_bytes {
+        if !(128..=(1u64 << 40)).contains(&sb) {
+            return Err(anyhow!("segment_bytes must be between 128 bytes and 1 TiB"));
+        }
+    }
+    Ok(())
 }
 
 /// Validate a topic name. Rejects anything that isn't `[A-Za-z0-9_.-]{1,200}`
@@ -442,16 +498,11 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     h
 }
 
+/// Replace `path` with `value` as JSON: unique temp file (0600), fsync,
+/// rename, fsync of the directory. See [`crate::fsutil::write_atomic`].
 pub(crate) fn write_json_atomic<P: AsRef<Path>, T: Serialize>(path: P, value: &T) -> Result<()> {
     let path = path.as_ref();
-    let tmp: PathBuf = path.with_extension("json.tmp");
     let bytes = serde_json::to_vec_pretty(value)?;
-    {
-        use std::io::Write;
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(&bytes)?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)?;
+    crate::fsutil::write_atomic(path, &bytes).with_context(|| format!("write {:?}", path))?;
     Ok(())
 }

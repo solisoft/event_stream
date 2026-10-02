@@ -1,24 +1,14 @@
-//! Raft consensus — **step 1 of N**: leader election only.
+//! Raft consensus: leader election, log replication, snapshots, and a TCP
+//! transport shared by every replicated partition on a broker.
 //!
-//! What works today:
-//!   * Term + voted-for state machine (`state::RaftState`)
-//!   * Randomized election timeouts + leader heartbeat
-//!   * Three-way role transitions: Follower → Candidate → Leader
-//!   * Per-peer TCP transport with persistent connections and reconnect
+//! * `state` — the pure state machine (no I/O, no clock).
+//! * `node` — the driver: timers, persistence-before-send, snapshot transfer.
+//! * `log` — the in-memory log and the durable, append-only store.
+//! * `transport` — one authenticated connection per peer, many groups over it.
 //!
-//! What's deliberately deferred to later steps:
-//!   * Log replication (`AppendEntries.entries` is always empty)
-//!   * Persistent `current_term` + `voted_for` (in-memory only — a real broker
-//!     must `fsync` these before responding to RPCs to keep election safety
-//!     across restarts)
-//!   * Snapshots / log truncation
-//!   * Membership changes (joint consensus)
-//!   * Linearizable client reads (read-index or leases)
-//!   * Integration with the partition log so writes go through Raft
-//!
-//! Treat this as the *scaffolding* — the wire types, state machine, and
-//! transport are designed so step 2 can add log replication without
-//! reshaping anything.
+//! Not implemented: joint-consensus membership changes (config entries are
+//! applied, but there is no safe reconfiguration protocol on top of them) and
+//! linearizable reads (reads are served from whatever the replica has applied).
 
 pub mod log;
 pub mod messages;
@@ -26,8 +16,13 @@ pub mod node;
 pub mod state;
 pub mod transport;
 
-pub use log::{JsonStore, Log, MemStore, PersistedRaft, PersistedSnapshot, RaftStore};
+pub use log::{
+    FileStore, JsonStore, Log, MemStore, PersistOp, PersistedRaft, PersistedSnapshot, RaftStore,
+};
 pub use messages::{LogEntry, LogIndex, Message, NodeId, Term};
-pub use node::{spawn_node, spawn_node_with_store, NodeHandle, Outbound, ProposeReply, Timing};
+pub use node::{
+    spawn_node, spawn_node_with_options, spawn_node_with_store, NodeHandle, NodeOptions, Outbound,
+    ProposeReply, SnapshotSender, SnapshotTransfer, Timing,
+};
 pub use state::{Action, RaftState, Role};
 pub use transport::{group_key, spawn_transport, RaftHub, Transport};

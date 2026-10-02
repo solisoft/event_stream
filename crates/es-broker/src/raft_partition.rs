@@ -1,69 +1,173 @@
-//! Proof-of-concept integration: a [`Partition`] backed by a Raft node.
+//! A [`Partition`] backed by a Raft group.
 //!
-//! Appends are proposed through the Raft leader's `propose` API. When the
-//! resulting log entry commits, a background apply task decodes the command
-//! and writes it to the underlying partition's segmented log; the proposer
-//! waits on a per-log-index `oneshot` to receive the assigned partition
-//! offset.
+//! # Write path
 //!
-//! Multi-node operation: call [`RaftPartition::connect_transport`] after
-//! opening to set up TCP connections between peers. Without it, the node
-//! operates in single-node mode (no replication).
+//! A produce request becomes **one** log entry carrying all of its records,
+//! the offset the first of them gets, and their timestamps — all assigned by
+//! the leader when it proposes. Replicas apply the entry by storing each record
+//! under exactly that offset (`Partition::append_batch` with explicit offsets),
+//! so every replica holds the same record at the same offset with the same
+//! timestamp, and re-applying an entry after a restart is a no-op.
+//!
+//! The proposer waits for its entry by **proposal id**, not by log index: if
+//! leadership changes and another leader's entry lands at the index this one
+//! was given, the waiter is told so instead of being handed that entry's
+//! offsets as its own.
+//!
+//! # Snapshots
+//!
+//! The partition log *is* the state machine, so a snapshot is just "the
+//! partition up to offset E, synced". A follower too far behind for the
+//! leader's Raft log is caught up by streaming it the records it is missing
+//! from the leader's partition ([`SnapshotTransfer`]).
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+use rand::RngCore;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::partition::Partition;
-use crate::raft::state::RaftState;
+use crate::partition::{now_ms, AppendRecord, Durability, Partition};
+use crate::raft::state::{is_config_entry, RaftState};
 use crate::raft::{
-    spawn_node_with_store,
+    spawn_node_with_options,
     transport::{RaftHub, Transport},
-    JsonStore, LogIndex, NodeHandle, NodeId, Outbound, ProposeReply, RaftStore, Timing,
+    JsonStore, LogIndex, NodeHandle, NodeId, NodeOptions, Outbound, ProposeReply, RaftStore,
+    SnapshotSender, SnapshotTransfer, Timing,
 };
 use tokio::sync::Mutex as TokioMutex;
 
-fn encode_append_command(key: Option<&[u8]>, value: &[u8]) -> Vec<u8> {
-    let key_len_field: i32 = key.map(|k| k.len() as i32).unwrap_or(-1);
-    let mut out = Vec::with_capacity(4 + key.map_or(0, |k| k.len()) + 4 + value.len());
-    out.extend_from_slice(&key_len_field.to_be_bytes());
-    if let Some(k) = key {
-        out.extend_from_slice(k);
+/// Version tag of a data entry. Entries written before batching began with an
+/// `i32` key length instead, whose first byte is 0x00 or 0xFF.
+const ENTRY_V1: u8 = 0x01;
+
+/// A decoded data entry.
+#[derive(Debug, PartialEq)]
+enum Command {
+    Batch {
+        proposal: u64,
+        base_offset: u64,
+        records: Vec<(i64, Option<Vec<u8>>, Vec<u8>)>,
+    },
+    /// The pre-batching single-record format. Its offset was the entry's
+    /// index minus one by construction.
+    Legacy {
+        key: Option<Vec<u8>>,
+        value: Vec<u8>,
+    },
+}
+
+fn encode_batch(proposal: u64, base_offset: u64, ts: i64, records: &[AppendRecord]) -> Vec<u8> {
+    let size: usize = records
+        .iter()
+        .map(|r| 8 + 4 + r.key.as_ref().map_or(0, |k| k.len()) + 4 + r.value.len())
+        .sum();
+    let mut out = Vec::with_capacity(1 + 8 + 8 + 4 + size);
+    out.push(ENTRY_V1);
+    out.extend_from_slice(&proposal.to_be_bytes());
+    out.extend_from_slice(&base_offset.to_be_bytes());
+    out.extend_from_slice(&(records.len() as u32).to_be_bytes());
+    for r in records {
+        out.extend_from_slice(&r.timestamp_ms.unwrap_or(ts).to_be_bytes());
+        match &r.key {
+            Some(k) => {
+                out.extend_from_slice(&(k.len() as i32).to_be_bytes());
+                out.extend_from_slice(k);
+            }
+            None => out.extend_from_slice(&(-1i32).to_be_bytes()),
+        }
+        out.extend_from_slice(&(r.value.len() as u32).to_be_bytes());
+        out.extend_from_slice(&r.value);
     }
-    out.extend_from_slice(&(value.len() as u32).to_be_bytes());
-    out.extend_from_slice(value);
     out
 }
 
-fn decode_append_command(bytes: &[u8]) -> Result<(Option<Vec<u8>>, Vec<u8>)> {
-    if bytes.len() < 8 {
-        return Err(anyhow!("append command too short"));
+/// Just the `(base_offset, count)` of a batch entry, without copying records.
+fn batch_span(bytes: &[u8]) -> Option<(u64, u64)> {
+    if bytes.len() < 21 || bytes[0] != ENTRY_V1 {
+        return None;
     }
-    let key_len = i32::from_be_bytes(bytes[0..4].try_into().unwrap());
-    let (key, mut pos): (Option<Vec<u8>>, usize) = if key_len < 0 {
-        (None, 4)
-    } else {
-        let kl = key_len as usize;
-        if bytes.len() < 4 + kl + 4 {
-            return Err(anyhow!("append command truncated in key"));
+    let base = u64::from_be_bytes(bytes[9..17].try_into().ok()?);
+    let count = u32::from_be_bytes(bytes[17..21].try_into().ok()?) as u64;
+    Some((base, count))
+}
+
+struct Cur<'a> {
+    b: &'a [u8],
+    p: usize,
+}
+
+impl<'a> Cur<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+        let end = self
+            .p
+            .checked_add(n)
+            .ok_or_else(|| anyhow!("length overflow"))?;
+        let s = self
+            .b
+            .get(self.p..end)
+            .ok_or_else(|| anyhow!("entry truncated"))?;
+        self.p = end;
+        Ok(s)
+    }
+    fn u32(&mut self) -> Result<u32> {
+        Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+    }
+    fn i32(&mut self) -> Result<i32> {
+        Ok(self.u32()? as i32)
+    }
+    fn u64(&mut self) -> Result<u64> {
+        Ok(u64::from_be_bytes(self.take(8)?.try_into().unwrap()))
+    }
+    fn opt_bytes(&mut self) -> Result<Option<Vec<u8>>> {
+        let n = self.i32()?;
+        if n < 0 {
+            return Ok(None);
         }
-        let k = bytes[4..4 + kl].to_vec();
-        (Some(k), 4 + kl)
-    };
-    let value_len = u32::from_be_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
-    pos += 4;
-    if bytes.len() < pos + value_len {
-        return Err(anyhow!("append command truncated in value"));
+        Ok(Some(self.take(n as usize)?.to_vec()))
     }
-    let value = bytes[pos..pos + value_len].to_vec();
-    Ok((key, value))
+    fn bytes(&mut self) -> Result<Vec<u8>> {
+        let n = self.u32()? as usize;
+        Ok(self.take(n)?.to_vec())
+    }
+}
+
+fn decode_command(bytes: &[u8]) -> Result<Command> {
+    if bytes.first() == Some(&ENTRY_V1) {
+        let mut c = Cur { b: bytes, p: 1 };
+        let proposal = c.u64()?;
+        let base_offset = c.u64()?;
+        let n = c.u32()? as usize;
+        let mut records = Vec::with_capacity(n.min(bytes.len() / 16));
+        for _ in 0..n {
+            let ts = c.u64()? as i64;
+            let key = c.opt_bytes()?;
+            let value = c.bytes()?;
+            records.push((ts, key, value));
+        }
+        if c.p != bytes.len() {
+            return Err(anyhow!("trailing bytes after batch entry"));
+        }
+        return Ok(Command::Batch {
+            proposal,
+            base_offset,
+            records,
+        });
+    }
+    let mut c = Cur { b: bytes, p: 0 };
+    let key = c.opt_bytes()?;
+    let value = c.bytes()?;
+    if c.p != bytes.len() {
+        return Err(anyhow!("trailing bytes after append command"));
+    }
+    Ok(Command::Legacy { key, value })
 }
 
 /// How long an accepted proposal is given to commit before the caller is told
@@ -76,17 +180,26 @@ pub struct AppendResult {
     pub offset: u64,
 }
 
-enum Slot {
-    Pending(oneshot::Sender<Result<AppendResult, String>>),
-    Applied(Result<AppendResult, String>),
+struct Waiter {
+    tx: oneshot::Sender<Result<Vec<u64>, String>>,
+    /// The log index the proposal was given, once known.
+    index: Option<LogIndex>,
 }
+
+type Waiters = Arc<Mutex<HashMap<u64, Waiter>>>;
 
 pub struct RaftPartition {
     partition: Arc<Partition>,
     raft: NodeHandle,
-    slots: Arc<Mutex<HashMap<LogIndex, Slot>>>,
+    waiters: Waiters,
+    /// Serializes "assign offsets, propose" so proposals enter the log in
+    /// offset order.
+    propose_lock: TokioMutex<()>,
+    proposal_nonce: u64,
+    proposal_counter: AtomicU64,
     cancel: CancellationToken,
     apply_join: Mutex<Option<JoinHandle<()>>>,
+    node_join: Mutex<Option<JoinHandle<()>>>,
     /// Held aside after construction; consumed by `connect_transport`.
     outbound_rx: Mutex<Option<mpsc::UnboundedReceiver<Outbound>>>,
     /// Set by `connect_transport`.
@@ -107,7 +220,7 @@ pub struct RaftTransportConfig {
     pub bind: SocketAddr,
     pub peer_addrs: BTreeMap<NodeId, SocketAddr>,
     /// Pre-shared secret peers must present in the raft handshake. `None`
-    /// disables peer authentication (only safe on a trusted/loopback network).
+    /// disables peer authentication (only allowed on a loopback bind).
     pub shared_secret: Option<String>,
 }
 
@@ -120,6 +233,86 @@ impl RaftPartitionConfig {
             timing: Timing::default(),
             snapshot_after_applies: 1024,
         }
+    }
+}
+
+/// Ships partition records to a lagging follower.
+///
+/// Chunk format: `end u64` (the state end of the snapshot being installed),
+/// then records as `offset u64 | ts i64 | key (i32 len, -1 = none) | value
+/// (u32 len)`.
+struct PartitionTransfer {
+    partition: Arc<Partition>,
+}
+
+impl SnapshotTransfer for PartitionTransfer {
+    fn read_chunk(&self, from: u64, end: u64, max_bytes: usize) -> Result<(Vec<u8>, bool)> {
+        let mut out = Vec::with_capacity(max_bytes.min(1 << 20) + 64);
+        out.extend_from_slice(&end.to_be_bytes());
+        let mut cursor = from;
+        while cursor < end && out.len() < max_bytes {
+            let (records, next, _) = self.partition.read_records_raw(
+                cursor,
+                usize::MAX,
+                max_bytes - out.len().min(max_bytes),
+            )?;
+            for r in records.iter().filter(|r| r.offset < end) {
+                out.extend_from_slice(&r.offset.to_be_bytes());
+                out.extend_from_slice(&r.timestamp_ms.to_be_bytes());
+                match &r.key {
+                    Some(k) => {
+                        out.extend_from_slice(&(k.len() as i32).to_be_bytes());
+                        out.extend_from_slice(k);
+                    }
+                    None => out.extend_from_slice(&(-1i32).to_be_bytes()),
+                }
+                out.extend_from_slice(&(r.value.len() as u32).to_be_bytes());
+                out.extend_from_slice(&r.value);
+            }
+            if next <= cursor {
+                break;
+            }
+            cursor = next;
+        }
+        Ok((out, cursor >= end))
+    }
+
+    fn apply_chunk(&self, data: &[u8], done: bool) -> Result<()> {
+        let mut c = Cur { b: data, p: 0 };
+        let end = c.u64()?;
+        let mut recs = Vec::new();
+        while c.p < data.len() {
+            let offset = c.u64()?;
+            let ts = c.u64()? as i64;
+            let key = c.opt_bytes()?;
+            let value = c.bytes()?;
+            recs.push(AppendRecord {
+                key,
+                value,
+                timestamp_ms: Some(ts),
+                offset: Some(offset),
+            });
+        }
+        self.partition.append_batch(&recs, Durability::Deferred)?;
+        if done {
+            // Offsets with no record (retention on the leader, entries with
+            // nothing to store) still count as covered.
+            self.partition.advance_to(end);
+            // The Raft log behind this snapshot is about to be dropped.
+            self.partition.sync_all()?;
+        }
+        Ok(())
+    }
+
+    fn progress(&self) -> u64 {
+        self.partition.end_offset()
+    }
+
+    fn snapshot_end(&self, data: &[u8]) -> u64 {
+        data.get(0..8)
+            .and_then(|b| b.try_into().ok())
+            .map(u64::from_be_bytes)
+            .unwrap_or(0)
     }
 }
 
@@ -138,44 +331,53 @@ impl RaftPartition {
             flush_every_records,
         )?;
         let store: Arc<dyn RaftStore> = Arc::new(JsonStore::new(config.raft_store_path));
-        let mut raft =
-            spawn_node_with_store(config.node_id, config.peers, config.timing, store.clone())?;
-        let raft_state = raft.state.clone();
+        let options = NodeOptions {
+            noop_on_elect: true,
+            transfer: Some(Arc::new(PartitionTransfer {
+                partition: partition.clone(),
+            })),
+        };
+        let mut raft = spawn_node_with_options(
+            config.node_id,
+            config.peers,
+            config.timing,
+            store.clone(),
+            options,
+        )?;
 
-        // Take the outbound channel now so transport can use it later.
         let outbound_rx = raft.take_outbound();
-
-        let slots: Arc<Mutex<HashMap<LogIndex, Slot>>> = Arc::new(Mutex::new(HashMap::new()));
+        let node_join = raft.join.take();
+        let waiters: Waiters = Arc::new(Mutex::new(HashMap::new()));
         let cancel = CancellationToken::new();
 
         let committed = raft
             .take_committed()
             .ok_or_else(|| anyhow!("raft node committed receiver already taken"))?;
 
-        let p_for_apply = partition.clone();
-        let slots_for_apply = slots.clone();
+        let apply = ApplyLoop {
+            partition: partition.clone(),
+            waiters: waiters.clone(),
+            snapshot_after_applies: config.snapshot_after_applies,
+        };
+        let raft_for_apply = raft.snapshot_sender();
         let cancel_for_apply = cancel.clone();
-        let store_for_apply = store.clone();
-        let snapshot_threshold = config.snapshot_after_applies;
         let apply_join = tokio::spawn(async move {
-            apply_loop(
-                committed,
-                p_for_apply,
-                slots_for_apply,
-                cancel_for_apply,
-                raft_state,
-                store_for_apply,
-                snapshot_threshold,
-            )
-            .await;
+            apply.run(committed, cancel_for_apply, raft_for_apply).await;
         });
+
+        let mut nonce = [0u8; 8];
+        rand::thread_rng().fill_bytes(&mut nonce);
 
         Ok(Arc::new(Self {
             partition,
             raft,
-            slots,
+            waiters,
+            propose_lock: TokioMutex::new(()),
+            proposal_nonce: u64::from_be_bytes(nonce),
+            proposal_counter: AtomicU64::new(0),
             cancel,
             apply_join: Mutex::new(Some(apply_join)),
+            node_join: Mutex::new(node_join),
             outbound_rx: Mutex::new(outbound_rx),
             transport: Mutex::new(None),
         }))
@@ -184,15 +386,10 @@ impl RaftPartition {
     /// Route this partition's Raft traffic over a hub shared with every other
     /// partition on this broker. Must be called after `open()` and before any
     /// appends; without it the node operates in single-node mode.
-    ///
-    /// This is the path a real cluster uses. `connect_transport` below is the
-    /// same thing with a hub of its own, for a single partition.
     pub fn attach_to_hub(&self, hub: &Arc<RaftHub>, group: &str) -> Result<()> {
         let outbound_rx = self.take_outbound()?;
         hub.register(group, self.raft.inbound.clone(), outbound_rx)
             .with_context(|| format!("register raft group '{group}'"))?;
-        // The dispatcher handle is dropped: the hub's cancellation token stops
-        // it, and the task must outlive this call.
         Ok(())
     }
 
@@ -218,18 +415,11 @@ impl RaftPartition {
             tcfg.shared_secret,
         )
         .await?;
-        {
-            let mut guard = self.transport.lock().unwrap();
-            *guard = Some(transport);
-        }
+        *self.transport.lock().unwrap() = Some(transport);
         Ok(())
     }
 
     /// The Raft state machine behind this partition, for reporting only.
-    ///
-    /// Read-only by convention: the node loop owns every mutation, and a second
-    /// writer would race it. Exposed so `/raft` can answer "is this member
-    /// replicating?" — which nothing outside the process could tell before.
     pub fn raft_state(&self) -> &Arc<TokioMutex<RaftState>> {
         &self.raft.state
     }
@@ -245,178 +435,248 @@ impl RaftPartition {
     }
 
     pub async fn append(&self, key: Option<&[u8]>, value: &[u8]) -> Result<u64> {
-        let cmd = encode_append_command(key, value);
-        let reply = self.raft.propose(cmd).await?;
+        let offs = self
+            .append_batch(vec![AppendRecord::new(
+                key.map(|k| k.to_vec()),
+                value.to_vec(),
+            )])
+            .await?;
+        Ok(offs[0])
+    }
+
+    /// The offset the next proposal starts at: past every record already in
+    /// the partition and every record any entry in the log will produce — a
+    /// new leader's log can hold uncommitted entries from its predecessor that
+    /// will commit, and their offsets must not be handed out twice.
+    async fn next_assignable_offset(&self) -> u64 {
+        let state = self.raft.state.lock().await;
+        let mut from_log = None;
+        for e in state.log.entries.iter().rev() {
+            if e.payload.is_empty() || is_config_entry(&e.payload) {
+                continue;
+            }
+            from_log = Some(match batch_span(&e.payload) {
+                Some((base, count)) => base + count,
+                // Legacy single-record entry: its offset is index - 1.
+                None => e.index,
+            });
+            break;
+        }
+        drop(state);
+        from_log.unwrap_or(0).max(self.partition.end_offset())
+    }
+
+    /// Propose `records` as one entry and wait for it to be applied. Returns
+    /// each record's offset.
+    pub async fn append_batch(&self, records: Vec<AppendRecord>) -> Result<Vec<u64>> {
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+        let proposal = self
+            .proposal_nonce
+            .wrapping_add(self.proposal_counter.fetch_add(1, Ordering::Relaxed));
+        let (tx, rx) = oneshot::channel();
+        // Registered before proposing: on a single-node cluster the entry can
+        // be applied before `propose` even returns.
+        self.waiters
+            .lock()
+            .unwrap()
+            .insert(proposal, Waiter { tx, index: None });
+
+        let reply = {
+            let _guard = self.propose_lock.lock().await;
+            let base = self.next_assignable_offset().await;
+            let payload = encode_batch(proposal, base, now_ms(), &records);
+            self.raft.propose(payload).await
+        };
         let index = match reply {
-            ProposeReply::Accepted { index } => index,
-            ProposeReply::NotLeader { leader_hint } => {
+            Ok(ProposeReply::Accepted { index }) => index,
+            Ok(ProposeReply::NotLeader { leader_hint }) => {
+                self.waiters.lock().unwrap().remove(&proposal);
                 return Err(anyhow!(
                     "not leader (hint: {:?}); produce must be routed to the leader",
                     leader_hint
                 ));
             }
-        };
-
-        let rx = {
-            let mut slots = self.slots.lock().unwrap();
-            match slots.remove(&index) {
-                Some(Slot::Applied(res)) => return res.map(|r| r.offset).map_err(|e| anyhow!(e)),
-                Some(Slot::Pending(_)) => {
-                    return Err(anyhow!("duplicate pending slot for raft index {}", index));
-                }
-                None => {
-                    let (tx, rx) = oneshot::channel();
-                    slots.insert(index, Slot::Pending(tx));
-                    rx
-                }
+            Err(e) => {
+                self.waiters.lock().unwrap().remove(&proposal);
+                return Err(e);
             }
         };
+        if let Some(w) = self.waiters.lock().unwrap().get_mut(&proposal) {
+            w.index = Some(index);
+        }
 
-        // Bounded, because an entry proposed while the quorum is gone never
-        // commits and an unbounded wait would hold the client's connection for
-        // as long as the outage lasts. The slot is left in place on purpose: the
-        // apply loop removes it if the entry does eventually commit, so giving
-        // up here leaks nothing.
+        // Bounded: an entry proposed while the quorum is gone never commits,
+        // and an unbounded wait would hold the client for the whole outage.
         match tokio::time::timeout(COMMIT_TIMEOUT, rx).await {
-            Ok(Ok(Ok(result))) => Ok(result.offset),
+            Ok(Ok(Ok(offsets))) => Ok(offsets),
             Ok(Ok(Err(e))) => Err(anyhow!(e)),
             Ok(Err(_)) => Err(anyhow!(
                 "raft apply task exited before this entry was applied"
             )),
-            Err(_) => Err(anyhow!(
-                "raft entry {} was accepted into the log but did not commit within {:?}: the \
-                 leader cannot reach a majority of the cluster",
-                index,
-                COMMIT_TIMEOUT
-            )),
+            Err(_) => {
+                self.waiters.lock().unwrap().remove(&proposal);
+                Err(anyhow!(
+                    "raft entry {} was accepted into the log but did not commit within {:?}: the \
+                     leader cannot reach a majority of the cluster",
+                    index,
+                    COMMIT_TIMEOUT
+                ))
+            }
         }
     }
 
     pub async fn shutdown(&self) {
         self.cancel.cancel();
-        {
-            let mut guard = self.transport.lock().unwrap();
-            if let Some(t) = guard.take() {
-                t.cancel.cancel();
-            }
+        self.raft.cancel.cancel();
+        if let Some(t) = self.transport.lock().unwrap().take() {
+            t.cancel.cancel();
         }
-        let join = {
-            let mut guard = self.apply_join.lock().unwrap();
-            guard.take()
-        };
-        if let Some(j) = join {
+        let apply = self.apply_join.lock().unwrap().take();
+        if let Some(j) = apply {
             let _ = j.await;
         }
-        let mut slots = self.slots.lock().unwrap();
-        for (_, slot) in slots.drain() {
-            if let Slot::Pending(tx) = slot {
-                let _ = tx.send(Err("raft partition shutdown".to_string()));
-            }
+        let node = self.node_join.lock().unwrap().take();
+        if let Some(j) = node {
+            let _ = j.await;
+        }
+        for (_, w) in self.waiters.lock().unwrap().drain() {
+            let _ = w.tx.send(Err("raft partition shutdown".to_string()));
         }
     }
 }
 
-async fn apply_loop(
-    mut committed: tokio::sync::mpsc::UnboundedReceiver<crate::raft::messages::LogEntry>,
+struct ApplyLoop {
     partition: Arc<Partition>,
-    slots: Arc<Mutex<HashMap<LogIndex, Slot>>>,
-    cancel: CancellationToken,
-    raft_state: Arc<TokioMutex<RaftState>>,
-    store: Arc<dyn RaftStore>,
+    waiters: Waiters,
     snapshot_after_applies: u32,
-) {
-    let skip_at_or_below = partition.end_offset();
-    let mut applies_since_snapshot: u32 = 0;
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => break,
-            msg = committed.recv() => {
-                let Some(entry) = msg else { break; };
-                if entry.index <= skip_at_or_below {
-                    let already = AppendResult { offset: entry.index.saturating_sub(1) };
-                    let mut s = slots.lock().unwrap();
-                    match s.remove(&entry.index) {
-                        Some(Slot::Pending(tx)) => { let _ = tx.send(Ok(already)); }
-                        _ => { s.insert(entry.index, Slot::Applied(Ok(already))); }
-                    }
-                    continue;
-                }
-                let outcome = match decode_append_command(&entry.payload) {
-                    Ok((key, value)) => {
-                        match partition.append(key.as_deref(), &value).await {
-                            Ok(offset) => Ok(AppendResult { offset }),
-                            Err(e) => Err(format!("partition append: {}", e)),
-                        }
-                    }
-                    Err(e) => Err(format!("decode: {}", e)),
-                };
-                let succeeded = outcome.is_ok();
-                {
-                    let mut s = slots.lock().unwrap();
-                    match s.remove(&entry.index) {
-                        Some(Slot::Pending(tx)) => { let _ = tx.send(outcome); }
-                        Some(Slot::Applied(_)) => {}
-                        None => {
-                            s.insert(entry.index, Slot::Applied(outcome));
-                        }
-                    }
-                }
-                if succeeded {
-                    applies_since_snapshot += 1;
-                    if snapshot_after_applies > 0
-                        && applies_since_snapshot >= snapshot_after_applies
-                    {
-                        if let Err(e) = take_snapshot(&raft_state, &store, &partition).await {
-                            tracing::warn!(error = %e, "raft_partition: snapshot failed");
-                        }
-                        applies_since_snapshot = 0;
-                    }
+}
+
+impl ApplyLoop {
+    async fn run(
+        self,
+        mut committed: mpsc::UnboundedReceiver<crate::raft::messages::LogEntry>,
+        cancel: CancellationToken,
+        raft: SnapshotSender,
+    ) {
+        let mut applies_since_snapshot: u32 = 0;
+        loop {
+            let entry = tokio::select! {
+                _ = cancel.cancelled() => break,
+                msg = committed.recv() => match msg {
+                    Some(e) => e,
+                    None => break,
+                },
+            };
+            let index = entry.index;
+            if let Err(e) = self.apply(entry).await {
+                // The partition is fenced (or the entry is garbage): applying
+                // later entries on top would diverge from the other replicas.
+                tracing::error!(
+                    partition = self.partition.id,
+                    index,
+                    error = %e,
+                    "raft apply failed; this replica stops applying"
+                );
+                break;
+            }
+            applies_since_snapshot += 1;
+            if self.snapshot_after_applies > 0
+                && applies_since_snapshot >= self.snapshot_after_applies
+            {
+                applies_since_snapshot = 0;
+                if let Err(e) = self.snapshot(&raft, index).await {
+                    tracing::warn!(partition = self.partition.id, error = %e, "raft_partition: snapshot failed");
                 }
             }
         }
-    }
-    while let Ok(entry) = committed.try_recv() {
-        let outcome = match decode_append_command(&entry.payload) {
-            Ok((key, value)) => partition
-                .append(key.as_deref(), &value)
-                .await
-                .map(|offset| AppendResult { offset })
-                .map_err(|e| format!("partition append: {}", e)),
-            Err(e) => Err(format!("decode: {}", e)),
-        };
-        let mut s = slots.lock().unwrap();
-        if let Some(Slot::Pending(tx)) = s.remove(&entry.index) {
-            let _ = tx.send(outcome);
-        } else {
-            s.insert(entry.index, Slot::Applied(outcome));
+        // Whoever is still waiting will not be answered.
+        for (_, w) in self.waiters.lock().unwrap().drain() {
+            let _ = w.tx.send(Err("raft apply loop stopped".to_string()));
         }
+        tracing::debug!("raft_partition: apply loop exited");
     }
-    tracing::debug!("raft_partition: apply loop exited");
-}
 
-async fn take_snapshot(
-    state: &Arc<TokioMutex<RaftState>>,
-    store: &Arc<dyn RaftStore>,
-    partition: &Arc<Partition>,
-) -> anyhow::Result<()> {
-    let data = partition.end_offset().to_be_bytes().to_vec();
-    let (snap, persisted) = {
-        let mut s = state.lock().await;
-        if s.last_applied == 0 {
-            return Ok(());
+    async fn apply(&self, entry: crate::raft::messages::LogEntry) -> Result<()> {
+        let (proposal, records) = match decode_command(&entry.payload)? {
+            Command::Batch {
+                proposal,
+                base_offset,
+                records,
+            } => {
+                let recs: Vec<AppendRecord> = records
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (ts, key, value))| AppendRecord {
+                        key,
+                        value,
+                        timestamp_ms: Some(ts),
+                        offset: Some(base_offset + i as u64),
+                    })
+                    .collect();
+                (Some(proposal), recs)
+            }
+            Command::Legacy { key, value } => (
+                None,
+                vec![AppendRecord {
+                    key,
+                    value,
+                    timestamp_ms: None,
+                    offset: Some(entry.index.saturating_sub(1)),
+                }],
+            ),
+        };
+        let p = self.partition.clone();
+        let offsets =
+            tokio::task::spawn_blocking(move || p.append_batch(&records, Durability::Deferred))
+                .await
+                .map_err(|e| anyhow!("apply task: {e}"))??;
+
+        let mut waiters = self.waiters.lock().unwrap();
+        if let Some(pid) = proposal {
+            if let Some(w) = waiters.remove(&pid) {
+                let _ = w.tx.send(Ok(offsets));
+            }
         }
-        let snap = s.take_snapshot(data)?;
-        let persisted = s.snapshot_persistent();
-        (snap, persisted)
-    };
-    store.save_snapshot(&snap)?;
-    store.save_all(&persisted)?;
-    tracing::info!(
-        last_index = snap.last_index,
-        last_term = snap.last_term,
-        "raft_partition: snapshot taken"
-    );
-    Ok(())
+        // A proposal that was given this index but is not this entry lost it
+        // to another leader's entry: it will never be applied.
+        let superseded: Vec<u64> = waiters
+            .iter()
+            .filter(|(_, w)| w.index.is_some_and(|i| i <= entry.index))
+            .map(|(pid, _)| *pid)
+            .collect();
+        for pid in superseded {
+            if let Some(w) = waiters.remove(&pid) {
+                let _ = w.tx.send(Err(format!(
+                    "raft entry at index {} was replaced by another leader's entry; the write \
+                     was not applied",
+                    w.index.unwrap_or_default()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Snapshot through `through`: everything up to it has been applied, and
+    /// the partition is synced before the log behind it may be dropped.
+    async fn snapshot(&self, raft: &SnapshotSender, through: LogIndex) -> Result<()> {
+        let p = self.partition.clone();
+        let end = tokio::task::spawn_blocking(move || -> Result<u64> {
+            p.sync_all()?;
+            Ok(p.end_offset())
+        })
+        .await
+        .map_err(|e| anyhow!("snapshot sync task: {e}"))??;
+        raft.take(end.to_be_bytes().to_vec(), Some(through)).await?;
+        tracing::debug!(
+            partition = self.partition.id,
+            through,
+            end,
+            "raft_partition: snapshot taken"
+        );
+        Ok(())
+    }
 }
 
 pub fn test_timing() -> Timing {
@@ -427,40 +687,95 @@ pub fn test_timing() -> Timing {
     }
 }
 
-#[allow(unused_imports)]
-use Context as _;
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn append_command_roundtrip() {
-        let bytes = encode_append_command(Some(b"k1"), b"hello\x00world");
-        let (k, v) = decode_append_command(&bytes).unwrap();
-        assert_eq!(k.as_deref(), Some(&b"k1"[..]));
-        assert_eq!(v, b"hello\x00world");
+    fn batch_command_roundtrip() {
+        let recs = vec![
+            AppendRecord::new(Some(b"k1".to_vec()), b"hello\x00world".to_vec()),
+            AppendRecord::new(None, b"v-only".to_vec()),
+            AppendRecord::new(Some(Vec::new()), Vec::new()),
+        ];
+        let bytes = encode_batch(42, 100, 7, &recs);
+        assert_eq!(batch_span(&bytes), Some((100, 3)));
+        match decode_command(&bytes).unwrap() {
+            Command::Batch {
+                proposal,
+                base_offset,
+                records,
+            } => {
+                assert_eq!(proposal, 42);
+                assert_eq!(base_offset, 100);
+                assert_eq!(
+                    records[0],
+                    (7, Some(b"k1".to_vec()), b"hello\x00world".to_vec())
+                );
+                assert_eq!(records[1], (7, None, b"v-only".to_vec()));
+                assert_eq!(records[2], (7, Some(Vec::new()), Vec::new()));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
 
-        let bytes = encode_append_command(None, b"v-only");
-        let (k, v) = decode_append_command(&bytes).unwrap();
-        assert!(k.is_none());
-        assert_eq!(v, b"v-only");
-
-        let bytes = encode_append_command(Some(b""), b"");
-        let (k, v) = decode_append_command(&bytes).unwrap();
-        assert_eq!(k.as_deref(), Some(&b""[..]));
-        assert_eq!(v, b"");
+    #[test]
+    fn legacy_command_still_decodes() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&2i32.to_be_bytes());
+        bytes.extend_from_slice(b"k1");
+        bytes.extend_from_slice(&5u32.to_be_bytes());
+        bytes.extend_from_slice(b"hello");
+        assert_eq!(
+            decode_command(&bytes).unwrap(),
+            Command::Legacy {
+                key: Some(b"k1".to_vec()),
+                value: b"hello".to_vec()
+            }
+        );
     }
 
     #[test]
     fn decode_rejects_truncated_input() {
-        assert!(decode_append_command(&[]).is_err());
-        let mut bytes = encode_append_command(Some(b"k"), b"v");
+        assert!(decode_command(&[]).is_err());
+        let mut bytes = encode_batch(
+            1,
+            0,
+            0,
+            &[AppendRecord::new(Some(b"k".to_vec()), b"v".to_vec())],
+        );
         bytes.truncate(bytes.len() - 1);
-        assert!(decode_append_command(&bytes).is_err());
+        assert!(decode_command(&bytes).is_err());
     }
 
-    fn _use_test_timing() -> Timing {
-        test_timing()
+    #[test]
+    fn transfer_chunks_roundtrip_between_partitions() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let src = Partition::open(a.path().to_path_buf(), 0, 4096, 1).unwrap();
+        let dst = Partition::open(b.path().to_path_buf(), 0, 4096, 1).unwrap();
+        let recs: Vec<AppendRecord> = (0..300)
+            .map(|i| AppendRecord::new(None, format!("record-{i}").into_bytes()))
+            .collect();
+        src.append_batch(&recs, Durability::Policy).unwrap();
+        let tx = PartitionTransfer {
+            partition: src.clone(),
+        };
+        let rx = PartitionTransfer {
+            partition: dst.clone(),
+        };
+        let end = src.end_offset();
+        let mut from = rx.progress();
+        loop {
+            let (chunk, done) = tx.read_chunk(from, end, 2048).unwrap();
+            rx.apply_chunk(&chunk, done).unwrap();
+            from = rx.progress();
+            if done {
+                break;
+            }
+        }
+        assert_eq!(dst.end_offset(), 300);
+        let (got, _, _) = dst.read_records_raw(299, 1, 1 << 20).unwrap();
+        assert_eq!(got[0].value, b"record-299");
     }
 }

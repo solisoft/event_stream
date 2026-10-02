@@ -1,6 +1,4 @@
-//! Raft RPC message types. Implements the **leader-election** subset for
-//! session 1 — log replication carries `entries` and `leader_commit` but the
-//! current node only ever sends empty heartbeats.
+//! Raft RPC message types.
 //!
 //! Wire format (big-endian, length-prefixed at the framing layer):
 //!
@@ -21,15 +19,13 @@ pub const TAG_APPEND_ENTRIES_RESP: u8 = 0x04;
 pub const TAG_INSTALL_SNAPSHOT: u8 = 0x05;
 pub const TAG_INSTALL_SNAPSHOT_RESP: u8 = 0x06;
 
-/// Node identifier. Hand-assigned via CLI in step 1; later a discovery service.
+/// Node identifier, hand-assigned via `--raft-node-id`.
 pub type NodeId = u32;
 
 /// Raft term. Monotonically increasing.
 pub type Term = u64;
 
-/// Index into the replicated log. Step 1 only carries log_index = 0 in
-/// AppendEntries heartbeats, but the field is here so step 2 doesn't need a
-/// wire change.
+/// Index into the replicated log.
 pub type LogIndex = u64;
 
 #[derive(Debug, Clone)]
@@ -53,7 +49,6 @@ pub struct AppendEntries {
     pub leader_id: NodeId,
     pub prev_log_index: LogIndex,
     pub prev_log_term: Term,
-    /// In step 1 this is always empty. Carries log entries in step 2.
     pub entries: Vec<LogEntry>,
     pub leader_commit: LogIndex,
 }
@@ -63,10 +58,19 @@ pub struct AppendEntriesResp {
     pub term: Term,
     pub success: bool,
     pub responder_id: NodeId,
-    /// For step 2: the highest log_index the follower has after this RPC.
+    /// On success: the highest index this RPC proved the follower shares with
+    /// the leader (`prev_log_index + entries.len()`). On failure: the
+    /// follower's last log index, a hint for where the leader should back up to.
     pub match_index: LogIndex,
 }
 
+/// One chunk of a snapshot transfer.
+///
+/// With a state-machine transfer configured (Raft partitions), the leader
+/// streams the records the follower is missing: `offset` is the state-machine
+/// position the chunk starts at, `data` the chunk, `done` marks the last one.
+/// The first message of a transfer is a probe — `offset == PROBE_OFFSET`, no
+/// data — that asks the follower where to start.
 #[derive(Debug, Clone)]
 pub struct InstallSnapshot {
     pub term: Term,
@@ -78,11 +82,28 @@ pub struct InstallSnapshot {
     pub data: Vec<u8>,
 }
 
+/// `InstallSnapshot::offset` of a probe.
+pub const PROBE_OFFSET: u64 = u64::MAX;
+
+impl InstallSnapshot {
+    pub fn is_probe(&self) -> bool {
+        self.offset == PROBE_OFFSET && self.data.is_empty() && !self.done
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct InstallSnapshotResp {
     pub term: Term,
     pub success: bool,
     pub responder_id: NodeId,
+    /// The follower's state-machine position after this chunk: where the next
+    /// chunk should start.
+    pub next_offset: u64,
+    /// Non-zero once the snapshot is installed: the index the follower's log
+    /// now starts after. The leader advances `match_index` to it — without this
+    /// the leader never learned the transfer had finished and resent the
+    /// snapshot forever.
+    pub installed_index: LogIndex,
 }
 
 #[derive(Debug, Clone)]
@@ -186,6 +207,8 @@ impl Message {
                 buf.extend_from_slice(&m.term.to_be_bytes());
                 buf.push(if m.success { 1 } else { 0 });
                 buf.extend_from_slice(&m.responder_id.to_be_bytes());
+                buf.extend_from_slice(&m.next_offset.to_be_bytes());
+                buf.extend_from_slice(&m.installed_index.to_be_bytes());
             }
         }
         buf
@@ -268,6 +291,8 @@ impl Message {
                 term: r.u64()?,
                 success: r.u8()? != 0,
                 responder_id: r.u32()?,
+                next_offset: r.u64()?,
+                installed_index: r.u64()?,
             })),
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,

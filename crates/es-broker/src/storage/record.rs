@@ -43,7 +43,7 @@ const RECORD_LEN_FIELD: usize = 4;
 /// u32 read straight off disk; without a cap a corrupt/hostile length (up to
 /// ~4 GiB) forces a giant zeroed allocation during recovery or consume. Set
 /// well above any realistic record size.
-const MAX_RECORD_BODY_BYTES: usize = 256 * 1024 * 1024;
+pub const MAX_RECORD_BODY_BYTES: usize = 256 * 1024 * 1024;
 
 /// Encode a record into `buf`. Returns the total number of bytes written, including
 /// the leading `record_len` and trailing CRC.
@@ -98,8 +98,23 @@ pub fn read_record<R: Read + Seek>(reader: &mut R) -> Result<Record, RecordDecod
         }
         Err(e) => return Err(e.into()),
     }
-    let body_len = u32::from_be_bytes(len_buf) as usize;
+    let body_len = check_body_len(u32::from_be_bytes(len_buf), at)?;
 
+    let mut body = vec![0u8; body_len];
+    if let Err(e) = reader.read_exact(&mut body) {
+        if e.kind() == io::ErrorKind::UnexpectedEof {
+            // Don't leave the cursor mid-record; the caller will truncate at `at`.
+            reader.seek(SeekFrom::Start(at))?;
+            return Err(RecordDecodeError::Truncated { at });
+        }
+        return Err(e.into());
+    }
+    decode_body(&body, at)
+}
+
+/// Validate a `record_len` read off disk before anything is allocated for it.
+pub fn check_body_len(raw: u32, at: u64) -> Result<usize, RecordDecodeError> {
+    let body_len = raw as usize;
     if body_len < HEADER_LEN + VALUE_LEN_FIELD + CRC_LEN {
         return Err(RecordDecodeError::Invalid {
             at,
@@ -112,17 +127,41 @@ pub fn read_record<R: Read + Seek>(reader: &mut R) -> Result<Record, RecordDecod
             reason: "body_len exceeds maximum",
         });
     }
+    Ok(body_len)
+}
 
-    let mut body = vec![0u8; body_len];
-    if let Err(e) = reader.read_exact(&mut body) {
-        if e.kind() == io::ErrorKind::UnexpectedEof {
-            // Don't leave the cursor mid-record; the caller will truncate at `at`.
-            reader.seek(SeekFrom::Start(at))?;
-            return Err(RecordDecodeError::Truncated { at });
-        }
-        return Err(e.into());
+/// Decode the record starting at `buf[0]`, where `buf[0]` sits at file
+/// position `at`. Returns the record and the number of bytes it occupies.
+///
+/// A record that does not fit in `buf` is reported as `Truncated`; callers that
+/// read in windows treat that as "fetch more" rather than as corruption.
+pub fn decode_record(buf: &[u8], at: u64) -> Result<(Record, usize), RecordDecodeError> {
+    if buf.is_empty() {
+        return Err(RecordDecodeError::Eof);
     }
+    if buf.len() < RECORD_LEN_FIELD {
+        return Err(RecordDecodeError::Truncated { at });
+    }
+    let body_len = check_body_len(u32::from_be_bytes(buf[0..4].try_into().unwrap()), at)?;
+    let total = RECORD_LEN_FIELD + body_len;
+    if buf.len() < total {
+        return Err(RecordDecodeError::Truncated { at });
+    }
+    let rec = decode_body(&buf[RECORD_LEN_FIELD..total], at)?;
+    Ok((rec, total))
+}
 
+/// The full on-disk length (prefix included) of the record at `buf[0]`, if at
+/// least its length prefix is present and plausible.
+pub fn peek_record_len(buf: &[u8], at: u64) -> Result<Option<usize>, RecordDecodeError> {
+    if buf.len() < RECORD_LEN_FIELD {
+        return Ok(None);
+    }
+    let body_len = check_body_len(u32::from_be_bytes(buf[0..4].try_into().unwrap()), at)?;
+    Ok(Some(RECORD_LEN_FIELD + body_len))
+}
+
+fn decode_body(body: &[u8], at: u64) -> Result<Record, RecordDecodeError> {
     let mut p = 0usize;
     let offset = u64::from_be_bytes(body[p..p + 8].try_into().unwrap());
     p += 8;
@@ -131,7 +170,7 @@ pub fn read_record<R: Read + Seek>(reader: &mut R) -> Result<Record, RecordDecod
     let key_len = i32::from_be_bytes(body[p..p + 4].try_into().unwrap());
     p += 4;
 
-    let key = if key_len < 0 {
+    let key_range = if key_len < 0 {
         if key_len != -1 {
             return Err(RecordDecodeError::Invalid {
                 at,
@@ -144,9 +183,9 @@ pub fn read_record<R: Read + Seek>(reader: &mut R) -> Result<Record, RecordDecod
         if p + kl > body.len() {
             return Err(RecordDecodeError::Truncated { at });
         }
-        let k = body[p..p + kl].to_vec();
+        let r = p..p + kl;
         p += kl;
-        Some(k)
+        Some(r)
     };
 
     if p + VALUE_LEN_FIELD > body.len() {
@@ -160,9 +199,10 @@ pub fn read_record<R: Read + Seek>(reader: &mut R) -> Result<Record, RecordDecod
             reason: "value_len does not match remaining body",
         });
     }
-    let value = body[p..p + value_len].to_vec();
+    let value_range = p..p + value_len;
     p += value_len;
 
+    // CRC before anything is copied out: a corrupt record costs no allocation.
     let stored_crc = u32::from_be_bytes(body[p..p + 4].try_into().unwrap());
     let computed_crc = crc32fast::hash(&body[..p]);
     if stored_crc != computed_crc {
@@ -176,8 +216,8 @@ pub fn read_record<R: Read + Seek>(reader: &mut R) -> Result<Record, RecordDecod
     Ok(Record {
         offset,
         timestamp_ms,
-        key,
-        value,
+        key: key_range.map(|r| body[r].to_vec()),
+        value: body[value_range].to_vec(),
     })
 }
 
@@ -236,6 +276,26 @@ mod tests {
         let mut cur = Cursor::new(buf);
         let err = read_record(&mut cur).unwrap_err();
         assert!(matches!(err, RecordDecodeError::Truncated { .. }));
+    }
+
+    #[test]
+    fn decode_record_from_slice_matches_reader() {
+        let mut buf = Vec::new();
+        encode_record(&mut buf, 3, 9, Some(b"k"), b"value");
+        let n1 = buf.len();
+        encode_record(&mut buf, 4, 10, None, b"");
+        let (r, used) = decode_record(&buf, 0).unwrap();
+        assert_eq!(used, n1);
+        assert_eq!(r.offset, 3);
+        assert_eq!(r.key.as_deref(), Some(&b"k"[..]));
+        let (r2, _) = decode_record(&buf[used..], used as u64).unwrap();
+        assert_eq!(r2.offset, 4);
+        assert_eq!(r2.value, b"");
+        // A window that cuts the second record short is "truncated", not corrupt.
+        assert!(matches!(
+            decode_record(&buf[used..buf.len() - 1], used as u64),
+            Err(RecordDecodeError::Truncated { .. })
+        ));
     }
 
     #[test]

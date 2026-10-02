@@ -124,9 +124,7 @@ pub async fn delete_topic(
     if !key.is_admin() {
         return Err(AppError::forbidden("delete topic requires admin grant"));
     }
-    let topic = broker
-        .delete_topic(&name)
-        .map_err(|e| AppError::not_found(format!("{}", e)))?;
+    let topic = broker.delete_topic(&name).await?;
     Ok(Json(DeleteTopicResponse {
         name: topic.name.clone(),
         partitions: topic.partitions.len() as u32,
