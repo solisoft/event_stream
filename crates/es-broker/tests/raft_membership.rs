@@ -257,15 +257,31 @@ async fn a_removed_leader_steps_down_and_the_rest_elect_another() -> Result<()> 
     }
     let all: Vec<&Node> = nodes.iter().collect();
     let old = node(&all, leader(&c, &all, Duration::from_secs(10)).await?);
-
-    let report: Value = c
-        .delete(format!("{}/admin/raft/members/{}", old.base, old.id))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    assert_eq!(statuses(&report), vec!["committed"], "{report}");
+    // A broker that reports itself leader may be losing its term under load:
+    // the removal then comes back `not_leader` or `pending`, which the API
+    // documents as retryable. Retry removing the same broker, sent to whoever
+    // leads now, as an operator would, until it is `committed` (or `already`,
+    // when an earlier attempt committed after its report was written).
+    let give_up = Instant::now() + Duration::from_secs(15);
+    loop {
+        let at = node(&all, leader(&c, &all, Duration::from_secs(10)).await?);
+        let report: Value = c
+            .delete(format!("{}/admin/raft/members/{}", at.base, old.id))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let got = statuses(&report);
+        if got == ["committed"] || got == ["already"] {
+            break;
+        }
+        anyhow::ensure!(
+            Instant::now() < give_up,
+            "removal never committed: {report}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 
     let rest: Vec<&Node> = nodes.iter().filter(|n| n.id != old.id).collect();
     let new = node(&rest, leader(&c, &rest, Duration::from_secs(10)).await?);
