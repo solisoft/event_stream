@@ -6,12 +6,12 @@
 
 <h2 id="v0-3">0.3: a cluster you can operate</h2>
 <p>
-  Today a three-broker cluster replicates every partition, but a client has to find the leader itself and the
-  membership is fixed at startup.
+  Today a three-broker cluster replicates every partition, and a produce can go to any broker, but the membership is
+  fixed at startup.
 </p>
 <ul>
-  <li><strong>Leader routing.</strong> A produce sent to a follower is forwarded to the partition's leader instead of
-    failing with a hint, so clients can talk to any broker.</li>
+  <li><strong>Leader routing</strong> (done). A produce sent to a follower is forwarded to the partition's leader, as
+    the original caller, so clients can talk to any broker.</li>
   <li><strong>Safe membership changes.</strong> Add or remove one broker at a time without a restart, and the transport
     follows the current membership, so a removed broker can no longer connect.</li>
   <li><strong>Linearizable reads, as an opt-in.</strong> Read-index or lease reads, for consumers that must not see a

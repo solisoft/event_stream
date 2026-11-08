@@ -55,6 +55,7 @@ X-Es-Key: esk_AbCdEf…</pre>
     <tr><td><code>401</code></td><td>No key, or a key the broker does not know.</td></tr>
     <tr><td><code>403</code></td><td>The key exists but has no grant for this topic, group or producer id.</td></tr>
     <tr><td><code>429</code></td><td>Over the key's byte-rate quota; <code>Retry-After</code> says how many seconds to wait.</td></tr>
+    <tr><td><code>503</code></td><td>A produce for a partition whose leader is unknown or unreachable. Retry after <code>Retry-After</code>.</td></tr>
   </tbody>
 </table>
 <aside class="note warn">
@@ -194,6 +195,17 @@ X-Es-Key: esk_AbCdEf…</pre>
 <p>
   The response comes once the records are on disk (with the default <code>--flush-every-records 1</code>). One request
   is one write per partition, so batching records into a request is the main lever on throughput.
+</p>
+<p>
+  With <code>?encoding=base64</code>, keys and values are base64-encoded, so values that are not text can be produced
+  over HTTP.
+</p>
+<p>
+  In a cluster, any broker takes a produce: a follower forwards it to the partition's leader, with your key, and
+  returns the leader's offsets (see <a href="<%= docs_cluster_path() %>#leader-routing">Leader routing</a>). If the
+  leader is unknown or unreachable the answer is <code>503</code> with <code>Retry-After</code> and a message starting
+  "not leader" that names the leader when known. The <code>X-Es-Forwarded</code> header marks a request a follower has
+  already forwarded; it is never forwarded again, and grants nothing.
 </p>
 
 <h3>Idempotent producers</h3>
@@ -373,7 +385,8 @@ X-Es-Key: esk_AbCdEf…</pre>
 </p>
 <ul>
   <li><strong>TLS</strong> is on whenever the broker has a certificate; connect with <code>ClientOptions { tls: Some(…), .. }</code>.</li>
-  <li><strong>Concurrency.</strong> Up to 32 requests per connection run at once; produces to one topic keep their order.</li>
+  <li><strong>Concurrency.</strong> Up to 32 requests per connection run at once; produces to one topic keep their order, including produces a follower forwards to the leader.</li>
+  <li><strong>Leader routing.</strong> A produce sent to a follower is forwarded to the leader over HTTP with the connection's key, and the leader's offsets come back in the usual response. A leader that cannot be reached gives an error frame starting "not leader"; retry.</li>
   <li><strong>Limits.</strong> Connections per address (<code>--binary-max-connections-per-ip</code>), an idle timeout (<code>--binary-idle-timeout</code>, 10 minutes), and a shared memory budget for request bytes. A client that stops reading responses is disconnected.</li>
   <li><strong>Authorization</strong> is checked against the topic at the start of a frame, before a compressed frame is inflated, and again after every key revocation.</li>
 </ul>

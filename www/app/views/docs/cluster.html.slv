@@ -18,29 +18,31 @@
 <h2>Start a three-node cluster</h2>
 <p>
   Start each broker with its own id, the address its peers reach it on, every other member, and the same secret.
-  The membership is exactly the brokers you list; there is no discovery.
+  The membership is exactly the brokers you list; there is no discovery. <code>--raft-peer-api</code> gives each
+  member's client-facing address, so a follower can forward produces to it. The examples assume the brokers serve TLS
+  (<code>--tls-cert</code>, <code>--tls-key</code>); without it, use <code>http://</code>.
 </p>
 <figure class="code">
   <figcaption><span>node 1</span></figcaption>
 <pre><span class="c-key">export</span> ES_RAFT_SHARED_SECRET=<span class="c-str">'output of openssl rand -hex 32, the same on every node'</span>
 es-broker --data-dir /var/lib/es --bind 10.0.0.1:9000 --auth required \
   --raft-node-id 1 --raft-bind 10.0.0.1:6000 \
-  --raft-peer 2=10.0.0.2:6000 \
-  --raft-peer 3=10.0.0.3:6000</pre>
+  --raft-peer 2=10.0.0.2:6000 --raft-peer-api 2=https://10.0.0.2:9000 \
+  --raft-peer 3=10.0.0.3:6000 --raft-peer-api 3=https://10.0.0.3:9000</pre>
 </figure>
 <figure class="code">
   <figcaption><span>node 2</span></figcaption>
 <pre>es-broker --data-dir /var/lib/es --bind 10.0.0.2:9000 --auth required \
   --raft-node-id 2 --raft-bind 10.0.0.2:6000 \
-  --raft-peer 1=10.0.0.1:6000 \
-  --raft-peer 3=10.0.0.3:6000</pre>
+  --raft-peer 1=10.0.0.1:6000 --raft-peer-api 1=https://10.0.0.1:9000 \
+  --raft-peer 3=10.0.0.3:6000 --raft-peer-api 3=https://10.0.0.3:9000</pre>
 </figure>
 <figure class="code">
   <figcaption><span>node 3</span></figcaption>
 <pre>es-broker --data-dir /var/lib/es --bind 10.0.0.3:9000 --auth required \
   --raft-node-id 3 --raft-bind 10.0.0.3:6000 \
-  --raft-peer 1=10.0.0.1:6000 \
-  --raft-peer 2=10.0.0.2:6000</pre>
+  --raft-peer 1=10.0.0.1:6000 --raft-peer-api 1=https://10.0.0.1:9000 \
+  --raft-peer 2=10.0.0.2:6000 --raft-peer-api 2=https://10.0.0.2:9000</pre>
 </figure>
 <p>
   Then create topics on every broker with the same name and partition count. Each partition elects a leader within a
@@ -67,9 +69,35 @@ es-broker --data-dir /var/lib/es --bind 10.0.0.1:9000 --auth required \
 
 <h2>Writing and reading</h2>
 <ul>
-  <li><strong>Produce to the leader.</strong> A produce sent to a follower fails with a hint naming the leader; send it there instead. <code>GET /raft</code> shows each partition's leader.</li>
+  <li><strong>Produce to any broker.</strong> A follower forwards a produce to the partition's leader and returns the leader's answer; see <a href="#leader-routing">Leader routing</a>. <code>GET /raft</code> shows each partition's leader, for clients that would rather skip the hop.</li>
   <li><strong>Acknowledgement means a majority has it.</strong> The leader appends the entry durably, replicates it, and answers once a majority of members have it on disk and it is applied.</li>
   <li><strong>Reads come from what a broker has applied.</strong> A follower can be slightly behind the leader; reads are not linearizable.</li>
+</ul>
+
+<h2 id="leader-routing">Leader routing</h2>
+<p>
+  Only a partition's leader can write to it. A produce that reaches a follower, over HTTP or the binary protocol, is
+  sent on to the leader's HTTP API and the leader's answer comes back as if the follower had written the records. A
+  request whose partitions have different leaders is split: each leader gets its records, and the answers return in
+  the order the records were sent.
+</p>
+<ul>
+  <li><strong>The leader checks the caller, not the follower.</strong> The caller's key travels with the forwarded
+    request, and the leader authenticates it, checks its grants and producer id, and charges its quota, exactly as if
+    the client had called it. The follower charges nothing for what it forwards. API keys must therefore be the same on
+    every broker. Over TLS, forwarding goes over <code>https</code>; a TLS broker refuses a plain <code>http</code>
+    peer address. <code>--raft-peer-api-ca</code> names the certificate authorities to trust for it.</li>
+  <li><strong>One hop.</strong> A forwarded request is marked, and a broker that receives one without leading the
+    partition answers "not leader" instead of forwarding it again. The mark grants nothing.</li>
+  <li><strong>Idempotent producers keep working.</strong> <code>producer_id</code> and sequences go through unchanged,
+    and the leader dedupes them. A retry after any failure is safe.</li>
+  <li><strong>Failures are retryable.</strong> With no leader known, no <code>--raft-peer-api</code> for it, or a leader
+    that cannot be reached within 2&nbsp;s (or does not answer within 15&nbsp;s), the produce fails with
+    <code>503</code> and <code>Retry-After: 1</code> (an error frame on the binary protocol) whose message starts
+    "not leader" and names the leader when it is known.</li>
+  <li><strong>Size.</strong> Records are forwarded base64-encoded in JSON, about a third larger. A forwarded body over
+    <code>--max-request-body-bytes</code> is refused with <code>400</code>: send large binary batches to the leader, or
+    split them.</li>
 </ul>
 
 <h2>What happens to a write</h2>
@@ -151,7 +179,10 @@ es-broker --data-dir /var/lib/es --bind 10.0.0.1:9000 --auth required \
 
 <h2>Limitations</h2>
 <ul>
-  <li><strong>No leader forwarding.</strong> Clients must send produces to the leader.</li>
+  <li><strong>Only produces are forwarded.</strong> Topic creation, consumer groups and admin calls act on the broker
+    they are sent to.</li>
+  <li><strong>Idempotent-producer state is per broker.</strong> It lives on the leader that accepted the writes; after
+    a leadership change, the new leader does not know the producer's earlier sequences.</li>
   <li><strong>Static membership.</strong> Adding or removing a broker means restarting every broker with the new peer list.</li>
   <li><strong>No linearizable reads.</strong> A follower serves what it has applied.</li>
   <li><strong>No pre-vote.</strong> A rejoining broker cannot win an election against a healthy leader, but its higher term can make the leader step down once.</li>

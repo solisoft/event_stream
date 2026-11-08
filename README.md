@@ -98,14 +98,19 @@ registry, tiered storage, and a security and performance audit (see below).
   `--raft-shared-secret-file` (mode 600) rather than on the command line. The raft port
   accepts connections only from the peers' addresses. Replication traffic is not
   encrypted: keep `--raft-bind` on a private network.
+- **Produce to any broker.** A Raft follower forwards a produce, over HTTP or the binary
+  protocol, to the partition's leader at its `--raft-peer-api` address, once, and returns the
+  leader's offsets. The leader re-checks the caller's own key (so keys must match across
+  brokers), dedupes idempotent producers and charges the quota; a TLS broker forwards over
+  https only. With the leader unknown or unreachable the answer is a retryable `503` (an
+  error frame on the binary protocol) starting "not leader" and naming the leader.
 
 ## What's not here yet
 
 The [roadmap](https://es.solisoft.net/docs/roadmap) plans each of these, release by release:
 
-- **0.3**: leader routing (today a produce sent to a Raft follower fails with a leader hint and
-  the client retries), safe membership changes, opt-in linearizable reads, and per-broker
-  identity in Raft.
+- **0.3**: safe membership changes, opt-in linearizable reads, and per-broker identity in
+  Raft.
 - **0.4**: record format v2, with record headers, compression on disk and `sendfile(2)` consume.
 - **0.5**: object-store tiering.
 - **0.6**: transactions across partitions.

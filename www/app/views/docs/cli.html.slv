@@ -178,6 +178,8 @@ es tiered list --topic orders --partition 0     <span class="c-com"># base offse
   <div><dt><code>--raft-node-id</code></dt><dd>This broker's id in the cluster. Setting it replicates every topic.</dd></div>
   <div><dt><code>--raft-bind</code></dt><dd>Address for traffic from the other members.</dd></div>
   <div><dt><code>--raft-peer</code></dt><dd><code>&lt;id&gt;=&lt;host:port&gt;</code>, once per other member.</dd></div>
+  <div><dt><code>--raft-peer-api</code></dt><dd><code>&lt;id&gt;=&lt;http(s)://host:port&gt;</code>, a member's HTTP API, once per other member. A follower forwards a produce there when that member leads the partition, with the caller's own key. Must be <code>https</code> when this broker has <code>--tls-cert</code>. Without it, a produce for that member's partitions fails with a retryable "not leader".</dd></div>
+  <div><dt><code>--raft-peer-api-ca</code></dt><dd>PEM file of the certificate authorities trusted for <code>https</code> peer APIs. Default: the public web roots.</dd></div>
   <div><dt><code>--raft-shared-secret</code>, <code>ES_RAFT_SHARED_SECRET</code></dt><dd>Secret the members prove to each other, at least 32 bytes (<code>openssl rand -hex 32</code>). Required unless the Raft address is loopback. Prefer the environment variable: on the command line it shows in <code>ps</code>.</dd></div>
   <div><dt><code>--raft-shared-secret-file</code>, <code>ES_RAFT_SHARED_SECRET_FILE</code></dt><dd>Read the secret from a file instead; it must be readable by its owner only (mode 600).</dd></div>
 </dl>
