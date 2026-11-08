@@ -135,6 +135,15 @@ impl GroupCoordinator {
                 MAX_MEMBERS_PER_GROUP
             ));
         }
+        // Check again under the group lock. A topic deleted between the check
+        // above and here is purged from subscriptions under this same lock
+        // (see `purge_topic`); without the recheck the join could land after
+        // that purge and put the deleted topic back.
+        for t in &topics {
+            if broker.topic(t).is_none() {
+                return Err(anyhow!("topic '{}' not found", t));
+            }
+        }
         let now = Instant::now();
         if let Some(existing) = state.members.get(&mid) {
             if existing.owner != key.key_id && !key.is_admin() {
@@ -287,6 +296,36 @@ impl GroupCoordinator {
         }
     }
 
+    /// Drop a deleted topic from every member's subscription and rebalance
+    /// each group that subscribed to it, so the next heartbeat reports a new
+    /// generation and the next assignment no longer names its partitions.
+    ///
+    /// A member whose only topic it was stays in the group with nothing to
+    /// subscribe to: its assignment is empty, which is not an error. It can
+    /// re-join with other topics. Returns the number of groups rebalanced.
+    pub async fn purge_topic(&self, broker: &Broker, topic: &str) -> usize {
+        let mut rebalanced = 0;
+        for g in self.group_names() {
+            let Some(slot) = self.state.get(&g).map(|s| s.clone()) else {
+                continue;
+            };
+            let mut state = slot.lock().await;
+            let mut touched = false;
+            for m in state.members.values_mut() {
+                let before = m.topics.len();
+                m.topics.retain(|t| t != topic);
+                touched |= m.topics.len() != before;
+            }
+            if touched {
+                recompute_assignment(broker, &mut state);
+                rebalanced += 1;
+                tracing::info!(group = %g, topic, generation = state.generation,
+                    "coord: deleted topic dropped from subscriptions");
+            }
+        }
+        rebalanced
+    }
+
     /// Union of topics currently subscribed by any member of `group`. Used to
     /// authorize group operations (a caller must be able to read the group's
     /// topics). Returns empty for an unknown group without creating a slot.
@@ -352,7 +391,7 @@ pub enum AssignmentReply {
 ///
 /// The result is balanced (no member has more than `ceil(N/M)`) and stable —
 /// members keep what they had unless they were over-allocated or unsubscribed.
-fn recompute_assignment(broker: &Arc<Broker>, state: &mut GroupState) {
+fn recompute_assignment(broker: &Broker, state: &mut GroupState) {
     let previous = std::mem::take(&mut state.assignment);
     state.generation += 1;
     if state.members.is_empty() {

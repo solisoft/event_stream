@@ -2108,3 +2108,95 @@ async fn join_only_takes_from_over_allocated_members() -> Result<()> {
     handle.shutdown().await?;
     Ok(())
 }
+
+async fn delete_topic(client: &Client, base: &str, name: &str) -> Result<()> {
+    client
+        .delete(format!("{}/topics/{}", base, name))
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(())
+}
+
+// Bonfire #733: deleting a topic takes it out of every group's subscription.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleting_a_topic_drops_it_from_group_assignments() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let (base, handle) = boot_coord_fast(&tmp).await?;
+    let client = Client::new();
+    create_topic(&client, &base, "keep", 2).await?;
+    create_topic(&client, &base, "gone", 2).await?;
+
+    let a = join(&client, &base, "g", None, &["gone", "keep"]).await?;
+    let b = join(&client, &base, "g", None, &["gone", "keep"]).await?;
+    let before = fetch_assignment(&client, &base, "g", &b.member_id).await?;
+
+    delete_topic(&client, &base, "gone").await?;
+
+    // The delete bumped the generation, so a heartbeat at the old one is told
+    // to rebalance.
+    let hb = heartbeat(&client, &base, "g", &b.member_id, before.generation).await?;
+    let current = match hb {
+        HeartbeatResponse::RebalanceRequired { current_generation } => current_generation,
+        other => panic!("expected a rebalance after the delete, got {:?}", other),
+    };
+    assert!(current > before.generation);
+
+    // Nothing names the deleted topic; the survivor's partitions are all
+    // still handed out.
+    let mut all = std::collections::BTreeSet::new();
+    for m in [&a.member_id, &b.member_id] {
+        let r = fetch_assignment(&client, &base, "g", m).await?;
+        assert_eq!(r.generation, current);
+        for tp in r.assignment {
+            assert_eq!(tp.topic, "keep", "assignment still names a deleted topic");
+            all.insert(tp.partition);
+        }
+    }
+    assert_eq!(all, std::collections::BTreeSet::from([0, 1]));
+
+    // Recreating the name does not resurrect the old subscription.
+    create_topic(&client, &base, "gone", 2).await?;
+    let a2 = join(&client, &base, "g", Some(&a.member_id), &["keep"]).await?;
+    let a2_now = fetch_assignment(&client, &base, "g", &a2.member_id).await?;
+    assert!(a2_now.assignment.iter().all(|tp| tp.topic == "keep"));
+
+    handle.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn group_whose_only_topic_is_deleted_gets_an_empty_assignment() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let (base, handle) = boot_coord_fast(&tmp).await?;
+    let client = Client::new();
+    create_topic(&client, &base, "only", 3).await?;
+
+    let a = join(&client, &base, "g", None, &["only"]).await?;
+    assert_eq!(a.assignment.len(), 3);
+
+    delete_topic(&client, &base, "only").await?;
+
+    // Still a member, at a new generation, with nothing to consume.
+    let hb = heartbeat(&client, &base, "g", &a.member_id, a.generation).await?;
+    assert!(matches!(hb, HeartbeatResponse::RebalanceRequired { .. }));
+    let r = fetch_assignment(&client, &base, "g", &a.member_id).await?;
+    assert!(r.generation > a.generation);
+    assert!(r.assignment.is_empty());
+    let hb = heartbeat(&client, &base, "g", &a.member_id, r.generation).await?;
+    assert!(matches!(hb, HeartbeatResponse::Ok { .. }));
+
+    // A join naming the deleted topic is refused, as for any unknown topic.
+    let resp = client
+        .post(format!("{}/groups/g/join", base))
+        .json(&JoinGroupRequest {
+            member_id: Some(a.member_id.clone()),
+            topics: vec!["only".to_string()],
+        })
+        .send()
+        .await?;
+    assert!(resp.status().is_client_error(), "got {}", resp.status());
+
+    handle.shutdown().await?;
+    Ok(())
+}
