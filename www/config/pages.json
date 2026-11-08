@@ -43,10 +43,5 @@
     "kicker": "Docs",
     "title": "Clients",
     "description": "Soli's ES class and the Rust es-client: produce and consume over the binary protocol, everything else over HTTP."
-  },
-  "changelog": {
-    "kicker": "Docs",
-    "title": "Changelog",
-    "description": "What changed in each release of es, with what to check before upgrading."
   }
 }
