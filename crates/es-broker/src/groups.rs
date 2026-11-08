@@ -5,6 +5,16 @@
 //! them, consume through it, or join it. Without this, any key that could read
 //! a topic could rewind or skip another tenant's consumer on it.
 //!
+//! **Namespace.** A key may only claim a group whose name falls under one of
+//! its ACL prefixes ([`ApiKey::may_claim`]): the namespace is global, and any
+//! tenant could otherwise squat `billing-service` before its owner. A group
+//! the caller may not use is refused with the same answer whether or not it
+//! exists, so the refusal does not reveal other tenants' groups.
+//!
+//! **Case.** Groups are stored as `<name>.json`. Two names that differ only
+//! in case would be one file on a case-insensitive filesystem (macOS, Windows),
+//! so a group whose name folds onto an existing one is refused.
+//!
 //! **Durability.** A commit updates memory and marks the group dirty; dirty
 //! groups are written out together every [`FLUSH_INTERVAL`] (and on shutdown).
 //! Fsyncing a rewritten file on every commit, under the group's lock, on an
@@ -93,9 +103,20 @@ impl std::fmt::Display for GroupError {
 
 impl std::error::Error for GroupError {}
 
+/// The one refusal for a group a key may not use, whether it belongs to
+/// another key or does not exist.
+fn unavailable(group: &str) -> GroupError {
+    GroupError::Forbidden(format!(
+        "consumer group '{}' is not available to this key",
+        group
+    ))
+}
+
 pub struct GroupStore {
     dir: PathBuf,
     entries: DashMap<String, Arc<Mutex<GroupEntry>>>,
+    /// Lowercased name → the spelling that owns it on disk.
+    folded: DashMap<String, String>,
     dirty: std::sync::Mutex<BTreeSet<String>>,
     flush_lock: Mutex<()>,
 }
@@ -105,6 +126,7 @@ impl GroupStore {
         crate::fsutil::create_dir_all_private(&dir)
             .with_context(|| format!("create dir {:?}", dir))?;
         let entries = DashMap::new();
+        let folded = DashMap::new();
         for entry in std::fs::read_dir(&dir)? {
             let entry = entry?;
             let path = entry.path();
@@ -123,11 +145,13 @@ impl GroupStore {
             let bytes = std::fs::read(&path)?;
             let e = parse_group_file(&bytes)
                 .with_context(|| format!("parse group offsets {:?}", path))?;
+            folded.insert(group.to_ascii_lowercase(), group.clone());
             entries.insert(group, Arc::new(Mutex::new(e)));
         }
         Ok(Self {
             dir,
             entries,
+            folded,
             dirty: std::sync::Mutex::new(BTreeSet::new()),
             flush_lock: Mutex::new(()),
         })
@@ -146,14 +170,33 @@ impl GroupStore {
         key: &ApiKey,
     ) -> Result<Arc<Mutex<GroupEntry>>, GroupError> {
         validate_group_name(group).map_err(|e| GroupError::Invalid(e.to_string()))?;
+        let may_claim = key.may_claim(group);
         let slot = match self.entries.get(group).map(|s| s.clone()) {
             Some(s) => s,
             None => {
+                // Refused before anything is created, and in the same words
+                // as a group that exists and is someone else's.
+                if !may_claim {
+                    return Err(unavailable(group));
+                }
                 if self.entries.len() >= MAX_GROUPS {
                     return Err(GroupError::Limit(format!(
                         "consumer group limit reached ({})",
                         MAX_GROUPS
                     )));
+                }
+                {
+                    let spelling = self
+                        .folded
+                        .entry(group.to_ascii_lowercase())
+                        .or_insert_with(|| group.to_string());
+                    if spelling.value() != group {
+                        return Err(GroupError::Invalid(format!(
+                            "consumer group '{}' differs only in case from an existing group; \
+                             group names are compared case-insensitively",
+                            group
+                        )));
+                    }
                 }
                 self.entries
                     .entry(group.to_string())
@@ -163,31 +206,37 @@ impl GroupStore {
         };
         {
             let mut g = slot.lock().await;
-            if g.owner.is_empty() {
+            if g.owner.is_empty() && may_claim {
                 g.owner = key.key_id.clone();
                 self.mark_dirty(group);
             } else if g.owner != key.key_id && !key.is_admin() {
-                return Err(GroupError::Forbidden(format!(
-                    "consumer group '{}' belongs to another key",
-                    group
-                )));
+                return Err(unavailable(group));
             }
         }
         Ok(slot)
     }
 
-    /// Whether `key` may use an *existing* group. Unknown groups are allowed
-    /// (there is nothing in them to protect) and are not created.
+    /// Whether `key` may use a group without creating it. A group the key
+    /// could claim and that does not exist yet is allowed (there is nothing
+    /// in it to protect) and is not created; outside the key's namespace an
+    /// unknown group is refused exactly like another key's.
     pub async fn check_access(&self, group: &str, key: &ApiKey) -> Result<(), GroupError> {
+        let may_claim = key.may_claim(group);
         let Some(slot) = self.entries.get(group).map(|s| s.clone()) else {
-            return Ok(());
+            return if may_claim {
+                Ok(())
+            } else {
+                Err(unavailable(group))
+            };
         };
         let g = slot.lock().await;
-        if !g.owner.is_empty() && g.owner != key.key_id && !key.is_admin() {
-            return Err(GroupError::Forbidden(format!(
-                "consumer group '{}' belongs to another key",
-                group
-            )));
+        let mine = if g.owner.is_empty() {
+            may_claim
+        } else {
+            g.owner == key.key_id || key.is_admin()
+        };
+        if !mine {
+            return Err(unavailable(group));
         }
         Ok(())
     }
@@ -246,6 +295,23 @@ impl GroupStore {
             .or_default()
             .insert(partition, offset);
         self.mark_dirty(group);
+    }
+
+    /// Forget every group's offsets for a deleted topic, and write the change
+    /// out now. A topic recreated under the same name used to inherit them, so
+    /// its consumers started from offsets that meant nothing in the new log.
+    pub async fn purge_topic(&self, topic: &str) -> Result<()> {
+        let slots: Vec<(String, Arc<Mutex<GroupEntry>>)> = self
+            .entries
+            .iter()
+            .map(|kv| (kv.key().clone(), kv.value().clone()))
+            .collect();
+        for (group, slot) in slots {
+            if slot.lock().await.offsets.remove(topic).is_some() {
+                self.mark_dirty(&group);
+            }
+        }
+        self.flush().await
     }
 
     pub async fn fetch(&self, group: &str, topic: &str, partition: u32) -> Option<u64> {
@@ -370,12 +436,16 @@ mod tests {
     use crate::auth::{AclAction, AclRule};
 
     fn key(id: &str) -> ApiKey {
+        scoped(id, "*")
+    }
+
+    fn scoped(id: &str, prefix: &str) -> ApiKey {
         ApiKey {
             key_id: id.into(),
             name: id.into(),
             acls: vec![AclRule {
                 action: AclAction::Read,
-                topic_prefix: "*".into(),
+                topic_prefix: prefix.into(),
             }],
             produce_bytes_per_sec: None,
             consume_bytes_per_sec: None,
@@ -416,5 +486,67 @@ mod tests {
         let s = GroupStore::open(dir.path().to_path_buf()).unwrap();
         assert_eq!(s.fetch("old", "t", 0).await, Some(3));
         assert_eq!(s.owner("old").await.as_deref(), Some(""));
+    }
+
+    #[tokio::test]
+    async fn a_key_claims_groups_only_under_its_prefixes() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = GroupStore::open(dir.path().to_path_buf()).unwrap();
+        let billing = scoped("billing", "billing");
+        let other = scoped("other", "other");
+        s.commit("billing.service", &billing, "t", 0, 1)
+            .await
+            .unwrap();
+        // Squatting a name outside one's own namespace is refused, and
+        // creates nothing.
+        assert!(matches!(
+            s.commit("billing.next", &other, "t", 0, 1).await,
+            Err(GroupError::Forbidden(_))
+        ));
+        assert_eq!(s.owner("billing.next").await, None);
+        // The refusal reads the same whether or not the group exists.
+        let foreign = s.check_access("billing.service", &other).await.unwrap_err();
+        let unknown = s.check_access("billing.nothing", &other).await.unwrap_err();
+        assert_eq!(
+            foreign.to_string().replace("billing.service", "X"),
+            unknown.to_string().replace("billing.nothing", "X")
+        );
+        // Inside one's namespace an unknown group is fine to look at.
+        s.check_access("other.new", &other).await.unwrap();
+        // A legacy unowned group is claimed only from inside the namespace.
+        std::fs::write(dir.path().join("billing.old.json"), br#"{"t":{"0":3}}"#).unwrap();
+        let s = GroupStore::open(dir.path().to_path_buf()).unwrap();
+        assert!(s.commit("billing.old", &other, "t", 0, 1).await.is_err());
+        s.commit("billing.old", &billing, "t", 0, 4).await.unwrap();
+        assert_eq!(s.owner("billing.old").await.as_deref(), Some("billing"));
+    }
+
+    #[tokio::test]
+    async fn names_that_differ_only_in_case_are_one_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = GroupStore::open(dir.path().to_path_buf()).unwrap();
+        s.commit("Orders", &key("a"), "t", 0, 1).await.unwrap();
+        assert!(matches!(
+            s.commit("orders", &key("a"), "t", 0, 2).await,
+            Err(GroupError::Invalid(_))
+        ));
+        s.flush().await.unwrap();
+        // Also after a restart.
+        let s = GroupStore::open(dir.path().to_path_buf()).unwrap();
+        assert!(s.commit("ORDERS", &key("a"), "t", 0, 2).await.is_err());
+        s.commit("Orders", &key("a"), "t", 0, 3).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn purging_a_topic_forgets_its_offsets_durably() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = GroupStore::open(dir.path().to_path_buf()).unwrap();
+        s.commit("g", &key("a"), "gone", 0, 7).await.unwrap();
+        s.commit("g", &key("a"), "kept", 0, 9).await.unwrap();
+        s.purge_topic("gone").await.unwrap();
+        assert_eq!(s.fetch("g", "gone", 0).await, None);
+        let s = GroupStore::open(dir.path().to_path_buf()).unwrap();
+        assert_eq!(s.fetch("g", "gone", 0).await, None);
+        assert_eq!(s.fetch("g", "kept", 0).await, Some(9));
     }
 }

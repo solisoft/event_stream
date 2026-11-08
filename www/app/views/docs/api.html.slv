@@ -75,10 +75,11 @@ X-Es-Key: esk_AbCdEf…</pre>
   <div><dt><code>admin</code></dt><dd>On <code>*</code>: create and delete topics, change configs, manage keys and producers, trigger retention and compaction.</dd></div>
 </dl>
 <p>
-  A prefix covers the topic of that name and the topics below it, starting at a separator (<code>.</code>,
-  <code>-</code> or <code>_</code>): <code>orders</code> matches <code>orders</code>, <code>orders.eu</code> and
-  <code>orders-archive</code>, not <code>ordersecret</code>. A prefix that ends in a separator, such as
-  <code>orders.</code>, matches the names that start with it. <code>*</code> matches every topic; an empty prefix is refused.
+  A prefix covers the topic of that name and the topics below it, at a <code>.</code>: <code>orders</code> matches
+  <code>orders</code> and <code>orders.eu</code>, not <code>ordersecret</code>, <code>orders-archive</code> or
+  <code>orders_old</code>. A prefix that ends in a separator, such as <code>orders.</code> or <code>orders-</code>,
+  matches the names that start with it. <code>*</code> matches every topic; an empty prefix is refused. Schema subjects
+  <code>&lt;topic&gt;-value</code> and <code>&lt;topic&gt;-key</code> are authorized against <code>&lt;topic&gt;</code>.
 </p>
 
 <h3>Keys</h3>
@@ -100,8 +101,10 @@ X-Es-Key: esk_AbCdEf…</pre>
 <h3>Quotas</h3>
 <p>
   <code>produce_bytes_per_sec</code> and <code>consume_bytes_per_sec</code> are per-key budgets holding one second of
-  traffic. A produce is checked against its size before anything is written. A consume is charged after the read, when
-  its size is known; the budget can go into debt, and further reads get <code>429</code> until it recovers.
+  traffic. A produce is checked against its size before anything is written. A consume reserves from the budget before
+  it reads, reads no more than it reserved, and gives back what it did not use; concurrent reads share the same budget.
+  A first record larger than the reservation is served only from a full budget. When the budget is spent, reads get
+  <code>429</code> with a <code>Retry-After</code>.
 </p>
 
 <h2>TLS and browsers</h2>
@@ -202,7 +205,7 @@ X-Es-Key: esk_AbCdEf…</pre>
 <figure class="code">
   <figcaption><span>POST /topics/orders/produce</span><span>json</span></figcaption>
 <pre>{
-  <span class="c-key">"producer_id"</span>: <span class="c-str">"checkout-svc-1"</span>,
+  <span class="c-key">"producer_id"</span>: <span class="c-str">"orders.checkout-svc-1"</span>,
   <span class="c-key">"records"</span>: [
     { <span class="c-key">"key"</span>: <span class="c-str">"abc"</span>, <span class="c-key">"value"</span>: <span class="c-str">"…"</span>, <span class="c-key">"partition"</span>: <span class="c-num">0</span>, <span class="c-key">"sequence"</span>: <span class="c-num">42</span> },
     { <span class="c-key">"key"</span>: <span class="c-str">"abc"</span>, <span class="c-key">"value"</span>: <span class="c-str">"…"</span>, <span class="c-key">"partition"</span>: <span class="c-num">0</span>, <span class="c-key">"sequence"</span>: <span class="c-num">43</span> }
@@ -216,8 +219,10 @@ X-Es-Key: esk_AbCdEf…</pre>
   <div><dt>Older than that</dt><dd><code>400</code>, sequence too low.</dd></div>
 </dl>
 <p>
-  The whole request is checked before anything is written. A producer id belongs to the key that first used it (another
-  key gets <code>403</code>); a key may own 10,000 and ids idle for 7 days are forgotten. Accepted sequences are on disk
+  The whole request is checked before anything is written. A producer id belongs to the key that first used it, and a
+  key may only claim ids under one of its ACL prefixes (<code>orders.checkout-svc-1</code> for a key granted
+  <code>orders</code>); any other id gets <code>403</code>, whether or not another key holds it. A key may own 10,000 and
+  ids idle for 7 days are forgotten. Accepted sequences are on disk
   before the response is sent.
 </p>
 
@@ -252,7 +257,10 @@ X-Es-Key: esk_AbCdEf…</pre>
 
 <h2>Consumer groups</h2>
 <p>
-  A group belongs to the key that first joined it or committed to it: only that key, or a global admin, can use it.
+  A group belongs to the key that first joined it or committed to it: only that key, or a global admin, can use it. A
+  key may only create groups named under one of its ACL prefixes (<code>orders.billing</code> for a key granted
+  <code>orders</code>), and a group it may not use is refused the same way whether or not it exists. Names that differ
+  only in case are refused, so <code>Billing</code> cannot shadow <code>billing</code>.
 </p>
 <ul class="endpoints">
   <li><span class="verb post">POST</span><code>/groups/:group/commit</code><span class="desc">Record the next offset to read.</span></li>
@@ -354,12 +362,14 @@ X-Es-Key: esk_AbCdEf…</pre>
 <span class="c-dim">400 {"error":"backward-incompatible: new schema adds required field 'phone'"}</span></pre>
 </figure>
 
-<h2>Binary protocol</h2>
+<h2 id="binary-protocol">Binary protocol</h2>
 <p>
   With <code>--bind-binary 127.0.0.1:9001</code> the broker also listens for a length-prefixed binary protocol over a
   long-lived connection. Keys and values travel as raw bytes, with the same keys, grants, quotas and idempotency as HTTP.
   The Rust clients are <code>es_broker::binary::BinaryClient</code> and the pipelined
-  <code>PipelinedClient</code>.
+  <code>PipelinedClient</code>, both on tokio, and the blocking <code>es_client::Client</code> &mdash; plain
+  <code>std::net</code>, one request at a time, with no dependency on the broker; it is what Soli's <code>ES</code>
+  class speaks.
 </p>
 <ul>
   <li><strong>TLS</strong> is on whenever the broker has a certificate; connect with <code>ClientOptions { tls: Some(…), .. }</code>.</li>

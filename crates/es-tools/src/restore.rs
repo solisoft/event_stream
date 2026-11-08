@@ -24,23 +24,62 @@ struct Manifest {
     total_bytes: u64,
 }
 
+/// Most partitions one topic may have. Mirrors `es_broker::topic::MAX_PARTITIONS`
+/// (this crate does not link the broker): a restored topic.json above it would
+/// be refused by the broker at startup.
+const MAX_PARTITIONS: u32 = 10_000;
+
+/// Default for `--max-bytes`: the most archive payload a restore unpacks.
+pub const DEFAULT_MAX_BYTES: u64 = 1 << 40;
+/// Default for `--max-entries`: the most archive entries a restore reads.
+pub const DEFAULT_MAX_ENTRIES: u64 = 1_000_000;
+
+/// What the operator allows a restore to do. The archive's own manifest is
+/// never an authority on any of it (Bonfire #711): whoever wrote the archive
+/// wrote the manifest too.
+#[derive(Debug, Clone)]
+pub struct RestoreOptions {
+    /// Replace a non-empty data directory (moved aside, never deleted).
+    pub force: bool,
+    /// Restore `api_keys.json`. Without it a key file in the archive is
+    /// skipped, whatever the manifest claims.
+    pub with_keys: bool,
+    /// Ceiling on the bytes of every entry read, restored or skipped.
+    pub max_bytes: u64,
+    /// Ceiling on the number of entries read, directories and empty files
+    /// included.
+    pub max_entries: u64,
+}
+
+impl Default for RestoreOptions {
+    fn default() -> Self {
+        Self {
+            force: false,
+            with_keys: false,
+            max_bytes: DEFAULT_MAX_BYTES,
+            max_entries: DEFAULT_MAX_ENTRIES,
+        }
+    }
+}
+
 /// Restore `input` into `data_dir`.
 ///
 /// The archive is extracted into a staging directory next to `data_dir` and
 /// validated there — manifest first and supported, every path on the
-/// allow-list, sizes within what the manifest declared — before the existing
+/// allow-list, sizes within what the manifest declared and what `opts`
+/// allow, every topic.json one the broker will open — before the existing
 /// data is touched. Only then is the old directory moved aside (never deleted:
 /// its new name is printed) and the staging directory renamed into place.
 ///
 /// The old order deleted the data directory first and opened the archive
 /// second, so a typo in `--input` or a truncated archive destroyed live data.
-pub fn restore(input: &str, data_dir: &str, force: bool) -> Result<()> {
+pub fn restore(input: &str, data_dir: &str, opts: &RestoreOptions) -> Result<()> {
     let data_dir = PathBuf::from(data_dir);
     let has_content = data_dir.exists()
         && fs::read_dir(&data_dir)
             .map(|mut rd| rd.next().is_some())
             .unwrap_or(false);
-    if has_content && !force {
+    if has_content && !opts.force {
         return Err(anyhow::anyhow!(
             "data-dir '{}' already exists and is not empty. Use --force to replace it (the \
              current contents are kept under a new name).",
@@ -59,13 +98,10 @@ pub fn restore(input: &str, data_dir: &str, force: bool) -> Result<()> {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "data".into());
-    let staging = parent.join(format!(".{}.restore-{}", base, std::process::id()));
-    if staging.exists() {
-        fs::remove_dir_all(&staging)?;
-    }
-    create_private_dir(&staging)?;
+    let staging = create_staging_dir(&parent, &base)?;
 
-    let extracted = extract(file, input, &staging);
+    let extracted =
+        extract(file, input, &staging, opts).and_then(|v| validate_topics(&staging).map(|_| v));
     let (manifest, files_restored, bytes_restored) = match extracted {
         Ok(v) => v,
         Err(e) => {
@@ -109,16 +145,44 @@ pub fn restore(input: &str, data_dir: &str, force: bool) -> Result<()> {
 /// the manifest being written and being copied when dumping a live broker.
 const SIZE_SLACK_BYTES: u64 = 64 * 1024 * 1024;
 
-fn extract(file: File, input: &str, staging: &Path) -> Result<(Manifest, usize, u64)> {
+/// A topic.json is a few hundred bytes; anything near this is not one.
+const MAX_TOPIC_META_BYTES: u64 = 1024 * 1024;
+
+fn extract(
+    file: File,
+    input: &str,
+    staging: &Path,
+    opts: &RestoreOptions,
+) -> Result<(Manifest, usize, u64)> {
     let decoder = GzDecoder::new(BufReader::new(file));
     let mut archive = tar::Archive::new(decoder);
 
     let mut manifest: Option<Manifest> = None;
     let mut files_restored: usize = 0;
     let mut bytes_restored: u64 = 0;
+    // Every entry counts, restored or skipped, directory or empty file: the
+    // tar stream is decompressed in full either way.
+    let mut entries_read: u64 = 0;
+    let mut bytes_read: u64 = 0;
 
     for entry in archive.entries()? {
         let mut entry = entry?;
+        entries_read += 1;
+        if entries_read > opts.max_entries {
+            return Err(anyhow::anyhow!(
+                "archive has more than {} entries (--max-entries); refusing to continue",
+                opts.max_entries
+            ));
+        }
+        bytes_read = bytes_read
+            .checked_add(entry.size())
+            .filter(|b| *b <= opts.max_bytes)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "archive holds more than {} bytes (--max-bytes); refusing to continue",
+                    opts.max_bytes
+                )
+            })?;
         let path = entry.path()?.to_path_buf();
         let path_str = path.to_string_lossy().into_owned();
 
@@ -178,7 +242,19 @@ fn extract(file: File, input: &str, staging: &Path) -> Result<(Manifest, usize, 
             );
             continue;
         }
-        if !is_allowed(&path, entry_type.is_dir(), m.includes_keys) {
+        if is_key_file(&path) && !opts.with_keys {
+            eprintln!(
+                "warning: skipping '{}': API keys are restored only with --with-keys{}",
+                path_str,
+                if m.includes_keys {
+                    " (the archive says it includes them)"
+                } else {
+                    ""
+                }
+            );
+            continue;
+        }
+        if !is_allowed(&path, entry_type.is_dir(), opts.with_keys) {
             eprintln!(
                 "warning: skipping '{}': not part of a broker data directory",
                 path_str
@@ -196,8 +272,11 @@ fn extract(file: File, input: &str, staging: &Path) -> Result<(Manifest, usize, 
         }
 
         let size = entry.size();
-        bytes_restored += size;
-        if bytes_restored > m.total_bytes + SIZE_SLACK_BYTES {
+        if path_str.ends_with("topic.json") && size > MAX_TOPIC_META_BYTES {
+            return Err(anyhow::anyhow!("'{}' is implausibly large", path_str));
+        }
+        bytes_restored = bytes_restored.saturating_add(size);
+        if bytes_restored > m.total_bytes.saturating_add(SIZE_SLACK_BYTES) {
             return Err(anyhow::anyhow!(
                 "archive holds more data than its manifest declares ({} bytes); refusing to \
                  continue",
@@ -242,6 +321,162 @@ fn extract(file: File, input: &str, staging: &Path) -> Result<(Manifest, usize, 
         );
     }
     Ok((m, files_restored, bytes_restored))
+}
+
+/// Create the staging directory `.<base>.restore-<random>` in `parent`.
+///
+/// One `mkdir`, mode 0700, that fails if the name exists — never a recursive
+/// create, which follows a symlink planted at a predictable name (the old
+/// suffix was the pid) and would extract into wherever it points (Bonfire
+/// #719). The result is checked with `symlink_metadata` before use.
+fn create_staging_dir(parent: &Path, base: &str) -> Result<PathBuf> {
+    let mut last_err = None;
+    for _ in 0..8 {
+        let staging = parent.join(format!(".{}.restore-{:016x}", base, random_u64()));
+        let mut b = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            b.mode(0o700);
+        }
+        match b.create(&staging) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_err = Some(e);
+                continue;
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("create staging dir {:?}", staging));
+            }
+        }
+        let meta = fs::symlink_metadata(&staging)
+            .with_context(|| format!("stat staging dir {:?}", staging))?;
+        if !meta.file_type().is_dir() {
+            return Err(anyhow::anyhow!(
+                "staging dir {:?} is not a plain directory",
+                staging
+            ));
+        }
+        return Ok(staging);
+    }
+    Err(anyhow::anyhow!(
+        "could not create a staging dir in {:?}: {}",
+        parent,
+        last_err.map(|e| e.to_string()).unwrap_or_default()
+    ))
+}
+
+/// 64 unpredictable bits without a `rand` dependency: std seeds every
+/// `RandomState` from the OS generator.
+fn random_u64() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u32(std::process::id());
+    h.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    );
+    h.finish()
+}
+
+fn is_key_file(path: &Path) -> bool {
+    let mut normal = path.components().filter_map(|c| match c {
+        std::path::Component::Normal(s) => Some(s),
+        _ => None,
+    });
+    matches!((normal.next(), normal.next()), (Some(f), None) if f == "api_keys.json")
+}
+
+/// The subset of the broker's topic.json a restore checks.
+#[derive(Debug, serde::Deserialize)]
+struct TopicMeta {
+    partitions: u32,
+    #[serde(default)]
+    config: TopicMetaConfig,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct TopicMetaConfig {
+    #[serde(default)]
+    cleanup_policy: Option<String>,
+    #[serde(default)]
+    segment_bytes: Option<u64>,
+}
+
+/// Every restored topic must be one the broker can open: a topic.json that
+/// parses, a partition count within 1..=MAX_PARTITIONS, a config the broker
+/// accepts, and no partition directory beyond the count. A bad one used to be
+/// restored as is and the broker then refused to start (Bonfire #711).
+fn validate_topics(staging: &Path) -> Result<()> {
+    let topics = staging.join("topics");
+    let rd = match fs::read_dir(&topics) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).context("read restored topics"),
+    };
+    for entry in rd {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !valid_name(&name) {
+            return Err(anyhow::anyhow!(
+                "restored topic '{}' has an invalid name",
+                name
+            ));
+        }
+        let dir = entry.path();
+        let bytes = fs::read(dir.join("topic.json"))
+            .with_context(|| format!("topic '{}' has no topic.json", name))?;
+        let meta = parse_topic_meta(&bytes).with_context(|| format!("topic '{}'", name))?;
+        for p in fs::read_dir(&dir)? {
+            let p = p?;
+            if !p.file_type()?.is_dir() {
+                continue;
+            }
+            let id: u32 = p
+                .file_name()
+                .to_string_lossy()
+                .parse()
+                .map_err(|_| anyhow::anyhow!("topic '{}': stray directory", name))?;
+            if id >= meta.partitions {
+                return Err(anyhow::anyhow!(
+                    "topic '{}': partition {} beyond its {} partition(s)",
+                    name,
+                    id,
+                    meta.partitions
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_topic_meta(bytes: &[u8]) -> Result<TopicMeta> {
+    let meta: TopicMeta = serde_json::from_slice(bytes).context("parse topic.json")?;
+    if meta.partitions == 0 || meta.partitions > MAX_PARTITIONS {
+        return Err(anyhow::anyhow!(
+            "topic.json: partitions must be between 1 and {} (found {})",
+            MAX_PARTITIONS,
+            meta.partitions
+        ));
+    }
+    if let Some(sb) = meta.config.segment_bytes {
+        if !(128..=(1u64 << 40)).contains(&sb) {
+            return Err(anyhow::anyhow!(
+                "topic.json: segment_bytes must be between 128 bytes and 1 TiB"
+            ));
+        }
+    }
+    if let Some(cp) = meta.config.cleanup_policy.as_deref() {
+        if !matches!(cp, "delete" | "compact" | "compact,delete") {
+            return Err(anyhow::anyhow!(
+                "topic.json: unknown cleanup_policy '{}'",
+                cp
+            ));
+        }
+    }
+    Ok(meta)
 }
 
 fn create_private_dir(p: &Path) -> Result<()> {
@@ -428,12 +663,16 @@ mod tests {
         .unwrap();
 
         let dst = dir.path().join("dst");
-        super::restore(out.to_str().unwrap(), dst.to_str().unwrap(), false).unwrap();
+        let opts = super::RestoreOptions {
+            with_keys: true,
+            ..Default::default()
+        };
+        super::restore(out.to_str().unwrap(), dst.to_str().unwrap(), &opts).unwrap();
         assert!(dst.join("topics/t/0/00000000000000000000.log").exists());
         assert!(dst.join("groups/g.json").exists());
         assert!(
             dst.join("api_keys.json").exists(),
-            "--include-keys must back up api_keys.json"
+            "--include-keys and --with-keys must round-trip api_keys.json"
         );
         assert!(
             !dst.join("bootstrap.key").exists(),
@@ -458,8 +697,12 @@ mod tests {
         std::fs::write(data.join("schemas.json"), b"precious").unwrap();
         let bogus = dir.path().join("bogus.tar.gz");
         std::fs::write(&bogus, b"not an archive").unwrap();
-        assert!(super::restore(bogus.to_str().unwrap(), data.to_str().unwrap(), true).is_err());
-        assert!(super::restore("/does/not/exist.tar.gz", data.to_str().unwrap(), true).is_err());
+        let force = super::RestoreOptions {
+            force: true,
+            ..Default::default()
+        };
+        assert!(super::restore(bogus.to_str().unwrap(), data.to_str().unwrap(), &force).is_err());
+        assert!(super::restore("/does/not/exist.tar.gz", data.to_str().unwrap(), &force).is_err());
         assert_eq!(
             std::fs::read(data.join("schemas.json")).unwrap(),
             b"precious"
@@ -477,5 +720,196 @@ mod tests {
         assert!(!is_safe_relative_path(Path::new("/etc/passwd")));
         // Empty path is not a valid extraction target.
         assert!(!is_safe_relative_path(Path::new("")));
+    }
+
+    use super::RestoreOptions;
+
+    const SEG: &str = "00000000000000000000";
+
+    /// Write a gzipped tar of `entries` (path, contents; `None` = directory)
+    /// after a manifest with the given `includes_keys` and `total_bytes`.
+    fn archive(
+        dir: &Path,
+        includes_keys: bool,
+        total_bytes: u64,
+        entries: &[(&str, Option<&[u8]>)],
+    ) -> std::path::PathBuf {
+        let out = dir.join("crafted.tar.gz");
+        let f = std::fs::File::create(&out).unwrap();
+        let gz = flate2::write::GzEncoder::new(f, flate2::Compression::fast());
+        let mut tar = tar::Builder::new(gz);
+        let manifest = serde_json::json!({
+            "version": 1, "created_at_ms": 0, "broker_version": "test",
+            "topics": [], "includes_keys": includes_keys,
+            "file_count": entries.len() + 1, "total_bytes": total_bytes,
+        })
+        .to_string();
+        let mut add = |path: &str, data: Option<&[u8]>| {
+            let mut h = tar::Header::new_gnu();
+            match data {
+                Some(d) => {
+                    h.set_entry_type(tar::EntryType::Regular);
+                    h.set_size(d.len() as u64);
+                    h.set_mode(0o644);
+                    h.set_cksum();
+                    tar.append_data(&mut h, path, d).unwrap();
+                }
+                None => {
+                    h.set_entry_type(tar::EntryType::Directory);
+                    h.set_size(0);
+                    h.set_mode(0o755);
+                    h.set_cksum();
+                    tar.append_data(&mut h, path, &[][..]).unwrap();
+                }
+            }
+        };
+        add("manifest.json", Some(manifest.as_bytes()));
+        for (p, d) in entries {
+            add(p, *d);
+        }
+        tar.into_inner().unwrap().finish().unwrap();
+        out
+    }
+
+    fn topic(partitions: &str) -> Vec<(String, Option<Vec<u8>>)> {
+        vec![
+            ("topics".into(), None),
+            ("topics/t".into(), None),
+            (
+                "topics/t/topic.json".into(),
+                Some(format!(r#"{{"partitions":{partitions}}}"#).into_bytes()),
+            ),
+            ("topics/t/0".into(), None),
+            (format!("topics/t/0/{SEG}.log"), Some(Vec::new())),
+        ]
+    }
+
+    fn run(
+        entries: &[(String, Option<Vec<u8>>)],
+        includes_keys: bool,
+        total_bytes: u64,
+        opts: &RestoreOptions,
+    ) -> (tempfile::TempDir, anyhow::Result<()>) {
+        let dir = tempfile::tempdir().unwrap();
+        let e: Vec<(&str, Option<&[u8]>)> = entries
+            .iter()
+            .map(|(p, d)| (p.as_str(), d.as_deref()))
+            .collect();
+        let a = archive(dir.path(), includes_keys, total_bytes, &e);
+        let dst = dir.path().join("dst");
+        let r = super::restore(a.to_str().unwrap(), dst.to_str().unwrap(), opts);
+        (dir, r)
+    }
+
+    fn leftovers(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".restore-"))
+            .collect()
+    }
+
+    /// Bonfire #711: the manifest is written by whoever wrote the archive.
+    /// Saying `includes_keys: true` no longer installs credentials; only the
+    /// operator's --with-keys does.
+    #[test]
+    fn keys_are_restored_only_with_the_flag() {
+        let mut e = topic("1");
+        e.push(("api_keys.json".into(), Some(b"{\"keys\":[]}".to_vec())));
+
+        let (dir, r) = run(&e, true, 1 << 20, &RestoreOptions::default());
+        r.unwrap();
+        assert!(!dir.path().join("dst/api_keys.json").exists());
+        assert!(dir.path().join("dst/topics/t/topic.json").exists());
+
+        let with = RestoreOptions {
+            with_keys: true,
+            ..Default::default()
+        };
+        let (dir, r) = run(&e, false, 1 << 20, &with);
+        r.unwrap();
+        assert!(dir.path().join("dst/api_keys.json").exists());
+    }
+
+    #[test]
+    fn entry_and_byte_ceilings_hold_whatever_the_manifest_says() {
+        let mut e = topic("1");
+        for i in 0..20 {
+            e.push((format!("groups/g{i}.json"), Some(Vec::new())));
+        }
+        // Directories and empty files count toward --max-entries.
+        let opts = RestoreOptions {
+            max_entries: 10,
+            ..Default::default()
+        };
+        let (dir, r) = run(&e, false, u64::MAX, &opts);
+        assert!(format!("{:#}", r.unwrap_err()).contains("--max-entries"));
+        assert!(!dir.path().join("dst").exists());
+        assert!(leftovers(dir.path()).is_empty(), "staging removed");
+
+        // A manifest total near u64::MAX cannot raise the CLI ceiling, nor
+        // wrap the running count.
+        let mut e = topic("1");
+        e.push(("schemas.json".into(), Some(vec![b' '; 4096])));
+        let opts = RestoreOptions {
+            max_bytes: 1024,
+            ..Default::default()
+        };
+        let (dir, r) = run(&e, false, u64::MAX, &opts);
+        assert!(format!("{:#}", r.unwrap_err()).contains("--max-bytes"));
+        assert!(!dir.path().join("dst").exists());
+
+        let (_dir, r) = run(&e, false, u64::MAX, &RestoreOptions::default());
+        r.unwrap();
+    }
+
+    #[test]
+    fn a_topic_the_broker_could_not_open_is_refused() {
+        for bad in ["4294967295", "0", "10001", "\"x\""] {
+            let (dir, r) = run(&topic(bad), false, 1 << 20, &RestoreOptions::default());
+            assert!(r.is_err(), "partitions {bad} accepted");
+            assert!(!dir.path().join("dst").exists());
+            assert!(leftovers(dir.path()).is_empty());
+        }
+        // A partition directory beyond the declared count.
+        let mut e = topic("1");
+        e.push(("topics/t/3".into(), None));
+        let (_dir, r) = run(&e, false, 1 << 20, &RestoreOptions::default());
+        assert!(format!("{:#}", r.unwrap_err()).contains("beyond"));
+        // A topic without its topic.json.
+        let e: Vec<(String, Option<Vec<u8>>)> = topic("1")
+            .into_iter()
+            .filter(|(p, _)| !p.ends_with("topic.json"))
+            .collect();
+        let (_dir, r) = run(&e, false, 1 << 20, &RestoreOptions::default());
+        assert!(r.is_err());
+        // Config the broker rejects.
+        let mut e = topic("1");
+        e[2].1 = Some(br#"{"partitions":1,"config":{"segment_bytes":1}}"#.to_vec());
+        let (_dir, r) = run(&e, false, 1 << 20, &RestoreOptions::default());
+        assert!(r.is_err());
+    }
+
+    /// Bonfire #719: the staging directory is unpredictable, private, created
+    /// by a single non-recursive mkdir, and never an existing path.
+    #[test]
+    fn staging_dir_is_fresh_private_and_unpredictable() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = super::create_staging_dir(dir.path(), "data").unwrap();
+        let b = super::create_staging_dir(dir.path(), "data").unwrap();
+        assert_ne!(a, b);
+        let name = a.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with(".data.restore-"));
+        assert!(!name.ends_with(&std::process::id().to_string()));
+        let meta = std::fs::symlink_metadata(&a).unwrap();
+        assert!(meta.file_type().is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+        }
+        // A parent that does not exist is not created on the way.
+        assert!(super::create_staging_dir(&dir.path().join("missing/x"), "data").is_err());
+        assert!(!dir.path().join("missing").exists());
     }
 }

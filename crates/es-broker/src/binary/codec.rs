@@ -196,7 +196,7 @@ mod tests {
     #[test]
     fn topic_is_read_from_the_head_of_a_gzip_stream() {
         let mut b = es_protocol::wire::WireBuf::new();
-        b.put_str("orders");
+        b.put_str("orders").unwrap();
         b.put_bytes(&vec![0u8; 1 << 20]);
         let z = compress(&b.bytes).unwrap();
         assert_eq!(peek_topic(&z, true).unwrap(), "orders");

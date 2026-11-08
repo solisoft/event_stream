@@ -408,15 +408,23 @@ impl Driver {
                 }
             }
         }
-        let current_term = self.state.lock().await.current_term;
-        match &msg {
-            Message::AppendEntries(ae) if ae.term >= current_term => {
-                self.last_leader_contact = Some(Instant::now());
-            }
-            Message::InstallSnapshot(is) if is.term >= current_term => {
-                self.last_leader_contact = Some(Instant::now());
-            }
-            _ => {}
+        // Validate before acting: a message from a leader is a sign of life,
+        // and a snapshot chunk is written into the state machine, only once
+        // the state machine has agreed it would accept the message — member
+        // sender, plausible term, not stale, no other leader for that term.
+        // Doing either first let a forged chunk with an absurd term write
+        // records and silence elections before Raft ever looked at it.
+        let from_leader = match &msg {
+            Message::AppendEntries(ae) => Some((ae.leader_id, ae.term)),
+            Message::InstallSnapshot(is) => Some((is.leader_id, is.term)),
+            _ => None,
+        };
+        let accepted = match from_leader {
+            Some((leader, term)) => self.state.lock().await.accepts_from_leader(leader, term),
+            None => false,
+        };
+        if accepted {
+            self.last_leader_contact = Some(Instant::now());
         }
 
         let Message::InstallSnapshot(is) = msg else {
@@ -429,7 +437,7 @@ impl Driver {
         // acknowledged once the state behind it is really there.
         let mut progress = 0u64;
         let mut ok = true;
-        if is.term >= current_term {
+        if accepted {
             if let Some(t) = self.transfer.clone() {
                 if !is.is_probe() {
                     let data = is.data.clone();
@@ -694,5 +702,135 @@ pub async fn pump_outbound(
         if Instant::now() >= deadline {
             return Ok(());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::raft::messages::{AppendEntries, RequestVote, Term};
+
+    /// Records every chunk the driver hands to the state machine.
+    #[derive(Default)]
+    struct Recorder {
+        chunks: std::sync::Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl SnapshotTransfer for Recorder {
+        fn read_chunk(&self, _: u64, _: u64, _: usize) -> Result<(Vec<u8>, bool)> {
+            Ok((Vec::new(), true))
+        }
+        fn apply_chunk(&self, data: &[u8], _done: bool) -> Result<()> {
+            self.chunks.lock().unwrap().push(data.to_vec());
+            Ok(())
+        }
+        fn progress(&self) -> u64 {
+            0
+        }
+        fn snapshot_end(&self, _: &[u8]) -> u64 {
+            0
+        }
+    }
+
+    /// Node 2 of {1, 2, 3}, with timers too long to fire during a test.
+    fn follower() -> (NodeHandle, Arc<Recorder>) {
+        let rec = Arc::new(Recorder::default());
+        let timing = Timing {
+            election_min: Duration::from_secs(30),
+            election_max: Duration::from_secs(60),
+            heartbeat: Duration::from_secs(30),
+        };
+        let store: Arc<dyn RaftStore> = Arc::new(crate::raft::log::MemStore::new());
+        let options = NodeOptions {
+            noop_on_elect: false,
+            transfer: Some(rec.clone()),
+        };
+        let h = spawn_node_with_options(2, vec![1, 3], timing, store, options).unwrap();
+        (h, rec)
+    }
+
+    fn chunk(leader: NodeId, term: Term, marker: &[u8]) -> Message {
+        Message::InstallSnapshot(InstallSnapshot {
+            term,
+            leader_id: leader,
+            last_index: 10,
+            last_term: term,
+            offset: 0,
+            done: false,
+            data: marker.to_vec(),
+        })
+    }
+
+    async fn next_outbound(h: &mut NodeHandle) -> Option<Outbound> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if let Some(o) = h.try_recv_outbound() {
+                return Some(o);
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_chunk_is_applied_only_from_the_accepted_leader() {
+        let (mut h, rec) = follower();
+        // Node 1 leads term 1.
+        h.inbound
+            .send(Message::AppendEntries(AppendEntries {
+                term: 1,
+                leader_id: 1,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: 0,
+            }))
+            .unwrap();
+        assert!(next_outbound(&mut h).await.is_some(), "heartbeat answered");
+
+        h.inbound.send(chunk(3, 1, b"second leader")).unwrap();
+        h.inbound.send(chunk(9, 1, b"non-member")).unwrap();
+        h.inbound.send(chunk(1, Term::MAX, b"absurd term")).unwrap();
+        h.inbound
+            .send(chunk(1, 1 + (1 << 21), b"term jump"))
+            .unwrap();
+        h.inbound.send(chunk(1, 0, b"stale term")).unwrap();
+        h.inbound.send(chunk(1, 1, b"leader")).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while rec.chunks.lock().unwrap().is_empty() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // Messages are handled in order, so the leader's chunk arriving means
+        // every earlier one was already turned away.
+        assert_eq!(*rec.chunks.lock().unwrap(), vec![b"leader".to_vec()]);
+        assert_eq!(h.current_term().await, 1, "no forged term was adopted");
+        h.shutdown().await;
+    }
+
+    /// A refused message is no sign of a live leader: it must not make the
+    /// node ignore an election.
+    #[tokio::test]
+    async fn a_refused_snapshot_does_not_suppress_elections() {
+        let (mut h, rec) = follower();
+        h.inbound.send(chunk(1, Term::MAX, b"absurd term")).unwrap();
+        h.inbound
+            .send(Message::RequestVote(RequestVote {
+                term: 1,
+                candidate_id: 3,
+                last_log_index: 0,
+                last_log_term: 0,
+            }))
+            .unwrap();
+        let reply = next_outbound(&mut h).await;
+        assert!(
+            matches!(
+                reply,
+                Some(Outbound::SendTo(3, Message::RequestVoteResp(ref r))) if r.vote_granted
+            ),
+            "the vote request must be answered: {reply:?}"
+        );
+        assert!(rec.chunks.lock().unwrap().is_empty());
+        h.shutdown().await;
     }
 }

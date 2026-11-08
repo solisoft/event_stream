@@ -74,9 +74,11 @@ pub struct Config {
     pub raft_peer_addrs: BTreeMap<u32, SocketAddr>,
 
     /// Pre-shared secret that peers must present in the Raft transport
-    /// handshake. When `None`, the raft port performs no peer authentication
-    /// (only safe on a fully trusted/loopback network).
-    pub raft_shared_secret: Option<String>,
+    /// handshake. When `None`, the raft port performs no peer authentication,
+    /// which the transport allows only on a loopback bind. The type refuses a
+    /// secret shorter than [`crate::raft::secret::MIN_SECRET_BYTES`] and
+    /// keeps it out of this struct's `Debug` output.
+    pub raft_shared_secret: Option<crate::raft::SharedSecret>,
 
     /// Cold-storage directory for tiered storage. When set, sealed segments are
     /// offloaded here instead of being deleted by retention.

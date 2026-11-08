@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use es_broker::raft::Timing;
+use es_broker::raft::{SharedSecret, Timing};
 use es_broker::raft_partition::{RaftPartition, RaftPartitionConfig, RaftTransportConfig};
 use tempfile::TempDir;
 
@@ -45,7 +45,7 @@ async fn open_node(id: u32, addrs: &[SocketAddr], dir: &TempDir) -> Result<Arc<R
     rp.connect_transport(RaftTransportConfig {
         bind: addrs[id as usize - 1],
         peer_addrs,
-        shared_secret: Some("test-cluster-secret".into()),
+        shared_secret: Some(SharedSecret::new("test-cluster-secret-of-32-bytes!")?),
     })
     .await?;
     Ok(rp)

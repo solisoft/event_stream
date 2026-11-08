@@ -106,7 +106,7 @@ impl BinaryClient {
             producer_id: producer_id.map(|s| s.to_string()),
             records,
         };
-        let payload = encode_produce_request(&req);
+        let payload = encode_produce_request(&req)?;
         match self.round_trip(Opcode::Produce, &payload).await? {
             (Opcode::ProduceOk, body) => Ok(decode_produce_response(&body)?),
             (Opcode::Error, body) => {
@@ -131,7 +131,7 @@ impl BinaryClient {
             max_records,
             max_bytes,
         };
-        let payload = encode_consume_request(&req);
+        let payload = encode_consume_request(&req)?;
         match self.round_trip(Opcode::Consume, &payload).await? {
             (Opcode::ConsumeOk, body) => Ok(decode_consume_response(&body)?),
             (Opcode::Error, body) => {

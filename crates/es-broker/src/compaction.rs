@@ -92,7 +92,7 @@ pub async fn run_pass(broker: &Arc<Broker>, _grace: Duration, cancel: &Cancellat
     }
 }
 
-struct CompactionReport {
+pub(crate) struct CompactionReport {
     records_kept: usize,
     records_dropped: usize,
     sealed_merged: usize,
@@ -135,7 +135,7 @@ fn for_each_record(seg: &Segment, mut f: impl FnMut(Record) -> Result<()>) -> Re
 /// Two streaming passes: the first keeps only `key -> newest offset`, the
 /// second copies the surviving records. Memory is proportional to the number of
 /// distinct keys, not to the bytes in the partition.
-fn compact_partition(
+pub(crate) fn compact_partition(
     partition: &Partition,
     config: &TopicConfig,
 ) -> Result<Option<CompactionReport>> {

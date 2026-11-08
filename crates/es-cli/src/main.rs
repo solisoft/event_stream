@@ -323,12 +323,26 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let auth = match &cli.auth_file {
         Some(path) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = std::fs::metadata(path) {
+                    if let Some(w) = auth_file_mode_warning(path, meta.permissions().mode()) {
+                        eprintln!("{w}");
+                    }
+                }
+            }
             let contents = std::fs::read_to_string(path)
                 .with_context(|| format!("read auth file {:?}", path))?;
             Some(contents.lines().next().unwrap_or("").trim().to_string())
         }
         None => cli.auth.clone(),
     };
+    if auth.as_deref().is_some_and(|t| !t.is_empty()) {
+        if let Some(w) = plaintext_token_warning(&cli.broker) {
+            eprintln!("{w}");
+        }
+    }
     let client = build_client(auth.as_deref())?;
     let base = cli.broker.trim_end_matches('/').to_string();
     match cli.cmd {
@@ -826,17 +840,60 @@ fn print_config(c: &TopicConfigDto) {
     }
 }
 
+/// A warning when a bearer token would cross the network in clear: plain
+/// `http://` to anything but a loopback address (Bonfire #720). Anyone on the
+/// path can read the token and act as its holder until it is revoked.
+fn plaintext_token_warning(broker: &str) -> Option<String> {
+    let url = reqwest::Url::parse(broker).ok()?;
+    if url.scheme() != "http" {
+        return None;
+    }
+    let host = url.host_str()?;
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    let loopback = match bare.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => host.eq_ignore_ascii_case("localhost"),
+    };
+    if loopback {
+        return None;
+    }
+    Some(format!(
+        "warning: sending the auth token over plain http to {}; anyone on the network path \
+         can read it. Use https:// (the broker's --tls-cert/--tls-key).",
+        host
+    ))
+}
+
+/// A warning when the token file is readable by its group or by everyone.
+fn auth_file_mode_warning(path: &std::path::Path, mode: u32) -> Option<String> {
+    if mode & 0o044 == 0 {
+        return None;
+    }
+    Some(format!(
+        "warning: auth file {:?} is readable by other users (mode {:o}); run chmod 600 on it",
+        path,
+        mode & 0o777
+    ))
+}
+
 fn build_client(auth: Option<&str>) -> Result<reqwest::Client> {
     let mut headers = reqwest::header::HeaderMap::new();
     if let Some(token) = auth {
-        let value = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token))
-            .map_err(|e| anyhow!("invalid auth token: {}", e))?;
-        headers.insert(reqwest::header::AUTHORIZATION, value);
+        headers.insert(reqwest::header::AUTHORIZATION, auth_header(token)?);
     }
     reqwest::Client::builder()
         .default_headers(headers)
         .build()
         .map_err(|e| anyhow!("reqwest client build failed: {}", e))
+}
+
+/// The `Authorization` value, marked sensitive so reqwest and hyper keep it
+/// out of `Debug` output and HPACK tables (Bonfire #720).
+fn auth_header(token: &str) -> Result<reqwest::header::HeaderValue> {
+    let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token))
+        .map_err(|e| anyhow!("invalid auth token: {}", e))?;
+    value.set_sensitive(true);
+    Ok(value)
 }
 
 async fn get_json<T: serde::de::DeserializeOwned>(
@@ -878,4 +935,38 @@ async fn put_json<B: serde::Serialize, T: serde::de::DeserializeOwned>(
         return Err(anyhow!("PUT {} failed: {} {}", url, status, txt));
     }
     Ok(resp.json().await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_token_over_plain_http_to_a_remote_host_is_flagged() {
+        assert!(plaintext_token_warning("http://broker.example:9000").is_some());
+        assert!(plaintext_token_warning("http://10.0.0.5:9000").is_some());
+        assert!(plaintext_token_warning("http://[2001:db8::1]:9000").is_some());
+        assert!(plaintext_token_warning("http://127.0.0.1:9000").is_none());
+        assert!(plaintext_token_warning("http://127.8.9.10:9000").is_none());
+        assert!(plaintext_token_warning("http://localhost:9000").is_none());
+        assert!(plaintext_token_warning("http://[::1]:9000").is_none());
+        assert!(plaintext_token_warning("https://broker.example:9000").is_none());
+    }
+
+    #[test]
+    fn a_shared_auth_file_is_flagged() {
+        let p = std::path::Path::new("/tmp/token");
+        assert!(auth_file_mode_warning(p, 0o100600).is_none());
+        assert!(auth_file_mode_warning(p, 0o100400).is_none());
+        assert!(auth_file_mode_warning(p, 0o100640).is_some());
+        assert!(auth_file_mode_warning(p, 0o100604).is_some());
+        assert!(auth_file_mode_warning(p, 0o100644).is_some());
+    }
+
+    #[test]
+    fn the_authorization_header_is_sensitive() {
+        let v = auth_header("esk_secret").unwrap();
+        assert!(v.is_sensitive());
+        assert!(!format!("{v:?}").contains("esk_secret"));
+    }
 }

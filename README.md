@@ -48,6 +48,7 @@ crates/
 ├── es-protocol/   # serde DTOs + binary wire format
 ├── es-broker/     # broker: storage, HTTP, binary, auth, retention, compaction
 ├── es-cli/        # `es` binary
+├── es-client/     # blocking binary-protocol client (std::net, no tokio)
 └── es-tools/      # offline dump/restore tools
 scripts/demo.sh    # one-command end-to-end exercise
 Makefile           # build · run-broker · demo · test · clean
@@ -79,13 +80,24 @@ registry, tiered storage, and a security and performance audit (see below).
   this machine (DNS-rebinding guard). No CORS headers unless `--cors-origin` lists origins.
 - **TLS covers both listeners.** `--tls-cert`/`--tls-key` apply to HTTP and the binary
   protocol; giving only one of them is an error.
-- **Tenants are isolated.** ACL prefixes match at name boundaries (`orders` covers
-  `orders.eu`, not `ordersecret`); consumer groups and idempotent producer ids belong to the
-  key that first used them; `/metrics` needs a key and shows only what it can read.
+- **Tenants are isolated.** ACL prefixes match at `.` boundaries only (`orders` covers
+  `orders.eu`, not `ordersecret`, `orders-archive` or `orders_old`; spell `orders-` to mean
+  every name starting with it). Schema subjects `<topic>-value` / `<topic>-key` are
+  authorized against `<topic>`. Consumer groups and idempotent producer ids belong to the
+  key that first used them, and a key may only claim names under its own ACL prefixes
+  (`orders.billing-service`, not `billing-service`); a group or id you may not use is
+  refused the same way whether or not it exists. `/metrics` needs a key and shows only
+  what it can read.
 - **Limits.** Records up to 8 MiB on both protocols, consume responses up to 8 MiB /
   10,000 records, produce and consume byte-rate quotas per key.
-- **Raft peers authenticate each other** (HMAC challenge-response, MAC on every frame).
-  Replication traffic is not encrypted: keep `--raft-bind` on a private network.
+- **Raft peers share one secret** (HMAC challenge-response, MAC on every frame). It keeps
+  outsiders out: without the secret nothing can join the cluster or forge, alter or replay
+  a frame. It does not tell members apart: any node holding the secret can claim to be any
+  other member, and vote or acknowledge in its name. The secret must be at least 32 bytes
+  (`openssl rand -hex 32`); pass it through `ES_RAFT_SHARED_SECRET` or
+  `--raft-shared-secret-file` (mode 600) rather than on the command line. The raft port
+  accepts connections only from the peers' addresses. Replication traffic is not
+  encrypted: keep `--raft-bind` on a private network.
 
 ## What's not here
 
@@ -110,6 +122,8 @@ cargo test --release --test bench -- --ignored --nocapture  # throughput bench
 # Backup & restore
 ./target/release/es-tools dump --data-dir ./data --output backup.tar.gz
 ./target/release/es-tools restore --input backup.tar.gz --data-dir ./new-data
+# API keys come back only on request, whatever the archive claims
+./target/release/es-tools restore --input backup.tar.gz --data-dir ./new-data --with-keys
 ```
 
 ## License

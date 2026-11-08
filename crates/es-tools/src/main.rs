@@ -52,6 +52,19 @@ enum Cmd {
         /// Overwrite existing data directory contents without confirmation.
         #[arg(long)]
         force: bool,
+
+        /// Restore API keys (api_keys.json) from the archive. Without it a key
+        /// file is skipped, whatever the archive's manifest says.
+        #[arg(long)]
+        with_keys: bool,
+
+        /// Most bytes to read from the archive, every entry counted.
+        #[arg(long, default_value_t = restore::DEFAULT_MAX_BYTES)]
+        max_bytes: u64,
+
+        /// Most entries to read from the archive, directories included.
+        #[arg(long, default_value_t = restore::DEFAULT_MAX_ENTRIES)]
+        max_entries: u64,
     },
 }
 
@@ -82,8 +95,17 @@ fn main() -> anyhow::Result<()> {
             data_dir,
             input,
             force,
+            with_keys,
+            max_bytes,
+            max_entries,
         } => {
-            restore::restore(&input, &data_dir, force)?;
+            let opts = restore::RestoreOptions {
+                force,
+                with_keys,
+                max_bytes,
+                max_entries,
+            };
+            restore::restore(&input, &data_dir, &opts)?;
         }
     }
     Ok(())

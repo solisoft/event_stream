@@ -378,6 +378,12 @@ impl Topic {
             .with_context(|| format!("read topic meta {:?}", meta_path))?;
         let meta: TopicMeta = serde_json::from_slice(&meta_bytes)
             .with_context(|| format!("parse topic meta {:?}", meta_path))?;
+        // topic.json can come from a restored archive, not only from
+        // `create`: hold it to the same limits. `partitions: 4294967295` had
+        // the broker open partitions until it ran out of files, and it could
+        // not start (Bonfire #711).
+        validate_topic_name(name)?;
+        validate_meta(&meta).with_context(|| format!("topic meta {:?}", meta_path))?;
         let resolved = meta.config.resolve(broker)?;
         let raft_cfg = meta.config.resolve_raft(broker, name);
         let mut parts = Vec::with_capacity(meta.partitions as usize);
@@ -468,6 +474,28 @@ fn validate_patch(p: &TopicConfigPatch) -> Result<()> {
     Ok(())
 }
 
+/// Reject a persisted topic.json that `create` would never have written.
+fn validate_meta(meta: &TopicMeta) -> Result<()> {
+    if meta.partitions == 0 || meta.partitions > MAX_PARTITIONS {
+        return Err(anyhow!(
+            "partitions must be between 1 and {} (found {})",
+            MAX_PARTITIONS,
+            meta.partitions
+        ));
+    }
+    let c = &meta.config;
+    validate_patch(&TopicConfigPatch {
+        segment_bytes: c.segment_bytes,
+        ..Default::default()
+    })?;
+    if let Some(p) = c.cleanup_policy.as_deref() {
+        if CleanupPolicy::from_str_opt(p).is_none() {
+            return Err(anyhow!("unknown cleanup_policy '{}'", p));
+        }
+    }
+    Ok(())
+}
+
 /// Validate a topic name. Rejects anything that isn't `[A-Za-z0-9_.-]{1,200}`
 /// and the `.`/`..` path specials, so a topic name can never be used to escape
 /// the data directory when it's joined into a filesystem path.
@@ -505,4 +533,49 @@ pub(crate) fn write_json_atomic<P: AsRef<Path>, T: Serialize>(path: P, value: &T
     let bytes = serde_json::to_vec_pretty(value)?;
     crate::fsutil::write_atomic(path, &bytes).with_context(|| format!("write {:?}", path))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn meta(json: &str) -> Result<()> {
+        validate_meta(&serde_json::from_str::<TopicMeta>(json)?)
+    }
+
+    /// Bonfire #711: topic.json arrives from restored archives too, and a
+    /// partition count `create` would refuse kept the broker from starting.
+    #[test]
+    fn persisted_meta_is_held_to_the_create_limits() {
+        assert!(meta(r#"{"partitions":1}"#).is_ok());
+        assert!(meta(&format!(r#"{{"partitions":{MAX_PARTITIONS}}}"#)).is_ok());
+        assert!(meta(r#"{"partitions":0}"#).is_err());
+        assert!(meta(r#"{"partitions":4294967295}"#).is_err());
+        assert!(meta(&format!(r#"{{"partitions":{}}}"#, MAX_PARTITIONS + 1)).is_err());
+        assert!(meta(r#"{"partitions":1,"config":{"segment_bytes":1}}"#).is_err());
+        assert!(meta(r#"{"partitions":1,"config":{"cleanup_policy":"shred"}}"#).is_err());
+        assert!(meta(r#"{"partitions":1,"config":{"cleanup_policy":"compact"}}"#).is_ok());
+    }
+
+    #[test]
+    fn open_refuses_an_out_of_range_partition_count() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("t")).unwrap();
+        std::fs::write(
+            dir.path().join("t/topic.json"),
+            br#"{"partitions":4294967295}"#,
+        )
+        .unwrap();
+        let cfg = Config::new(
+            dir.path().to_path_buf(),
+            "127.0.0.1:0".parse().unwrap(),
+            1 << 20,
+        );
+        let err = Topic::open(dir.path(), "t", &cfg).err().expect("refused");
+        assert!(format!("{err:#}").contains("partitions"), "{err:#}");
+        assert!(
+            !dir.path().join("t/0").exists(),
+            "no partition opened before the check"
+        );
+    }
 }
