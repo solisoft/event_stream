@@ -44,6 +44,24 @@ async fn settle_leader_in_process(
     Ok(leader)
 }
 
+/// Pump until exactly one node is leader, or `deadline` passes. Unlike
+/// `settle_leader_in_process`, which always pumps for its full window, this
+/// returns as soon as a leader exists: a two-node cluster can split its vote
+/// and need several election rounds, so a fixed short window is flaky and a
+/// fixed long one is slow.
+async fn await_leader_in_process(
+    handles: &mut BTreeMap<NodeId, NodeHandle>,
+    deadline: Duration,
+) -> Result<Option<NodeId>> {
+    let give_up = Instant::now() + deadline;
+    while Instant::now() < give_up {
+        if let Some(leader) = settle_leader_in_process(handles, Duration::from_millis(200)).await? {
+            return Ok(Some(leader));
+        }
+    }
+    Ok(None)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn three_node_in_process_elects_a_leader() -> Result<()> {
     let mut handles: BTreeMap<NodeId, NodeHandle> = BTreeMap::new();
@@ -459,8 +477,9 @@ async fn snapshot_sent_to_lagging_follower() -> Result<()> {
     handles.insert(1, n1);
     handles.insert(2, n2);
 
-    // Elect leader.
-    let leader = settle_leader_in_process(&mut handles, Duration::from_secs(2)).await?;
+    // Elect leader. Two nodes can split the vote, so poll rather than wait a
+    // fixed window.
+    let leader = await_leader_in_process(&mut handles, Duration::from_secs(10)).await?;
     assert!(leader.is_some(), "no leader");
     let leader_id = leader.unwrap();
 
