@@ -369,19 +369,21 @@ async fn two_node_tcp_replication() -> Result<()> {
     })
     .await?;
 
-    // Wait for election + initial heartbeats.
-    tokio::time::sleep(Duration::from_millis(1000)).await;
-
-    // Find the leader by trial: propose to each node, one will succeed.
-    let (leader, follower) = {
-        let r1 = rp1.append(None, b"probe").await;
-        if r1.is_ok() {
-            (&rp1, &rp2)
-        } else {
-            // Try the other node.
-            rp2.append(None, b"probe").await?;
-            (&rp2, &rp1)
+    // Find the leader by trial: propose to each node until one accepts. Two
+    // nodes can split their vote and need several election rounds, so poll
+    // against a deadline instead of probing once after a fixed sleep.
+    let give_up = std::time::Instant::now() + Duration::from_secs(10);
+    let (leader, follower) = loop {
+        if rp1.append(None, b"probe").await.is_ok() {
+            break (&rp1, &rp2);
         }
+        if rp2.append(None, b"probe").await.is_ok() {
+            break (&rp2, &rp1);
+        }
+        if std::time::Instant::now() >= give_up {
+            anyhow::bail!("no leader elected within 10 s");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     };
 
     // The probe landed; now produce a batch through the leader.
