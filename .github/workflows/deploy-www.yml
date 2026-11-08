@@ -179,6 +179,12 @@ jobs:
       DOMAIN: ${{ vars.DEPLOY_DOMAIN || 'es.solisoft.net' }}
       SITE_DIR: ${{ vars.DEPLOY_SITE_DIR || vars.DEPLOY_DOMAIN || 'es.solisoft.net' }}
       APP: ${{ vars.DEPLOY_APP || 'es.solisoft.net' }}
+      # Le fichier de routage avec lequel tourne le proxy (`--conf`).
+      # soli-proxy lit config.toml dans le même dossier : `-c` désigne donc
+      # proxy.conf, jamais config.toml. Depuis soli-proxy 1.0, lui passer
+      # config.toml fait lire ce TOML comme des règles et la bascule échoue
+      # (`cannot parse "[server]"`).
+      PROXY_CONF: ${{ vars.DEPLOY_PROXY_CONF || '/home/rocky/proxy.conf' }}
       # Les pids des processus qui servent CE site ; le serveur en héberge une
       # douzaine. Reconnus à leur ligne de commande et à leur dossier, pas au nom
       # du binaire : quand soli.toml épingle une autre version que
@@ -308,10 +314,10 @@ jobs:
           before="$(ssh "$USER@$HOST" "$PIDS")"
           echo "processus avant : ${before:-aucun}"
           echo "$before" > /tmp/pids-before
-          if ! ssh "$USER@$HOST" "soli-proxy deploy -c '$SITES_DIR/config.toml' '$APP' 2>&1"; then
+          if ! ssh "$USER@$HOST" "soli-proxy deploy -c '$PROXY_CONF' '$APP' 2>&1"; then
             echo "" >&2
             echo "La bascule a échoué. Cause fréquente : un slot orphelin tient encore son port." >&2
-            echo "  ssh $USER@$HOST 'soli-proxy logs -c $SITES_DIR/config.toml $APP'" >&2
+            echo "  ssh $USER@$HOST 'soli-proxy logs -c $PROXY_CONF $APP'" >&2
             exit 1
           fi
 
@@ -337,7 +343,7 @@ jobs:
           done
           echo "" >&2
           echo "Aucun nouveau slot n'a répondu 200 sur /up en 90 s." >&2
-          echo "  ssh $USER@$HOST 'soli-proxy logs -c $SITES_DIR/config.toml $APP'" >&2
+          echo "  ssh $USER@$HOST 'soli-proxy logs -c $PROXY_CONF $APP'" >&2
           exit 1
 
       # Après une bascule, le proxy répartit encore le trafic sur les DEUX ports
@@ -346,7 +352,7 @@ jobs:
       # courant.
       - name: Relancer les deux slots
         if: steps.cfg.outputs.configured == 'true'
-        run: ssh "$USER@$HOST" "soli-proxy restart -c '$SITES_DIR/config.toml' '$APP'"
+        run: ssh "$USER@$HOST" "soli-proxy restart -c '$PROXY_CONF' '$APP'"
 
       # De bout en bout, à travers le proxy, avec le vrai nom d'hôte — là où le
       # 421 se voit. La sonde sur le port de l'app contourne justement la partie
