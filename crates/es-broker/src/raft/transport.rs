@@ -22,6 +22,11 @@
 //! to reach; the listener checks the dialer is a configured peer. Both ids are
 //! bound into the session.
 //!
+//! The listener answers before the dialer has proved anything, so anyone who
+//! can reach the port gets one HMAC of the secret over values they know. That
+//! is harmless only for a secret nobody can guess, which is why
+//! [`SharedSecret`] refuses anything under 32 bytes.
+//!
 //! # Frames
 //!
 //! ```text
@@ -34,11 +39,41 @@
 //!
 //! `session_key` is derived from both nonces, and `seq` counts frames on the
 //! connection: a frame cannot be injected, replayed from another session, or
-//! reordered. Every message must name the authenticated dialer as its sender —
-//! a peer cannot speak for another node.
+//! reordered. Every message must name the dialer's handshake id as its sender.
+//!
+//! # What the shared secret does and does not prove
+//!
+//! There is **one** secret for the whole cluster. It keeps out everyone who
+//! does not hold it: an outsider can neither join, nor forge, alter or replay a
+//! frame. It does **not** tell members apart. The id a dialer announces is
+//! bound into the session but is not itself proved — every member can compute
+//! every other member's proofs — so a node holding the secret can dial as any
+//! member id and vote, acknowledge or lead in its name. The sender check above
+//! only stops a connection from mixing identities. Treat every holder of the
+//! secret as able to act as the whole cluster. Telling members apart needs a
+//! key per pair of members, configured per pair (deriving them from one master
+//! secret gives every holder every key); that is not implemented.
+//!
+//! The set of accepted dialer ids is fixed when the hub starts. Removing a
+//! member therefore means restarting the others without it.
 //!
 //! Without a shared secret (allowed only on a loopback bind) the same exchange
 //! runs with an empty key: no authentication, but the same framing.
+//!
+//! # Inbound limits
+//!
+//! With a secret and peers configured, a connection whose source address is
+//! not one of the peers' addresses is closed at accept, before it costs a
+//! handshake slot. Peers are given as IP addresses (`--raft-peer` takes no
+//! host names), so the list is exact; a peer behind NAT, or one that dials from
+//! a different address than the one it is listed with, is refused — the
+//! warning names the address it came from. Handshakes are capped in total and
+//! per source address and must finish within [`HANDSHAKE_TIMEOUT`]. An
+//! established connection takes no slot: there is at most one per
+//! authenticated peer id, and a newer one replaces it, so their number is
+//! bounded by the membership. Established connections have no idle timeout:
+//! a hub with no topics sends nothing, and closing its connections would only
+//! make the next frame wait for a redial.
 //!
 //! A frame for a group this node has not registered is **dropped**, not an
 //! error: during startup a peer may reach us before we have opened that topic,
@@ -46,9 +81,10 @@
 //!
 //! Records travel in cleartext. Run the raft port on a private network.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -57,12 +93,13 @@ use rand::RngCore;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::messages::{Message, NodeId};
 use super::node::Outbound;
+use super::secret::SharedSecret;
 
 const RAFT_MAGIC: [u8; 4] = *b"RAF2";
 const NONCE_LEN: usize = 32;
@@ -80,8 +117,12 @@ const PEER_QUEUE: usize = 4096;
 /// A write that does not complete in this long means the peer is not reading:
 /// drop the connection and redial instead of blocking behind it.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
-/// Concurrent inbound connections (handshaking or established).
-const MAX_INBOUND_CONNECTIONS: usize = 256;
+/// Inbound handshakes in progress at once, from all sources. Established
+/// connections are not counted: there is one per peer at most.
+const MAX_HANDSHAKES: usize = 64;
+/// Inbound handshakes in progress at once from one source address. A real
+/// peer has one dialer per hub, so one at a time plus a redial is the norm.
+const MAX_HANDSHAKES_PER_IP: usize = 4;
 /// Group name used by [`spawn_transport`], the single-group convenience path.
 pub const DEFAULT_GROUP: &str = "default";
 
@@ -90,8 +131,11 @@ pub fn group_key(topic: &str, partition: u32) -> String {
     format!("{topic}/{partition}")
 }
 /// How long a peer has to complete the handshake before we drop the socket.
-/// Bounds slowloris-style holds on the raft listener.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bounds slowloris-style holds on the raft listener; the handshake is two
+/// round trips of under a hundred bytes.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long a dial may take to connect before it is retried.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Whether this address can only be reached from the machine itself.
 ///
@@ -393,13 +437,13 @@ impl RaftHub {
         bind: SocketAddr,
         peers: BTreeMap<NodeId, SocketAddr>,
         reconnect_backoff: Duration,
-        shared_secret: Option<String>,
+        shared_secret: Option<SharedSecret>,
     ) -> Result<Arc<Self>> {
         // No-auth is allowed only where it was ever defensible: a bind the
-        // kernel will not route from off-box.
+        // kernel will not route from off-box. A secret that is present is at
+        // least `MIN_SECRET_BYTES` long: `SharedSecret` cannot hold less.
         let secret: Vec<u8> = shared_secret
-            .filter(|s| !s.is_empty())
-            .map(|s| s.into_bytes())
+            .map(|s| s.expose().to_vec())
             .unwrap_or_default();
         if secret.is_empty() && !bind_is_loopback(&bind) {
             anyhow::bail!(
@@ -414,6 +458,14 @@ impl RaftHub {
                  own vote twice and a majority of two becomes one"
             );
         }
+        // Only with a secret: without one the bind is loopback, and the
+        // filter would add nothing but a way to misconfigure `::1` against
+        // `127.0.0.1`.
+        let allowed_ips = if secret.is_empty() {
+            None
+        } else {
+            peer_source_filter(&peers)
+        };
         let auth = Arc::new(HubAuth {
             me: node_id,
             secret,
@@ -427,43 +479,8 @@ impl RaftHub {
         let peer_senders: PeerSenders = Arc::new(DashMap::new());
 
         // --- listener: accept inbound peer connections ---
-        {
-            let groups = groups.clone();
-            let cancel = cancel.clone();
-            let auth = auth.clone();
-            let slots = Arc::new(Semaphore::new(MAX_INBOUND_CONNECTIONS));
-            tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        _ = cancel.cancelled() => break,
-                        res = listener.accept() => {
-                            let (sock, peer) = match res {
-                                Ok(p) => p,
-                                Err(e) => {
-                                    tracing::warn!(error = %e, "raft accept failed");
-                                    // EMFILE and friends: don't spin.
-                                    tokio::time::sleep(Duration::from_millis(100)).await;
-                                    continue;
-                                }
-                            };
-                            let Ok(permit) = slots.clone().try_acquire_owned() else {
-                                tracing::warn!(?peer, "raft: inbound connection limit reached");
-                                continue;
-                            };
-                            let groups = groups.clone();
-                            let cancel = cancel.clone();
-                            let auth = auth.clone();
-                            tokio::spawn(async move {
-                                let _permit = permit;
-                                if let Err(e) = handle_inbound(sock, groups, cancel, auth).await {
-                                    tracing::debug!(error = %e, "raft inbound closed");
-                                }
-                            });
-                        }
-                    }
-                }
-            });
-        }
+        let inbound = Inbound::new(groups.clone(), cancel.clone(), auth.clone(), allowed_ips);
+        tokio::spawn(inbound.accept_loop(listener));
 
         // --- one dialer task per peer ---
         for (peer_id, peer_addr) in peers {
@@ -583,7 +600,7 @@ pub async fn spawn_transport(
     inbound_tx: mpsc::UnboundedSender<Message>,
     outbound_rx: mpsc::UnboundedReceiver<Outbound>,
     reconnect_backoff: Duration,
-    shared_secret: Option<String>,
+    shared_secret: Option<SharedSecret>,
 ) -> Result<Transport> {
     let hub = RaftHub::bind(node_id, bind, peers, reconnect_backoff, shared_secret).await?;
     let join = hub.register(DEFAULT_GROUP, inbound_tx, outbound_rx)?;
@@ -606,7 +623,7 @@ async fn dial_loop(
         if cancel.is_cancelled() {
             return;
         }
-        let connect = tokio::time::timeout(HANDSHAKE_TIMEOUT, TcpStream::connect(peer_addr)).await;
+        let connect = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(peer_addr)).await;
         let sock = match connect {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
@@ -668,19 +685,180 @@ async fn run_outbound(
     }
 }
 
-async fn handle_inbound(
-    mut sock: TcpStream,
+/// The source addresses inbound connections may come from: the peers' IPs.
+/// `None` means no filter — no peers, or one listed at an unspecified address,
+/// which names no source to compare against.
+fn peer_source_filter(peers: &BTreeMap<NodeId, SocketAddr>) -> Option<HashSet<IpAddr>> {
+    if peers.is_empty() || peers.values().any(|a| a.ip().is_unspecified()) {
+        return None;
+    }
+    Some(peers.values().map(|a| a.ip().to_canonical()).collect())
+}
+
+/// The listener side of a hub: who may connect, how many may be handshaking,
+/// and which connection currently speaks for each peer.
+struct Inbound {
     groups: Groups,
     cancel: CancellationToken,
     auth: Arc<HubAuth>,
-) -> std::io::Result<()> {
-    let _ = sock.set_nodelay(true);
-    let (peer_id, mut opener) = listener_handshake(&mut sock, &auth).await?;
+    /// Source addresses accepted at all; `None` accepts any.
+    allowed_ips: Option<HashSet<IpAddr>>,
+    handshakes: Arc<Semaphore>,
+    handshakes_per_ip: Mutex<HashMap<IpAddr, usize>>,
+    /// The live inbound connection of each authenticated peer: its id and the
+    /// token that closes it.
+    established: Mutex<HashMap<NodeId, (u64, CancellationToken)>>,
+    next_conn: AtomicU64,
+}
 
+/// A handshake slot, global and per source address. Released on drop, which
+/// is when the handshake ends one way or the other.
+struct HandshakeSlot {
+    inbound: Arc<Inbound>,
+    ip: IpAddr,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Drop for HandshakeSlot {
+    fn drop(&mut self) {
+        let mut per_ip = self.inbound.handshakes_per_ip.lock().unwrap();
+        if let Some(n) = per_ip.get_mut(&self.ip) {
+            *n -= 1;
+            if *n == 0 {
+                per_ip.remove(&self.ip);
+            }
+        }
+    }
+}
+
+impl Inbound {
+    fn new(
+        groups: Groups,
+        cancel: CancellationToken,
+        auth: Arc<HubAuth>,
+        allowed_ips: Option<HashSet<IpAddr>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            groups,
+            cancel,
+            auth,
+            allowed_ips,
+            handshakes: Arc::new(Semaphore::new(MAX_HANDSHAKES)),
+            handshakes_per_ip: Mutex::new(HashMap::new()),
+            established: Mutex::new(HashMap::new()),
+            next_conn: AtomicU64::new(0),
+        })
+    }
+
+    async fn accept_loop(self: Arc<Self>, listener: TcpListener) {
+        loop {
+            tokio::select! {
+                _ = self.cancel.cancelled() => break,
+                res = listener.accept() => {
+                    let (sock, from) = match res {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "raft accept failed");
+                            // EMFILE and friends: don't spin.
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            continue;
+                        }
+                    };
+                    let Some(slot) = self.admit(from.ip()) else {
+                        continue;
+                    };
+                    let me = self.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = me.serve(sock, slot).await {
+                            tracing::debug!(%from, error = %e, "raft inbound closed");
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    /// Decide at accept whether a connection from `ip` may handshake, and
+    /// take its slot if so. Dropping the socket is the refusal.
+    fn admit(self: &Arc<Self>, ip: IpAddr) -> Option<HandshakeSlot> {
+        let ip = ip.to_canonical();
+        if let Some(allowed) = &self.allowed_ips {
+            if !allowed.contains(&ip) {
+                tracing::warn!(%ip, "raft: connection from an address that is no configured peer's; closed");
+                return None;
+            }
+        }
+        let Ok(permit) = self.handshakes.clone().try_acquire_owned() else {
+            tracing::warn!(%ip, "raft: too many handshakes in progress; connection closed");
+            return None;
+        };
+        let mut per_ip = self.handshakes_per_ip.lock().unwrap();
+        let n = per_ip.entry(ip).or_insert(0);
+        if *n >= MAX_HANDSHAKES_PER_IP {
+            tracing::warn!(%ip, "raft: too many handshakes in progress from one address; connection closed");
+            return None;
+        }
+        *n += 1;
+        Some(HandshakeSlot {
+            inbound: self.clone(),
+            ip,
+            _permit: permit,
+        })
+    }
+
+    /// Make this connection the one that speaks for `peer`, closing the one
+    /// it replaces. A peer redials when its connection breaks, so the newest
+    /// is the live one; keeping the old would let a dead socket, or a holder
+    /// of the secret, pile up connections under one id.
+    fn claim(&self, peer: NodeId) -> (u64, CancellationToken) {
+        let id = self.next_conn.fetch_add(1, Ordering::Relaxed);
+        let token = self.cancel.child_token();
+        let old = self
+            .established
+            .lock()
+            .unwrap()
+            .insert(peer, (id, token.clone()));
+        if let Some((_, old)) = old {
+            tracing::debug!(
+                peer,
+                "raft: a new connection from this peer replaces the old one"
+            );
+            old.cancel();
+        }
+        (id, token)
+    }
+
+    fn release(&self, peer: NodeId, id: u64) {
+        let mut est = self.established.lock().unwrap();
+        if est.get(&peer).is_some_and(|(cur, _)| *cur == id) {
+            est.remove(&peer);
+        }
+    }
+
+    async fn serve(&self, mut sock: TcpStream, slot: HandshakeSlot) -> std::io::Result<()> {
+        let _ = sock.set_nodelay(true);
+        let (peer_id, opener) = listener_handshake(&mut sock, &self.auth).await?;
+        drop(slot);
+        let (conn, closed) = self.claim(peer_id);
+        let res = read_frames(sock, peer_id, opener, &self.groups, &closed).await;
+        self.release(peer_id, conn);
+        res
+    }
+}
+
+/// Read, verify and route frames from an authenticated peer until the
+/// connection ends or `closed` fires.
+async fn read_frames(
+    mut sock: TcpStream,
+    peer_id: NodeId,
+    mut opener: FrameOpener,
+    groups: &Groups,
+    closed: &CancellationToken,
+) -> std::io::Result<()> {
     let mut len_buf = [0u8; 4];
     loop {
         tokio::select! {
-            _ = cancel.cancelled() => return Ok(()),
+            _ = closed.cancelled() => return Ok(()),
             res = sock.read_exact(&mut len_buf) => {
                 match res {
                     Ok(_) => {}
@@ -755,14 +933,15 @@ mod tests {
         })
     }
 
+    /// A cluster secret long enough for `SharedSecret`.
+    const SECRET: &[u8] = b"0123456789abcdef0123456789abcdef";
+    const WRONG: &[u8] = b"fedcba9876543210fedcba9876543210";
+
     async fn serve_one(groups: Groups, auth: Arc<HubAuth>) -> (SocketAddr, JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let h = tokio::spawn(async move {
-            let (sock, _) = listener.accept().await.unwrap();
-            let _ = handle_inbound(sock, groups, CancellationToken::new(), auth).await;
-        });
-        (addr, h)
+        let inbound = Inbound::new(groups, CancellationToken::new(), auth, None);
+        (addr, tokio::spawn(inbound.accept_loop(listener)))
     }
 
     #[test]
@@ -786,11 +965,11 @@ mod tests {
     #[tokio::test]
     async fn rejects_peer_with_wrong_secret() {
         let (groups, mut rxs) = registry(&[DEFAULT_GROUP]);
-        let (addr, server) = serve_one(groups, auth(1, b"correct-secret", &[7])).await;
+        let (addr, server) = serve_one(groups, auth(1, SECRET, &[7])).await;
         let mut client = TcpStream::connect(addr).await.unwrap();
         // The dialer itself notices: the listener's proof does not verify
         // under the wrong secret, so nothing is ever sent.
-        let res = dialer_handshake(&mut client, 7, 1, b"wrong-secret").await;
+        let res = dialer_handshake(&mut client, 7, 1, WRONG).await;
         assert!(res.is_err(), "a wrong secret must fail the handshake");
         let (_, rx) = &mut rxs[0];
         let got = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await;
@@ -801,11 +980,9 @@ mod tests {
     #[tokio::test]
     async fn accepts_peer_with_correct_secret() {
         let (groups, mut rxs) = registry(&[DEFAULT_GROUP]);
-        let (addr, server) = serve_one(groups, auth(1, b"correct-secret", &[7])).await;
+        let (addr, server) = serve_one(groups, auth(1, SECRET, &[7])).await;
         let mut client = TcpStream::connect(addr).await.unwrap();
-        let mut sealer = dialer_handshake(&mut client, 7, 1, b"correct-secret")
-            .await
-            .unwrap();
+        let mut sealer = dialer_handshake(&mut client, 7, 1, SECRET).await.unwrap();
         client
             .write_all(&sealer.frame(DEFAULT_GROUP, &sample_msg(7)))
             .await
@@ -821,9 +998,9 @@ mod tests {
     #[tokio::test]
     async fn a_peer_cannot_speak_for_another_node() {
         let (groups, mut rxs) = registry(&[DEFAULT_GROUP]);
-        let (addr, server) = serve_one(groups, auth(1, b"s", &[7, 8])).await;
+        let (addr, server) = serve_one(groups, auth(1, SECRET, &[7, 8])).await;
         let mut client = TcpStream::connect(addr).await.unwrap();
-        let mut sealer = dialer_handshake(&mut client, 7, 1, b"s").await.unwrap();
+        let mut sealer = dialer_handshake(&mut client, 7, 1, SECRET).await.unwrap();
         // Authenticated as 7, claims to be 8.
         client
             .write_all(&sealer.frame(DEFAULT_GROUP, &sample_msg(8)))
@@ -842,12 +1019,122 @@ mod tests {
         server.abort();
     }
 
+    /// The limit of a cluster-wide secret, pinned so the docs stay honest: a
+    /// holder of the secret can authenticate as any member id it likes.
+    #[tokio::test]
+    async fn a_secret_holder_can_dial_as_any_member() {
+        let (groups, mut rxs) = registry(&[DEFAULT_GROUP]);
+        let (addr, server) = serve_one(groups, auth(1, SECRET, &[7, 8])).await;
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let mut sealer = dialer_handshake(&mut client, 8, 1, SECRET).await.unwrap();
+        client
+            .write_all(&sealer.frame(DEFAULT_GROUP, &sample_msg(8)))
+            .await
+            .unwrap();
+        let (_, rx) = &mut rxs[0];
+        let got = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.sender(), 8);
+        server.abort();
+    }
+
+    /// A second connection from the same peer replaces the first: one
+    /// established inbound connection per peer id.
+    #[tokio::test]
+    async fn a_new_connection_from_a_peer_replaces_its_old_one() {
+        let (groups, mut rxs) = registry(&[DEFAULT_GROUP]);
+        let (addr, server) = serve_one(groups, auth(1, SECRET, &[7])).await;
+        let (_, rx) = &mut rxs[0];
+        let mut first = TcpStream::connect(addr).await.unwrap();
+        let mut first_sealer = dialer_handshake(&mut first, 7, 1, SECRET).await.unwrap();
+        // Wait until the listener has taken the first connection as peer 7's.
+        first
+            .write_all(&first_sealer.frame(DEFAULT_GROUP, &sample_msg(7)))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("the first connection carries traffic");
+        let mut second = TcpStream::connect(addr).await.unwrap();
+        let mut sealer = dialer_handshake(&mut second, 7, 1, SECRET).await.unwrap();
+
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(2), first.read(&mut buf))
+            .await
+            .expect("the replaced connection must be closed")
+            .unwrap_or(0);
+        assert_eq!(n, 0, "the replaced connection reads end-of-stream");
+
+        second
+            .write_all(&sealer.frame(DEFAULT_GROUP, &sample_msg(7)))
+            .await
+            .unwrap();
+        let got = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("the replacing connection carries traffic");
+        assert!(matches!(got, Some(Message::RequestVote(_))));
+        server.abort();
+    }
+
+    #[test]
+    fn only_configured_peer_addresses_may_connect() {
+        let mut peers = BTreeMap::new();
+        peers.insert(2u32, "10.0.0.2:6000".parse().unwrap());
+        peers.insert(3u32, "10.0.0.3:6000".parse().unwrap());
+        let allowed = peer_source_filter(&peers);
+        let (groups, _rxs) = registry(&[]);
+        let inbound = Inbound::new(
+            groups,
+            CancellationToken::new(),
+            auth(1, SECRET, &[2, 3]),
+            allowed,
+        );
+        assert!(inbound.admit("203.0.113.9".parse().unwrap()).is_none());
+        assert!(inbound.admit("10.0.0.2".parse().unwrap()).is_some());
+        // A dual-stack listener sees IPv4 peers as mapped IPv6 addresses.
+        assert!(inbound.admit("::ffff:10.0.0.3".parse().unwrap()).is_some());
+
+        peers.insert(4u32, "0.0.0.0:6000".parse().unwrap());
+        assert!(
+            peer_source_filter(&peers).is_none(),
+            "an unspecified peer address names no source"
+        );
+        assert!(peer_source_filter(&BTreeMap::new()).is_none());
+    }
+
+    #[test]
+    fn handshakes_are_capped_per_source_address() {
+        let (groups, _rxs) = registry(&[]);
+        let inbound = Inbound::new(
+            groups,
+            CancellationToken::new(),
+            auth(1, SECRET, &[7]),
+            None,
+        );
+        let a: IpAddr = "10.0.0.7".parse().unwrap();
+        let mut held: Vec<_> = (0..MAX_HANDSHAKES_PER_IP)
+            .map(|_| inbound.admit(a).expect("under the cap"))
+            .collect();
+        assert!(inbound.admit(a).is_none(), "one address cannot hold more");
+        assert!(
+            inbound.admit("10.0.0.8".parse().unwrap()).is_some(),
+            "others are unaffected"
+        );
+        held.pop();
+        assert!(
+            inbound.admit(a).is_some(),
+            "a finished handshake frees its slot"
+        );
+    }
+
     #[tokio::test]
     async fn a_tampered_or_replayed_frame_closes_the_connection() {
         let (groups, mut rxs) = registry(&[DEFAULT_GROUP]);
-        let (addr, server) = serve_one(groups, auth(1, b"s", &[7])).await;
+        let (addr, server) = serve_one(groups, auth(1, SECRET, &[7])).await;
         let mut client = TcpStream::connect(addr).await.unwrap();
-        let mut sealer = dialer_handshake(&mut client, 7, 1, b"s").await.unwrap();
+        let mut sealer = dialer_handshake(&mut client, 7, 1, SECRET).await.unwrap();
         let first = sealer.frame(DEFAULT_GROUP, &sample_msg(7));
         client.write_all(&first).await.unwrap();
         // Replaying the same frame: its sequence number is already used.
@@ -869,9 +1156,9 @@ mod tests {
     #[tokio::test]
     async fn an_unconfigured_dialer_is_refused() {
         let (groups, _rxs) = registry(&[DEFAULT_GROUP]);
-        let (addr, server) = serve_one(groups, auth(1, b"s", &[7])).await;
+        let (addr, server) = serve_one(groups, auth(1, SECRET, &[7])).await;
         let mut client = TcpStream::connect(addr).await.unwrap();
-        assert!(dialer_handshake(&mut client, 9, 1, b"s").await.is_err());
+        assert!(dialer_handshake(&mut client, 9, 1, SECRET).await.is_err());
         server.abort();
     }
 

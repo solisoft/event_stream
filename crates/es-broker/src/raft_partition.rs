@@ -221,7 +221,7 @@ pub struct RaftTransportConfig {
     pub peer_addrs: BTreeMap<NodeId, SocketAddr>,
     /// Pre-shared secret peers must present in the raft handshake. `None`
     /// disables peer authentication (only allowed on a loopback bind).
-    pub shared_secret: Option<String>,
+    pub shared_secret: Option<crate::raft::SharedSecret>,
 }
 
 impl RaftPartitionConfig {
@@ -235,6 +235,13 @@ impl RaftPartitionConfig {
         }
     }
 }
+
+/// Bound on any offset a peer hands us, in a snapshot or a log entry. No real
+/// partition gets near it, so a value past it is a forged or corrupt message —
+/// and a snapshot ending at `u64::MAX` would move this replica's next offset
+/// past every record it could ever store, silently skipping all of them. The
+/// headroom also keeps `offset + 1` from overflowing anywhere downstream.
+const MAX_OFFSET: u64 = i64::MAX as u64;
 
 /// Ships partition records to a lagging follower.
 ///
@@ -280,9 +287,22 @@ impl SnapshotTransfer for PartitionTransfer {
     fn apply_chunk(&self, data: &[u8], done: bool) -> Result<()> {
         let mut c = Cur { b: data, p: 0 };
         let end = c.u64()?;
+        if end > MAX_OFFSET {
+            return Err(anyhow!(
+                "snapshot chunk declares state end {end}, past any real offset"
+            ));
+        }
         let mut recs = Vec::new();
         while c.p < data.len() {
             let offset = c.u64()?;
+            // Records at or past the end are not part of this snapshot. Ones
+            // below our position are a resent chunk: already stored, and
+            // skipped by `append_batch`.
+            if offset >= end {
+                return Err(anyhow!(
+                    "snapshot chunk carries offset {offset}, at or past its end {end}"
+                ));
+            }
             let ts = c.u64()? as i64;
             let key = c.opt_bytes()?;
             let value = c.bytes()?;
@@ -605,16 +625,30 @@ impl ApplyLoop {
                 base_offset,
                 records,
             } => {
-                let recs: Vec<AppendRecord> = records
+                // Checked: in a release build a batch running past u64::MAX
+                // wraps to low offsets, which `append_batch` takes for records
+                // it already has, and the batch is silently lost.
+                let recs = records
                     .into_iter()
                     .enumerate()
-                    .map(|(i, (ts, key, value))| AppendRecord {
-                        key,
-                        value,
-                        timestamp_ms: Some(ts),
-                        offset: Some(base_offset + i as u64),
+                    .map(|(i, (ts, key, value))| {
+                        let offset = base_offset
+                            .checked_add(i as u64)
+                            .filter(|o| *o < MAX_OFFSET)
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "raft entry {}: offsets overflow from base {base_offset}",
+                                    entry.index
+                                )
+                            })?;
+                        Ok(AppendRecord {
+                            key,
+                            value,
+                            timestamp_ms: Some(ts),
+                            offset: Some(offset),
+                        })
                     })
-                    .collect();
+                    .collect::<Result<Vec<_>>>()?;
                 (Some(proposal), recs)
             }
             Command::Legacy { key, value } => (
@@ -777,5 +811,73 @@ mod tests {
         assert_eq!(dst.end_offset(), 300);
         let (got, _, _) = dst.read_records_raw(299, 1, 1 << 20).unwrap();
         assert_eq!(got[0].value, b"record-299");
+    }
+
+    /// One record, as `read_chunk` encodes it.
+    fn chunk_record(out: &mut Vec<u8>, offset: u64) {
+        out.extend_from_slice(&offset.to_be_bytes());
+        out.extend_from_slice(&0i64.to_be_bytes());
+        out.extend_from_slice(&(-1i32).to_be_bytes());
+        out.extend_from_slice(&1u32.to_be_bytes());
+        out.push(b'v');
+    }
+
+    #[test]
+    fn a_snapshot_chunk_out_of_bounds_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let p = Partition::open(d.path().to_path_buf(), 0, 4096, 1).unwrap();
+        let rx = PartitionTransfer {
+            partition: p.clone(),
+        };
+
+        // An end of u64::MAX would push the next offset past everything.
+        let chunk = u64::MAX.to_be_bytes().to_vec();
+        assert!(rx.apply_chunk(&chunk, true).is_err());
+        assert_eq!(p.end_offset(), 0);
+
+        // A record at or past the declared end is not part of the snapshot.
+        let mut chunk = 5u64.to_be_bytes().to_vec();
+        chunk_record(&mut chunk, 2);
+        chunk_record(&mut chunk, 5);
+        assert!(rx.apply_chunk(&chunk, false).is_err());
+        assert_eq!(p.end_offset(), 0, "nothing of a refused chunk is stored");
+
+        let mut chunk = 5u64.to_be_bytes().to_vec();
+        chunk_record(&mut chunk, 2);
+        rx.apply_chunk(&chunk, true).unwrap();
+        assert_eq!(p.end_offset(), 5);
+    }
+
+    #[tokio::test]
+    async fn an_entry_whose_offsets_overflow_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let p = Partition::open(d.path().to_path_buf(), 0, 4096, 1).unwrap();
+        let apply = ApplyLoop {
+            partition: p.clone(),
+            waiters: Arc::new(Mutex::new(HashMap::new())),
+            snapshot_after_applies: 0,
+        };
+        let recs = [
+            AppendRecord::new(None, b"a".to_vec()),
+            AppendRecord::new(None, b"b".to_vec()),
+        ];
+        for base in [u64::MAX, u64::MAX - 1, MAX_OFFSET] {
+            let entry = crate::raft::messages::LogEntry {
+                term: 1,
+                index: 1,
+                payload: encode_batch(1, base, 0, &recs),
+            };
+            assert!(apply.apply(entry).await.is_err(), "base {base}");
+        }
+        assert_eq!(p.end_offset(), 0);
+    }
+
+    #[test]
+    fn append_refuses_an_offset_with_no_successor() {
+        let d = tempfile::tempdir().unwrap();
+        let p = Partition::open(d.path().to_path_buf(), 0, 4096, 1).unwrap();
+        let mut rec = AppendRecord::new(None, b"x".to_vec());
+        rec.offset = Some(u64::MAX);
+        assert!(p.append_batch(&[rec], Durability::Deferred).is_err());
     }
 }

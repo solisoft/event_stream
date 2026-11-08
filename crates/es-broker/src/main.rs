@@ -3,11 +3,13 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
-use clap::{Parser, ValueEnum};
+use clap::parser::ValueSource;
+use clap::{CommandFactory, FromArgMatches, Parser, ValueEnum};
 use tokio::signal::unix::{signal, SignalKind};
 use tracing_subscriber::EnvFilter;
 
 use es_broker::auth::AuthMode;
+use es_broker::raft::SharedSecret;
 use es_broker::{spawn, Config};
 
 #[derive(Parser, Debug)]
@@ -112,11 +114,24 @@ struct Args {
     #[arg(long)]
     cold_storage_dir: Option<PathBuf>,
 
-    /// Pre-shared secret peers must present in the Raft transport handshake.
-    /// Strongly recommended whenever Raft peers talk over an untrusted network —
-    /// without it the raft port accepts messages from any client.
-    #[arg(long, env = "ES_RAFT_SHARED_SECRET")]
-    raft_shared_secret: Option<String>,
+    /// Pre-shared secret peers must present in the Raft transport handshake,
+    /// at least 32 bytes (`openssl rand -hex 32`). Required unless --raft-bind
+    /// is loopback. Prefer the environment variable or
+    /// --raft-shared-secret-file: a value on the command line is visible to
+    /// every local account in `ps`.
+    #[arg(
+        long,
+        env = "ES_RAFT_SHARED_SECRET",
+        hide_env_values = true,
+        value_parser = secret_arg,
+        conflicts_with = "raft_shared_secret_file"
+    )]
+    raft_shared_secret: Option<SecretArg>,
+
+    /// File holding the Raft shared secret (a trailing newline is ignored).
+    /// It must be readable by its owner only (chmod 600).
+    #[arg(long, env = "ES_RAFT_SHARED_SECRET_FILE")]
+    raft_shared_secret_file: Option<PathBuf>,
 
     /// This broker's Raft node id, unique in the cluster. Setting it makes every
     /// topic on this broker a replicated one; leaving it unset runs a
@@ -134,6 +149,23 @@ struct Args {
     /// address cannot be declared.
     #[arg(long = "raft-peer", value_parser = parse_raft_peer)]
     raft_peers: Vec<(u32, SocketAddr)>,
+}
+
+/// A secret as clap received it. Kept opaque until it is checked, so neither
+/// `Args`' `Debug` nor a clap parse error can print it: clap quotes the
+/// rejected value in its errors, which is why the length check happens after
+/// parsing, in [`SharedSecret::new`], whose refusal does not repeat it.
+#[derive(Clone)]
+struct SecretArg(String);
+
+impl std::fmt::Debug for SecretArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+fn secret_arg(s: &str) -> Result<SecretArg, std::convert::Infallible> {
+    Ok(SecretArg(s.to_string()))
 }
 
 /// Parse `<node-id>=<host:port>`.
@@ -232,7 +264,10 @@ async fn main() -> Result<()> {
     // rustls needs a default crypto provider installed before use.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let args = Args::parse();
+    let matches = Args::command().get_matches();
+    let secret_on_argv =
+        matches.value_source("raft_shared_secret") == Some(ValueSource::CommandLine);
+    let args = Args::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     let mut config = Config::new(args.data_dir, args.bind, args.segment_bytes);
     config.retention_check_interval = args.retention_check_interval;
     config.compaction_check_interval = args.compaction_check_interval;
@@ -255,7 +290,18 @@ async fn main() -> Result<()> {
     config.allow_remote_unauthenticated = args.allow_remote_unauthenticated;
     config.binary_max_connections_per_ip = args.binary_max_connections_per_ip;
     config.binary_idle_timeout = args.binary_idle_timeout;
-    config.raft_shared_secret = args.raft_shared_secret;
+    if secret_on_argv {
+        tracing::warn!(
+            "the raft shared secret was given with --raft-shared-secret: every local account can \
+             read it from the process list. Use ES_RAFT_SHARED_SECRET or \
+             --raft-shared-secret-file instead."
+        );
+    }
+    config.raft_shared_secret = match (args.raft_shared_secret, args.raft_shared_secret_file) {
+        (Some(arg), _) => Some(SharedSecret::new(arg.0)?),
+        (None, Some(path)) => Some(SharedSecret::from_file(&path)?),
+        (None, None) => None,
+    };
     config.raft_node_id = args.raft_node_id;
     config.raft_bind = args.raft_bind;
     for (id, addr) in args.raft_peers {

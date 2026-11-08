@@ -214,6 +214,9 @@ impl Partition {
                     Some(o) => o,
                     None => next,
                 };
+                let after = offset
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("partition {}: offset {offset} overflows", self.id))?;
                 let need = record_disk_size(r.key.as_ref().map(|k| k.len()), r.value.len()) as u64;
                 let pending = app.size_bytes + batch.log.len() as u64;
                 if pending > 0 && pending + need > segment_bytes {
@@ -235,11 +238,11 @@ impl Partition {
                 }
                 batch.min_ts = batch.min_ts.min(ts);
                 batch.max_ts = batch.max_ts.max(ts);
-                batch.next = offset + 1;
+                batch.next = after;
                 batch.count += 1;
                 fresh += 1;
                 offsets.push(offset);
-                next = offset + 1;
+                next = after;
             }
             let wrote = fresh > 0;
             self.commit_batch(&mut app, &mut batch)?;
