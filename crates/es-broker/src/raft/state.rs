@@ -18,7 +18,7 @@ use super::membership::{decode_config_change, encode_member_change, MemberChange
 pub use super::membership::{encode_config_change, is_config_entry};
 use super::messages::{
     AppendEntries, AppendEntriesResp, InstallSnapshot, InstallSnapshotResp, LogEntry, LogIndex,
-    Message, NodeId, RequestVote, RequestVoteResp, Term,
+    Message, NodeId, RequestVote, RequestVoteResp, Term, FEATURES,
 };
 
 /// Most entries one AppendEntries carries.
@@ -132,6 +132,10 @@ pub struct RaftState {
     /// Leader-only: the highest read round each peer has acknowledged in the
     /// current term. Cleared on every change of role.
     read_acks: BTreeMap<NodeId, u64>,
+    /// The [`FEATURES`] each peer last advertised in an answer to this node
+    /// as leader. Kept across terms: what a peer's build understands does
+    /// not change with who leads.
+    peer_features: BTreeMap<NodeId, u64>,
     /// The configuration at the log's base: what the snapshot recorded, or
     /// what this node was started with.
     pub base_config: Membership,
@@ -168,6 +172,7 @@ impl RaftState {
             noop_on_elect: false,
             read_seq: 0,
             read_acks: BTreeMap::new(),
+            peer_features: BTreeMap::new(),
             base_config: config.clone(),
             committed_config: config.clone(),
             config,
@@ -232,6 +237,17 @@ impl RaftState {
             }
         }
         (config, at)
+    }
+
+    /// Whether every other voter of the latest configuration has told this
+    /// node, as leader, that it understands `feature`. A voter not heard
+    /// from since this node started counts as not understanding it.
+    pub fn peers_support(&self, feature: u64) -> bool {
+        self.peers.iter().all(|p| {
+            self.peer_features
+                .get(p)
+                .is_some_and(|f| f & feature == feature)
+        })
     }
 
     /// Bring `config` and `committed_config` up to date with the log, and
@@ -882,6 +898,7 @@ impl RaftState {
             responder_id: self.me,
             match_index,
             read_seq: ae.read_seq,
+            features: FEATURES,
         });
         let mut out = vec![Action::SendTo(ae.leader_id, resp)];
         // Any AppendEntries from the current leader proves it is alive, even
@@ -898,6 +915,7 @@ impl RaftState {
             return Vec::new();
         }
         let peer = aer.responder_id;
+        self.peer_features.insert(peer, aer.features);
         // Any answer in our term — a rejection included — shows the peer
         // still followed us when it wrote it, which is all a read round asks.
         if aer.read_seq > 0 {
@@ -1182,6 +1200,7 @@ mod tests {
             responder_id: 2,
             match_index: 1,
             read_seq: 0,
+            features: 0,
         }));
         assert_eq!(s.commit_index, 1);
     }
@@ -1242,6 +1261,7 @@ mod tests {
             responder_id: 2,
             match_index: 1,
             read_seq: 0,
+            features: 0,
         }));
         assert!(
             actions.iter().all(|a| !matches!(a, Action::SendTo(2, _))),
@@ -1305,6 +1325,7 @@ mod tests {
             done: true,
             data: Vec::new(),
             members: None,
+            extra: None,
         })
     }
 
@@ -1384,6 +1405,35 @@ mod tests {
         assert!(!s.snapshot_cursor.contains_key(&2));
     }
 
+    /// A leader writes what only newer members can apply once every voter
+    /// has said it understands it; one that answers without the field — a
+    /// 0.3.0 or 0.2 node — does not.
+    #[test]
+    fn a_feature_needs_every_voter() {
+        use crate::raft::messages::FEATURE_PRODUCER_STATE as F;
+        let mut s = leader_of_three();
+        assert!(!s.peers_support(F), "nobody has answered yet");
+        let answer = |s: &mut RaftState, peer: NodeId, features: u64| {
+            let term = s.current_term;
+            s.on_message(Message::AppendEntriesResp(AppendEntriesResp {
+                term,
+                success: true,
+                responder_id: peer,
+                match_index: 0,
+                read_seq: 0,
+                features,
+            }));
+        };
+        answer(&mut s, 2, FEATURES);
+        assert!(!s.peers_support(F), "node 3 has not answered");
+        answer(&mut s, 3, 0);
+        assert!(!s.peers_support(F), "node 3 predates it");
+        answer(&mut s, 3, FEATURES);
+        assert!(s.peers_support(F));
+        // A single-node group has no one else to ask.
+        assert!(RaftState::new(1, Vec::new()).peers_support(F));
+    }
+
     fn ack(term: Term, from: NodeId, match_index: LogIndex, read_seq: u64) -> Message {
         Message::AppendEntriesResp(AppendEntriesResp {
             term,
@@ -1391,6 +1441,7 @@ mod tests {
             responder_id: from,
             match_index,
             read_seq,
+            features: FEATURES,
         })
     }
 
@@ -1431,6 +1482,7 @@ mod tests {
             responder_id: 3,
             match_index: 0,
             read_seq: seq,
+            features: 0,
         }));
         assert_eq!(s.read_confirmed_seq(), seq);
 
@@ -1534,6 +1586,7 @@ mod tests {
             responder_id: peer,
             match_index: index,
             read_seq: 0,
+            features: 0,
         }))
     }
 
@@ -1767,6 +1820,7 @@ mod tests {
             done: true,
             data: Vec::new(),
             members: Some(members),
+            extra: None,
         }));
         assert!(f.config.contains(4));
         assert!(f.peers.contains(&4));

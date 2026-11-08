@@ -235,7 +235,8 @@ X-Es-Key: esk_AbCdEf…</pre>
   key may only claim ids under one of its ACL prefixes (<code>orders.checkout-svc-1</code> for a key granted
   <code>orders</code>); any other id gets <code>403</code>, whether or not another key holds it. A key may own 10,000 and
   ids idle for 7 days are forgotten. Accepted sequences are on disk
-  before the response is sent.
+  before the response is sent. In a Raft cluster they are replicated with the records, so a retry is recognised after
+  the partition's leader changes (see <a href="<%= docs_cluster_path() %>#idempotent-producers">Clustering</a>).
 </p>
 
 <h2>Consume</h2>

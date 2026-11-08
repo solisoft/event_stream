@@ -21,6 +21,14 @@ pub const TAG_APPEND_ENTRIES_RESP: u8 = 0x04;
 pub const TAG_INSTALL_SNAPSHOT: u8 = 0x05;
 pub const TAG_INSTALL_SNAPSHOT_RESP: u8 = 0x06;
 
+/// What this build understands beyond the 0.3.0 wire and log formats, as
+/// advertised in [`AppendEntriesResp::features`]. A leader writes something
+/// older members could not apply only once every voter has said it can.
+pub const FEATURES: u64 = FEATURE_PRODUCER_STATE;
+/// Data entries may carry an idempotent producer's id and sequences, and
+/// snapshot transfers the producers' windows (Bonfire #770).
+pub const FEATURE_PRODUCER_STATE: u64 = 1 << 0;
+
 /// Node identifier, hand-assigned via `--raft-node-id`.
 pub type NodeId = u32;
 
@@ -73,6 +81,10 @@ pub struct AppendEntriesResp {
     /// [`AppendEntries::read_seq`] of the request this answers. Optional
     /// trailing field on the wire, zero when absent.
     pub read_seq: u64,
+    /// The responder's [`FEATURES`]. Optional trailing field after
+    /// `read_seq`: zero from a node that predates it, which is what it
+    /// supports.
+    pub features: u64,
 }
 
 /// One chunk of a snapshot transfer.
@@ -96,7 +108,15 @@ pub struct InstallSnapshot {
     /// no longer in the leader's log. Trails the message on the wire, so a 0.2
     /// node ignores it and a 0.2 leader simply sends none.
     pub members: Option<Membership>,
+    /// State-machine data that is not part of the chunk stream, sent with the
+    /// last chunk (a Raft partition's producer windows). Trails `members`, as
+    /// `"XTR1" | len u32 | bytes`, and only follows one: a node that predates
+    /// it reads the membership and ignores the rest.
+    pub extra: Option<Vec<u8>>,
 }
+
+/// Marks [`InstallSnapshot::extra`] on the wire.
+const EXTRA_TAG: [u8; 4] = *b"XTR1";
 
 /// `InstallSnapshot::offset` of a probe.
 pub const PROBE_OFFSET: u64 = u64::MAX;
@@ -208,6 +228,7 @@ impl Message {
                 buf.extend_from_slice(&m.responder_id.to_be_bytes());
                 buf.extend_from_slice(&m.match_index.to_be_bytes());
                 buf.extend_from_slice(&m.read_seq.to_be_bytes());
+                buf.extend_from_slice(&m.features.to_be_bytes());
             }
             Self::InstallSnapshot(m) => {
                 buf.push(TAG_INSTALL_SNAPSHOT);
@@ -221,6 +242,11 @@ impl Message {
                 buf.extend_from_slice(&m.data);
                 if let Some(members) = &m.members {
                     members.encode(&mut buf);
+                    if let Some(extra) = &m.extra {
+                        buf.extend_from_slice(&EXTRA_TAG);
+                        buf.extend_from_slice(&(extra.len() as u32).to_be_bytes());
+                        buf.extend_from_slice(extra);
+                    }
                 }
             }
             Self::InstallSnapshotResp(m) => {
@@ -291,6 +317,7 @@ impl Message {
                 responder_id: r.u32()?,
                 match_index: r.u64()?,
                 read_seq: r.trailing_u64()?,
+                features: r.trailing_u64()?,
             })),
             TAG_INSTALL_SNAPSHOT => {
                 let term = r.u64()?;
@@ -301,13 +328,24 @@ impl Message {
                 let done = r.u8()? != 0;
                 let data_len = r.u32()? as usize;
                 let data = r.bytes(data_len)?;
-                let members = if r.remaining() > 0 {
-                    Some(Membership::decode(&r.bytes[r.pos..]).ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidData, "bad snapshot membership")
-                    })?)
-                } else {
-                    None
-                };
+                let mut members = None;
+                let mut extra = None;
+                if r.remaining() > 0 {
+                    let (m, used) =
+                        Membership::decode_prefix(&r.bytes[r.pos..]).ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidData, "bad snapshot membership")
+                        })?;
+                    members = Some(m);
+                    r.pos += used;
+                    // Anything after the membership that is not tagged as
+                    // ours is a later field: ignored, as this field is by
+                    // the nodes before it.
+                    if r.remaining() >= 4 && r.bytes[r.pos..r.pos + 4] == EXTRA_TAG {
+                        r.pos += 4;
+                        let len = r.u32()? as usize;
+                        extra = Some(r.bytes(len)?);
+                    }
+                }
                 Ok(Self::InstallSnapshot(InstallSnapshot {
                     term,
                     leader_id,
@@ -317,6 +355,7 @@ impl Message {
                     done,
                     data,
                     members,
+                    extra,
                 }))
             }
             TAG_INSTALL_SNAPSHOT_RESP => Ok(Self::InstallSnapshotResp(InstallSnapshotResp {
@@ -474,10 +513,11 @@ mod tests {
             responder_id: 2,
             match_index: 3,
             read_seq: 7,
+            features: FEATURES,
         });
-        for m in [ae, resp] {
+        for (m, trailing) in [(ae, 8), (resp, 16)] {
             let new = m.encode();
-            let old = &new[..new.len() - 8];
+            let old = &new[..new.len() - trailing];
             match Message::decode(old).unwrap() {
                 Message::AppendEntries(v) => {
                     assert_eq!((v.leader_commit, v.read_seq), (3, 0))
@@ -492,6 +532,32 @@ mod tests {
         }
     }
 
+    /// A 0.3.0 node answers with `read_seq` but no features: it supports
+    /// none of them. One that has them says so.
+    #[test]
+    fn features_trail_read_seq() {
+        let resp = AppendEntriesResp {
+            term: 2,
+            success: true,
+            responder_id: 2,
+            match_index: 3,
+            read_seq: 7,
+            features: FEATURES,
+        };
+        let new = Message::AppendEntriesResp(resp).encode();
+        match Message::decode(&new).unwrap() {
+            Message::AppendEntriesResp(v) => {
+                assert_eq!((v.read_seq, v.features), (7, FEATURES));
+                assert_ne!(v.features & FEATURE_PRODUCER_STATE, 0);
+            }
+            _ => panic!("wrong variant"),
+        }
+        match Message::decode(&new[..new.len() - 8]).unwrap() {
+            Message::AppendEntriesResp(v) => assert_eq!((v.read_seq, v.features), (7, 0)),
+            _ => panic!("wrong variant"),
+        }
+    }
+
     fn snapshot(members: Option<Membership>) -> Message {
         Message::InstallSnapshot(InstallSnapshot {
             term: 3,
@@ -502,6 +568,7 @@ mod tests {
             done: true,
             data: b"end".to_vec(),
             members,
+            extra: None,
         })
     }
 
@@ -511,7 +578,7 @@ mod tests {
         m.voters.insert(4, "10.0.0.4:6000".into());
         match Message::decode(&snapshot(Some(m.clone())).encode()).unwrap() {
             Message::InstallSnapshot(is) => {
-                assert_eq!(is.members, Some(m));
+                assert_eq!(is.members, Some(m.clone()));
                 assert_eq!(is.data, b"end");
             }
             _ => panic!("wrong variant"),
@@ -521,6 +588,24 @@ mod tests {
             Message::InstallSnapshot(is) => assert_eq!(is.members, None),
             _ => panic!("wrong variant"),
         }
+        // The state-machine extra rides after the membership; a decoder that
+        // predates it (one that stops at the membership) still reads the rest.
+        let Message::InstallSnapshot(mut is) = snapshot(Some(m.clone())) else {
+            unreachable!()
+        };
+        is.extra = Some(b"windows".to_vec());
+        let bytes = Message::InstallSnapshot(is).encode();
+        match Message::decode(&bytes).unwrap() {
+            Message::InstallSnapshot(is) => {
+                assert_eq!(is.members.as_ref(), Some(&m));
+                assert_eq!(is.extra.as_deref(), Some(&b"windows"[..]));
+            }
+            _ => panic!("wrong variant"),
+        }
+        // What a 0.3.0 node does: decode the membership from where the data
+        // ends, and look no further.
+        let data_end = 1 + 8 + 4 + 8 + 8 + 8 + 1 + 4 + b"end".len();
+        assert_eq!(Membership::decode(&bytes[data_end..]), Some(m.clone()));
         // A trailing membership that does not parse is refused, not ignored.
         let mut bad = snapshot(None).encode();
         bad.extend_from_slice(&[0, 0, 0, 9]);

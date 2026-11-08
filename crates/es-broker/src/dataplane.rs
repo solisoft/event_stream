@@ -5,7 +5,7 @@
 //! casts). Now each protocol only translates its request in and the result
 //! out.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,14 +13,20 @@ use std::time::Duration;
 use crate::auth::{AclAction, ApiKey};
 use crate::broker::Broker;
 use crate::partition::AppendRecord;
-use crate::producers::{AdmitError, DedupeOutcome};
+use crate::producers::{not_available, AdmitError, DedupeOutcome};
 use crate::raft::NodeId;
-use crate::raft_partition::{Leadership, NotLeader};
+use crate::raft_partition::{Leadership, NotLeader, ProducerRetry, ProducerView, ProducerWrite};
 use crate::storage::record::Record;
 use crate::topic::Topic;
 
 /// Most records accepted in one produce request.
 pub const MAX_RECORDS_PER_REQUEST: usize = 100_000;
+
+/// How long an idempotent produce waits for an earlier write of the same
+/// producer, still in its partition's Raft log, to commit before it can be
+/// checked. Well under the forwarding timeout, so a follower that forwarded it
+/// hears the leader's answer.
+pub const PRODUCER_SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long a linearizable read waits for its leader to confirm leadership
 /// and apply through the read index before it is refused as retryable. A
@@ -114,8 +120,9 @@ pub struct Origin<'a> {
 ///
 /// On a Raft broker, records for a partition this broker does not lead are
 /// forwarded to the leader (see [`crate::forward`]); the rest are written
-/// here. The leader checks, dedupes and charges what it is sent, so the
-/// idempotence and atomicity guarantees above hold per leader.
+/// here. The leader checks, dedupes and charges what it is sent. The
+/// sequences it accepts travel in the partition's Raft log, so a later leader
+/// dedupes against them too (see [`crate::replicated_producers`]).
 pub async fn produce(
     broker: &Arc<Broker>,
     key: &ApiKey,
@@ -307,12 +314,39 @@ fn not_leader(
 }
 
 /// A write that failed because leadership moved between the check and the
-/// proposal is as retryable as one refused up front.
+/// proposal is as retryable as one refused up front, and so is an idempotent
+/// write whose producer had another write in flight.
 fn write_error(e: anyhow::Error) -> DataError {
-    match e.downcast_ref::<NotLeader>() {
-        Some(n) => DataError::Unavailable(format!("{n}; retry")),
-        None => DataError::Internal(e),
+    if let Some(n) = e.downcast_ref::<NotLeader>() {
+        return DataError::Unavailable(format!("{n}; retry"));
     }
+    if let Some(r) = e.downcast_ref::<ProducerRetry>() {
+        return DataError::Unavailable(r.to_string());
+    }
+    DataError::Internal(e)
+}
+
+/// `producer_id`'s state on each Raft partition of `routed` that replicates
+/// it, once every write of it in that partition's log is applied.
+async fn replicated_views(
+    topic: &Topic,
+    routed: &[u32],
+    producer_id: &str,
+) -> Result<BTreeMap<u32, ProducerView>, DataError> {
+    let mut out = BTreeMap::new();
+    for p in routed.iter().copied().collect::<BTreeSet<u32>>() {
+        let Some(rp) = topic.partitions[p as usize].as_raft() else {
+            continue;
+        };
+        let view = rp
+            .producer_state(producer_id, PRODUCER_SETTLE_TIMEOUT)
+            .await
+            .map_err(write_error)?;
+        if view.replicated {
+            out.insert(p, view);
+        }
+    }
+    Ok(out)
 }
 
 /// Write `records`, already validated and routed to partitions this broker
@@ -336,15 +370,36 @@ async fn write_local(
 
     let mut results: Vec<Option<Produced>> = vec![None; records.len()];
     let mut guard = None;
+    // Raft partitions whose producer state is replicated: checked against
+    // that, and written with the producer's data in the entry.
+    let mut replicated: BTreeMap<u32, ProducerView> = BTreeMap::new();
     if let Some(pid) = producer_id {
+        let admit_error = |e| match e {
+            AdmitError::Forbidden(m) => DataError::Forbidden(m),
+            AdmitError::Invalid(m) | AdmitError::Limit(m) => DataError::BadRequest(m),
+        };
+        // An owner a partition's log recorded is a fact this broker may not
+        // have seen: the claim was made on an earlier leader.
+        let views = replicated_views(topic, &routed, pid).await?;
+        let recorded = views
+            .values()
+            .filter_map(|v| v.owner.as_deref())
+            .find(|o| *o != key.key_id)
+            .or_else(|| views.values().find_map(|v| v.owner.as_deref()));
         let g = broker
             .producers
-            .admit(pid, &key.key_id, key.may_claim(pid))
+            .admit_as(pid, &key.key_id, key.may_claim(pid), recorded)
             .await
-            .map_err(|e| match e {
-                AdmitError::Forbidden(m) => DataError::Forbidden(m),
-                AdmitError::Invalid(m) | AdmitError::Limit(m) => DataError::BadRequest(m),
-            })?;
+            .map_err(admit_error)?;
+        // Again under the producer's lock: another request of the same
+        // producer may have finished while this one waited for it.
+        replicated = replicated_views(topic, &routed, pid).await?;
+        if replicated
+            .values()
+            .any(|v| v.owner.as_deref().is_some_and(|o| o != key.key_id))
+        {
+            return Err(admit_error(not_available(pid)));
+        }
         // Decide every record before writing any of them.
         let mut tentative: BTreeMap<u32, i64> = BTreeMap::new();
         for (i, r) in records.iter().enumerate() {
@@ -359,7 +414,13 @@ async fn write_local(
                         pid, p, seq, prev
                     )))
                 }
-                None => g.check(topic_name, p, seq),
+                // A partition's replicated window; where it has none yet,
+                // whatever this broker remembers from before the partition
+                // replicated producer state.
+                None => match replicated.get(&p).and_then(|v| v.window.as_ref()) {
+                    Some(w) => w.check(seq),
+                    None => g.check(topic_name, p, seq),
+                },
             };
             match outcome {
                 DedupeOutcome::Accept => {
@@ -407,8 +468,21 @@ async fn write_local(
     // Partitions are independent: write them concurrently.
     let writes = per_partition.into_iter().map(|(p, (idxs, recs))| {
         let topic = topic.clone();
+        let producer = match (producer_id, replicated.get(&p)) {
+            (Some(pid), Some(view)) => Some(ProducerWrite {
+                producer_id: pid.to_string(),
+                owner: key.key_id.clone(),
+                first_sequence: sequences[idxs[0]].unwrap_or_default(),
+                checked_last_seen: view.window.as_ref().map(|w| w.last_seen()),
+            }),
+            _ => None,
+        };
         async move {
-            let offsets = topic.partitions[p as usize].append_batch(recs).await?;
+            let part = &topic.partitions[p as usize];
+            let offsets = match (producer, part.as_raft()) {
+                (Some(w), Some(rp)) => rp.append_batch_as(recs, w).await?,
+                _ => part.append_batch(recs).await?,
+            };
             Ok::<_, anyhow::Error>((p, idxs, offsets))
         }
     });
@@ -425,6 +499,11 @@ async fn write_local(
                 offset: off,
                 duplicate: false,
             });
+            // A replicated partition recorded them when it applied the
+            // entry, on every replica.
+            if replicated.contains_key(&p) {
+                continue;
+            }
             if let (Some(g), Some(seq)) = (guard.as_mut(), sequences[i]) {
                 g.record(topic_name, p, seq, off);
                 journal.push((topic_name.to_string(), p, seq, off));

@@ -16,6 +16,10 @@ A cluster you can operate. See the roadmap for what remains in 0.3.
 - **"Not leader" is now `503` with `Retry-After`**, instead of `400`.
 - **After a membership change, a broker's membership comes from each partition's log and
   snapshot**, not from `--raft-peer`, which only gives the starting membership.
+- **Once a partition's log carries idempotent-producer data, do not downgrade a member** to
+  0.3.0 or 0.2: it cannot apply those entries. A leader writes them only after every voter of
+  the partition has said it understands them, so a rolling upgrade is safe; until it is
+  complete, idempotent producers are deduped per leader, as before.
 
 ### Added
 
@@ -41,6 +45,12 @@ A cluster you can operate. See the roadmap for what remains in 0.3.
 
 - Deleting a topic removes it from consumer-group subscriptions and rebalances the affected
   groups.
+- **Idempotent producers stay exactly-once per partition when the leader changes.** Their
+  sequences and owner now travel in the partition's Raft log and snapshots, and every replica
+  records them, so a retry of a write an old leader committed is answered as a duplicate by
+  the new one, directly or through a follower, instead of being appended again. A retry that
+  arrives while the first copy is still uncommitted waits for it. Idle producers expire on the
+  log's timestamps, the same on every replica.
 
 ## 0.2.1 — 2026-11-08
 

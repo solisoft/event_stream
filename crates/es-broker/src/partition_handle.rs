@@ -302,6 +302,14 @@ impl PartitionHandle {
         }
     }
 
+    /// The Raft partition behind this handle, if it is one.
+    pub fn as_raft(&self) -> Option<&Arc<RaftPartition>> {
+        match self {
+            Self::Plain(_) => None,
+            Self::Raft(p) => Some(p),
+        }
+    }
+
     pub fn is_raft(&self) -> bool {
         matches!(self, Self::Raft(_))
     }
