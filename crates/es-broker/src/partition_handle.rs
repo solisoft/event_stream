@@ -182,15 +182,15 @@ impl PartitionHandle {
 
     pub async fn drop_sealed_segments(
         &self,
-        victim_bases: &[u64],
+        victims: &[Arc<Segment>],
         grace: Duration,
         cancel: &CancellationToken,
     ) -> Result<u64> {
         match self {
-            Self::Plain(p) => p.drop_sealed_segments(victim_bases, grace, cancel).await,
+            Self::Plain(p) => p.drop_sealed_segments(victims, grace, cancel).await,
             Self::Raft(p) => {
                 p.partition()
-                    .drop_sealed_segments(victim_bases, grace, cancel)
+                    .drop_sealed_segments(victims, grace, cancel)
                     .await
             }
         }
