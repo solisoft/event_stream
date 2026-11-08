@@ -220,16 +220,21 @@ jobs:
           echo "configured=true" >> "$GITHUB_OUTPUT"
           echo "Cible : $USER@$HOST:$SITES_DIR/$SITE_DIR  (domaine $DOMAIN, app proxy $APP)"
 
+      # Les secrets passent par l'environnement, jamais interpolés dans le
+      # script : leur contenu ne peut pas devenir du shell.
       - name: Préparer SSH
         if: steps.cfg.outputs.configured == 'true'
+        env:
+          SSH_DEPLOY_KEY: ${{ secrets.SSH_DEPLOY_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
         run: |
           set -euo pipefail
           install -d -m 700 ~/.ssh
-          printf '%s\n' "${{ secrets.SSH_DEPLOY_KEY }}" > ~/.ssh/id_ed25519
+          printf '%s\n' "$SSH_DEPLOY_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           # known_hosts plutôt que StrictHostKeyChecking=no : on ne désactive pas
           # la vérification d'hôte sur un canal qui porte du code de production.
-          printf '%s\n' "${{ secrets.SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
 
       # Le dossier seulement : rsync le créerait, et un site qui apparaît sur un

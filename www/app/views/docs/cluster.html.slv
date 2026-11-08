@@ -22,7 +22,7 @@
 </p>
 <figure class="code">
   <figcaption><span>node 1</span></figcaption>
-<pre><span class="c-key">export</span> ES_RAFT_SHARED_SECRET=<span class="c-str">'a long random string, the same on every node'</span>
+<pre><span class="c-key">export</span> ES_RAFT_SHARED_SECRET=<span class="c-str">'output of openssl rand -hex 32, the same on every node'</span>
 es-broker --data-dir /var/lib/es --bind 10.0.0.1:9000 --auth required \
   --raft-node-id 1 --raft-bind 10.0.0.1:6000 \
   --raft-peer 2=10.0.0.2:6000 \
@@ -100,12 +100,25 @@ es-broker --data-dir /var/lib/es --bind 10.0.0.1:9000 --auth required \
 <p>
   Brokers authenticate each other with the shared secret, without sending it: each side proves it knows the secret
   against a random challenge from the other, so a recorded handshake cannot be replayed. The dialing broker checks it
-  reached the node it meant to; the listening broker checks the dialer is a configured member.
+  reached the node it meant to; the listening broker checks the dialer is a configured member, and closes connections
+  from any address that is not a peer's before they reach the handshake.
+</p>
+<p>
+  The secret must be at least 32 bytes; the broker refuses to start with a shorter one. Generate it with
+  <code>openssl rand -hex 32</code> and pass it in <code>ES_RAFT_SHARED_SECRET</code> or in a file named by
+  <code>--raft-shared-secret-file</code>, readable by its owner only. On the command line it would be visible to every
+  local account in the process list.
 </p>
 <p>
   After the handshake every frame carries a MAC over a sequence number, so frames cannot be forged, replayed or
-  reordered, and a message must name the authenticated broker as its sender. Messages from outside the membership, or
-  with an implausibly large term, are ignored.
+  reordered by anyone without the secret. Messages from outside the membership, or with an implausibly large term, are
+  ignored.
+</p>
+<p>
+  There is one secret for the whole cluster, so it separates members from outsiders, not members from each other. The
+  id a broker announces in the handshake is not proved by anything only that broker holds: a broker with the secret
+  can connect as any member and vote, acknowledge or replicate in its name. Treat every holder of the secret as
+  trusted with the whole cluster. Per-member keys are not implemented.
 </p>
 <aside class="note warn">
   <p>Replication traffic is not encrypted</p>

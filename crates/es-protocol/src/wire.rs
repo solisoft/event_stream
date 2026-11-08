@@ -161,39 +161,57 @@ impl WireBuf {
     pub fn put_bytes(&mut self, v: &[u8]) {
         self.bytes.extend_from_slice(v);
     }
-    pub fn put_str(&mut self, s: &str) {
+    /// A `u16`-length string. Fails, rather than truncating the length,
+    /// when the string does not fit: a wrapped length would let the bytes
+    /// past it be read as the following fields.
+    pub fn put_str(&mut self, s: &str) -> io::Result<()> {
         let b = s.as_bytes();
-        self.put_u16(b.len() as u16);
+        let n = u16::try_from(b.len()).map_err(|_| too_long("string", b.len()))?;
+        self.put_u16(n);
         self.put_bytes(b);
+        Ok(())
     }
-    pub fn put_opt_bytes_i32(&mut self, v: Option<&[u8]>) {
+    pub fn put_opt_bytes_i32(&mut self, v: Option<&[u8]>) -> io::Result<()> {
         match v {
             None => self.put_i32(-1),
             Some(b) => {
-                self.put_i32(b.len() as i32);
+                let n = i32::try_from(b.len()).map_err(|_| too_long("bytes", b.len()))?;
+                self.put_i32(n);
                 self.put_bytes(b);
             }
         }
+        Ok(())
     }
-    pub fn put_value(&mut self, v: &[u8]) {
-        self.put_u32(v.len() as u32);
+    pub fn put_value(&mut self, v: &[u8]) -> io::Result<()> {
+        self.put_count(v.len())?;
         self.put_bytes(v);
+        Ok(())
     }
-    pub fn put_opt_string_i32(&mut self, v: Option<&str>) {
+    pub fn put_opt_string_i32(&mut self, v: Option<&str>) -> io::Result<()> {
+        self.put_opt_bytes_i32(v.map(str::as_bytes))
+    }
+    /// A `u32` length or element count.
+    pub fn put_count(&mut self, n: usize) -> io::Result<()> {
+        let n32 = u32::try_from(n).map_err(|_| too_long("count", n))?;
+        self.put_u32(n32);
+        Ok(())
+    }
+    /// `None` is `-1`, so a partition above `i32::MAX` would read back as
+    /// "no partition" — refused instead.
+    pub fn put_opt_u32_neg(&mut self, v: Option<u32>) -> io::Result<()> {
         match v {
             None => self.put_i32(-1),
-            Some(s) => {
-                let b = s.as_bytes();
-                self.put_i32(b.len() as i32);
-                self.put_bytes(b);
+            Some(n) => {
+                let n = i32::try_from(n).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("{} does not fit in the wire's i32", n),
+                    )
+                })?;
+                self.put_i32(n);
             }
         }
-    }
-    pub fn put_opt_u32_neg(&mut self, v: Option<u32>) {
-        match v {
-            None => self.put_i32(-1),
-            Some(n) => self.put_i32(n as i32),
-        }
+        Ok(())
     }
     pub fn put_opt_i64_min(&mut self, v: Option<i64>) {
         match v {
@@ -201,6 +219,16 @@ impl WireBuf {
             Some(n) => self.put_i64(n),
         }
     }
+}
+
+fn too_long(what: &str, len: usize) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "{} of {} bytes is too long for its wire length field",
+            what, len
+        ),
+    )
 }
 
 pub struct WireReader<'a> {
@@ -320,25 +348,35 @@ impl<'a> WireReader<'a> {
 
 // -- typed encoders/decoders --
 
-pub fn encode_produce_request(req: &WireProduceRequest) -> Vec<u8> {
+pub fn encode_produce_request(req: &WireProduceRequest) -> io::Result<Vec<u8>> {
     let mut b = WireBuf::new();
-    b.put_str(&req.topic);
-    b.put_opt_string_i32(req.producer_id.as_deref());
-    b.put_u32(req.records.len() as u32);
+    b.put_str(&req.topic)?;
+    b.put_opt_string_i32(req.producer_id.as_deref())?;
+    b.put_count(req.records.len())?;
     for r in &req.records {
-        b.put_opt_bytes_i32(r.key.as_deref());
-        b.put_value(&r.value);
-        b.put_opt_u32_neg(r.partition);
+        b.put_opt_bytes_i32(r.key.as_deref())?;
+        b.put_value(&r.value)?;
+        b.put_opt_u32_neg(r.partition)?;
         b.put_opt_i64_min(r.sequence);
     }
-    b.bytes
+    Ok(b.bytes)
 }
 
-pub fn decode_produce_request(bytes: &[u8]) -> io::Result<WireProduceRequest> {
+/// Decode a produce request, refusing one that claims more than
+/// `max_records` records before decoding any of them.
+pub fn decode_produce_request(bytes: &[u8], max_records: usize) -> io::Result<WireProduceRequest> {
     let mut r = WireReader::new(bytes);
     let topic = r.get_str()?;
     let producer_id = r.get_opt_string_i32()?;
     let n = r.get_u32()? as usize;
+    // A small frame of empty records still decodes to hundreds of thousands
+    // of allocations; the limit applies before the loop, not after it.
+    if n > max_records {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} records in one request; the limit is {}", n, max_records),
+        ));
+    }
     // Min per-record wire size: key(i32=4) + value_len(u32=4) + partition(i32=4)
     // + sequence(i64=8) = 20 bytes. Cap the pre-allocation to the frame size.
     let mut records = Vec::with_capacity(r.cap_hint(n, 20));
@@ -361,15 +399,15 @@ pub fn decode_produce_request(bytes: &[u8]) -> io::Result<WireProduceRequest> {
     })
 }
 
-pub fn encode_produce_response(results: &[WireProduceResult]) -> Vec<u8> {
+pub fn encode_produce_response(results: &[WireProduceResult]) -> io::Result<Vec<u8>> {
     let mut b = WireBuf::new();
-    b.put_u32(results.len() as u32);
+    b.put_count(results.len())?;
     for r in results {
         b.put_u32(r.partition);
         b.put_u64(r.offset);
         b.put_u8(if r.duplicate { 1 } else { 0 });
     }
-    b.bytes
+    Ok(b.bytes)
 }
 
 pub fn decode_produce_response(bytes: &[u8]) -> io::Result<Vec<WireProduceResult>> {
@@ -387,14 +425,14 @@ pub fn decode_produce_response(bytes: &[u8]) -> io::Result<Vec<WireProduceResult
     Ok(out)
 }
 
-pub fn encode_consume_request(req: &WireConsumeRequest) -> Vec<u8> {
+pub fn encode_consume_request(req: &WireConsumeRequest) -> io::Result<Vec<u8>> {
     let mut b = WireBuf::new();
-    b.put_str(&req.topic);
+    b.put_str(&req.topic)?;
     b.put_u32(req.partition);
     b.put_u64(req.offset);
     b.put_u32(req.max_records);
     b.put_u32(req.max_bytes);
-    b.bytes
+    Ok(b.bytes)
 }
 
 pub fn decode_consume_request(bytes: &[u8]) -> io::Result<WireConsumeRequest> {
@@ -408,19 +446,19 @@ pub fn decode_consume_request(bytes: &[u8]) -> io::Result<WireConsumeRequest> {
     })
 }
 
-pub fn encode_consume_response(resp: &WireConsumeResponse) -> Vec<u8> {
+pub fn encode_consume_response(resp: &WireConsumeResponse) -> io::Result<Vec<u8>> {
     let mut b = WireBuf::new();
     b.put_u64(resp.next_offset);
     b.put_u64(resp.high_watermark);
-    b.put_u32(resp.records.len() as u32);
+    b.put_count(resp.records.len())?;
     for r in &resp.records {
         b.put_u32(r.partition);
         b.put_u64(r.offset);
         b.put_i64(r.timestamp_ms);
-        b.put_opt_bytes_i32(r.key.as_deref());
-        b.put_value(&r.value);
+        b.put_opt_bytes_i32(r.key.as_deref())?;
+        b.put_value(&r.value)?;
     }
-    b.bytes
+    Ok(b.bytes)
 }
 
 pub fn decode_consume_response(bytes: &[u8]) -> io::Result<WireConsumeResponse> {
@@ -471,8 +509,8 @@ mod tests {
                 },
             ],
         };
-        let bytes = encode_produce_request(&req);
-        let back = decode_produce_request(&bytes).unwrap();
+        let bytes = encode_produce_request(&req).unwrap();
+        let back = decode_produce_request(&bytes, 100).unwrap();
         assert_eq!(back.topic, req.topic);
         assert_eq!(back.producer_id, req.producer_id);
         assert_eq!(back.records.len(), 2);
@@ -498,7 +536,7 @@ mod tests {
             next_offset: 101,
             high_watermark: 200,
         };
-        let bytes = encode_consume_response(&resp);
+        let bytes = encode_consume_response(&resp).unwrap();
         let back = decode_consume_response(&bytes).unwrap();
         assert_eq!(back.records.len(), 1);
         assert_eq!(back.records[0].key, resp.records[0].key);
@@ -514,10 +552,10 @@ mod tests {
         // records — cap_hint bounds capacity to the (near-zero) remaining bytes,
         // and the first record read fails cleanly.
         let mut b = WireBuf::new();
-        b.put_str(""); // topic
-        b.put_opt_string_i32(None); // producer_id
+        b.put_str("").unwrap(); // topic
+        b.put_opt_string_i32(None).unwrap(); // producer_id
         b.put_u32(u32::MAX); // record_count — hostile
-        let err = decode_produce_request(&b.bytes).unwrap_err();
+        let err = decode_produce_request(&b.bytes, usize::MAX).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 
@@ -528,5 +566,74 @@ mod tests {
         // A hostile count is clamped to what could actually fit.
         assert_eq!(r.cap_hint(usize::MAX, 20), 2);
         assert_eq!(r.cap_hint(1, 20), 1);
+    }
+
+    #[test]
+    fn decode_produce_request_refuses_a_count_above_the_limit_before_decoding() {
+        // 838k empty records fit in a 16 MiB frame; the count is checked
+        // first, so none of them is built.
+        let mut b = WireBuf::new();
+        b.put_str("t").unwrap();
+        b.put_opt_string_i32(None).unwrap();
+        b.put_u32(101);
+        for _ in 0..101 {
+            b.put_opt_bytes_i32(None).unwrap();
+            b.put_value(b"").unwrap();
+            b.put_opt_u32_neg(None).unwrap();
+            b.put_opt_i64_min(None);
+        }
+        let err = decode_produce_request(&b.bytes, 100).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("limit is 100"));
+        assert_eq!(
+            decode_produce_request(&b.bytes, 101).unwrap().records.len(),
+            101
+        );
+    }
+
+    #[test]
+    fn an_over_long_topic_is_refused_not_truncated() {
+        // A 65 537-byte topic used to be written with length 1, and the
+        // remaining bytes were then read as the request's other fields.
+        let mut topic = "a".repeat(u16::MAX as usize + 1);
+        topic.push('b');
+        let req = WireConsumeRequest {
+            topic: topic.clone(),
+            partition: 0,
+            offset: 0,
+            max_records: 1,
+            max_bytes: 1,
+        };
+        let err = encode_consume_request(&req).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let preq = WireProduceRequest {
+            topic,
+            producer_id: None,
+            records: Vec::new(),
+        };
+        assert!(encode_produce_request(&preq).is_err());
+
+        // The longest topic that fits still round-trips.
+        let ok = WireConsumeRequest {
+            topic: "a".repeat(u16::MAX as usize),
+            ..req
+        };
+        let back = decode_consume_request(&encode_consume_request(&ok).unwrap()).unwrap();
+        assert_eq!(back.topic.len(), u16::MAX as usize);
+    }
+
+    #[test]
+    fn a_partition_above_i32_max_is_refused_not_read_back_as_none() {
+        let req = WireProduceRequest {
+            topic: "t".into(),
+            producer_id: None,
+            records: vec![WireProduceRecord {
+                key: None,
+                value: Vec::new(),
+                partition: Some(u32::MAX),
+                sequence: None,
+            }],
+        };
+        assert!(encode_produce_request(&req).is_err());
     }
 }

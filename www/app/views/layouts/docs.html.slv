@@ -13,7 +13,8 @@
        ["clients", "Clients", docs_clients_path()],
        ["storage", "How storage works", docs_storage_path()],
        ["cluster", "Clustering with Raft", docs_cluster_path()],
-       ["tools", "Backup and restore", docs_tools_path()]
+       ["tools", "Backup and restore", docs_tools_path()],
+       ["changelog", "Changelog", docs_changelog_path()]
      ]) %>
 
   <div class="wrap docs">
@@ -33,6 +34,8 @@
           <a href="<%= docs_cluster_path() %>" <% if section == "cluster" %>aria-current="page"<% end %>>Clustering with Raft</a>
           <h2>Operations</h2>
           <a href="<%= docs_tools_path() %>" <% if section == "tools" %>aria-current="page"<% end %>>Backup and restore</a>
+          <h2>Releases</h2>
+          <a href="<%= docs_changelog_path() %>" <% if section == "changelog" %>aria-current="page"<% end %>>Changelog</a>
         </div>
       </details>
     </nav>

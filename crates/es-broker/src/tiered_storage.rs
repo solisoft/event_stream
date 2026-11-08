@@ -31,6 +31,11 @@ pub trait TieredStore: Send + Sync {
 
     /// Delete a remote segment.
     fn delete_remote(&self, topic: &str, partition_id: u32, base_offset: u64) -> Result<()>;
+
+    /// Delete everything stored for `topic`, when the topic is deleted. A
+    /// topic recreated under the same name must not inherit the old one's
+    /// cold segments.
+    fn purge_topic(&self, topic: &str) -> Result<()>;
 }
 
 /// Local-directory cold storage. Segments are copied to
@@ -101,6 +106,8 @@ impl TieredStore for LocalTieredStore {
         base_offset: u64,
         dest_dir: &Path,
     ) -> Result<()> {
+        // `topic` becomes a path component: `..` would walk out of the root.
+        crate::topic::validate_topic_name(topic)?;
         let dir = self.segment_dir(topic, partition_id);
         let src_log = dir.join(Self::log_name(base_offset));
         let src_idx = dir.join(Self::index_name(base_offset));
@@ -146,5 +153,54 @@ impl TieredStore for LocalTieredStore {
         let _ = fs::remove_file(dir.join(Self::log_name(base_offset)));
         let _ = fs::remove_file(dir.join(Self::index_name(base_offset)));
         Ok(())
+    }
+
+    fn purge_topic(&self, topic: &str) -> Result<()> {
+        // Validated like every other entry point: an unchecked `..` here
+        // would delete the whole cold root, or worse.
+        crate::topic::validate_topic_name(topic)?;
+        let dir = self.root.join(topic);
+        match fs::remove_dir_all(&dir) {
+            Ok(()) => {
+                crate::fsutil::fsync_dir(&self.root)?;
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("purge cold dir {:?}", dir)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retrieve_and_purge_refuse_names_that_leave_the_root() {
+        let root = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let s = LocalTieredStore::new(root.path().join("cold"));
+        assert!(s.retrieve("..", 0, 0, dest.path()).is_err());
+        assert!(s.retrieve("../x", 0, 0, dest.path()).is_err());
+        assert!(s.purge_topic("..").is_err());
+        assert!(root.path().exists());
+    }
+
+    #[test]
+    fn purge_removes_the_topic_and_only_it() {
+        let root = tempfile::tempdir().unwrap();
+        let s = LocalTieredStore::new(root.path().to_path_buf());
+        let src = tempfile::tempdir().unwrap();
+        let log = src.path().join("a.log");
+        let idx = src.path().join("a.index");
+        std::fs::write(&log, b"log").unwrap();
+        std::fs::write(&idx, b"idx").unwrap();
+        s.offload("gone", 0, 0, &log, &idx).unwrap();
+        s.offload("kept", 0, 0, &log, &idx).unwrap();
+        s.purge_topic("gone").unwrap();
+        assert!(s.list_remote("gone", 0).unwrap().is_empty());
+        assert_eq!(s.list_remote("kept", 0).unwrap(), vec![0]);
+        // Purging what is not there is not an error.
+        s.purge_topic("never").unwrap();
     }
 }

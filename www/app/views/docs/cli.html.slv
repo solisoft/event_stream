@@ -78,17 +78,17 @@ es consume --topic orders --partition 0 --group analytics  <span class="c-com">#
 <figure class="code">
   <figcaption><span>shell</span></figcaption>
 <pre>es produce --topic orders --partition 0 --value <span class="c-str">'…'</span> \
-  --producer-id checkout-svc-1 --sequence 42
+  --producer-id orders.checkout-svc-1 --sequence 42
 <span class="c-dim">partition=0 offset=57</span>
 <span class="c-com"># Running it again changes nothing</span>
 <span class="c-dim">partition=0 offset=57 (duplicate)</span>
 
 <span class="c-com"># From a file, sequences count up from --sequence</span>
 es produce --topic orders --partition 0 --from-file events.jsonl \
-  --producer-id checkout-svc-1 --sequence 100
+  --producer-id orders.checkout-svc-1 --sequence 100
 
 es producer list
-es producer revoke --id checkout-svc-1</pre>
+es producer revoke --id orders.checkout-svc-1</pre>
 </figure>
 
 <h2>Consumer groups</h2>
@@ -178,7 +178,8 @@ es tiered list --topic orders --partition 0     <span class="c-com"># base offse
   <div><dt><code>--raft-node-id</code></dt><dd>This broker's id in the cluster. Setting it replicates every topic.</dd></div>
   <div><dt><code>--raft-bind</code></dt><dd>Address for traffic from the other members.</dd></div>
   <div><dt><code>--raft-peer</code></dt><dd><code>&lt;id&gt;=&lt;host:port&gt;</code>, once per other member.</dd></div>
-  <div><dt><code>--raft-shared-secret</code>, <code>ES_RAFT_SHARED_SECRET</code></dt><dd>Secret the members prove to each other. Required unless the Raft address is loopback.</dd></div>
+  <div><dt><code>--raft-shared-secret</code>, <code>ES_RAFT_SHARED_SECRET</code></dt><dd>Secret the members prove to each other, at least 32 bytes (<code>openssl rand -hex 32</code>). Required unless the Raft address is loopback. Prefer the environment variable: on the command line it shows in <code>ps</code>.</dd></div>
+  <div><dt><code>--raft-shared-secret-file</code>, <code>ES_RAFT_SHARED_SECRET_FILE</code></dt><dd>Read the secret from a file instead; it must be readable by its owner only (mode 600).</dd></div>
 </dl>
 <p class="small">
   Logs go to stderr; set <code>RUST_LOG=info</code> (the default) or <code>debug</code>. The broker shuts down

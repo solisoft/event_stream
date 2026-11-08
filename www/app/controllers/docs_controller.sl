@@ -54,6 +54,13 @@ class DocsController < Controller
         render("docs/clients", { "layout": "docs" })
     end
 
+    # GET /docs/changelog
+    def changelog
+        @section = "changelog"
+        @title = "Changelog — es"
+        render("docs/changelog", { "layout": "docs" })
+    end
+
     # GET /docs/tools
     def tools
         @section = "tools"

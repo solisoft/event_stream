@@ -1,0 +1,119 @@
+<h1>Changelog</h1>
+<p class="lede">
+  What changed in each release, newest first. Binaries for every release are on
+  <a href="https://github.com/solisoft/event_stream/releases">GitHub</a>; the same notes are in
+  <code>CHANGELOG.md</code> at the root of the repository.
+</p>
+
+<h2 id="v0-2-1">0.2.1 <small>2026-11-08</small></h2>
+<p>
+  A security release: it fixes every finding of a second audit, and is the first release to ship everything merged
+  since 0.2.0.
+</p>
+
+<aside class="note">
+  <p>Upgrading: what can break</p>
+  <ul>
+    <li><strong>Group names and producer ids must sit under the key's own ACL prefixes.</strong> A key granted
+      <code>orders</code> can claim <code>orders.billing</code> but no longer <code>billing</code>. Admin keys and
+      <code>--auth disabled</code> are unrestricted, and a key keeps the names it already owns.</li>
+    <li><strong>ACL prefixes match at <code>.</code> only.</strong> A grant on <code>acme</code> no longer covers
+      <code>acme-corp</code> or <code>acme_eu</code>; grant <code>acme-</code> explicitly if that was intended.</li>
+    <li><strong>A Raft shared secret must be at least 32 bytes</strong>, or the broker refuses to start. Generate one
+      with <code>openssl rand -hex 32</code> and prefer <code>--raft-shared-secret-file</code> (mode 0600).</li>
+    <li><strong><code>es-tools restore</code> restores API keys only with <code>--with-keys</code></strong>, whatever
+      the archive's manifest says.</li>
+    <li><strong>Consume quotas are enforced strictly.</strong> A rate-limited consumer that used to overdraw now gets
+      <code>429</code> with <code>Retry-After</code>.</li>
+    <li><strong>The Docker image runs as an unprivileged user</strong> (<code>es</code>, uid 10001, home
+      <code>/var/lib/es</code>). Mount data volumes writable by that user.</li>
+    <li><strong><code>es-client</code></strong>: a request whose topic or key is too long for its length field returns
+      <code>Error::Invalid</code> (the connection stays usable) instead of being truncated.</li>
+  </ul>
+</aside>
+
+<h3>Security: high</h3>
+<ul>
+  <li>The DNS-rebinding guard accepted any <code>Host</code> starting with <code>127.</code>, so with auth disabled (the
+    default) a web page could act as admin. The host must now be a loopback address, the bind address,
+    <code>localhost</code> or an <code>--allowed-host</code>, exactly; a request with no host is refused.</li>
+  <li>Binary protocol: gzip frames could deadlock the global memory budget, and a frame's length prefix alone
+    reserved budget until its body arrived. One reservation now covers a frame and what it can inflate to, and slow
+    bodies draw on a per-source share with a minimum rate.</li>
+  <li>Binary protocol: consume responses count against the memory budget until written, so unread responses can no
+    longer exhaust memory.</li>
+  <li>Binary protocol: a per-connection table of produce topics grew without limit; it is now pruned.</li>
+</ul>
+
+<h3>Security: medium</h3>
+<ul>
+  <li><code>rustls</code> 0.23.46, <code>rustls-webpki</code> 0.103.16, <code>webpki-roots</code> 1.0.11 and
+    <code>tokio</code> 1.54.1 for seven RustSec advisories; CI now checks advisories.</li>
+  <li>Retention could delete a segment that compaction had just rebuilt, losing data. It now drops only the exact
+    segments it planned.</li>
+  <li>Consume quotas are reserved before the read instead of charged after, so concurrent reads can no longer
+    overdraw them.</li>
+  <li>Consumer group names and idempotent producer ids can no longer be squatted by another tenant, and a refusal no
+    longer reveals whether the name exists.</li>
+  <li><code>es-tools restore</code> no longer trusts the archive for its size limits (new <code>--max-bytes</code>,
+    <code>--max-entries</code>), for restoring keys, or for <code>topic.json</code> contents.</li>
+  <li>Raft: weak shared secrets are refused and the secret no longer appears in <code>--help</code> or debug output.
+    Inbound connections are accepted only from configured peers, with per-IP handshake limits and one connection
+    per peer. Leader messages and snapshot chunks are validated before they take effect.</li>
+  <li>Binary listener: the per-IP cap treats an IPv6 /64 as one source; TLS and the protocol handshake share one
+    deadline; unauthenticated connections have their own cap.</li>
+  <li>The <a href="<%= docs_cluster_path() %>">cluster docs</a> now state exactly what the Raft shared secret
+    guarantees: outsiders cannot join or forge frames, but any node holding the secret can act as any member.</li>
+</ul>
+
+<h3>Security: low</h3>
+<ul>
+  <li>Group names that differ only in case are refused.</li>
+  <li>API key changes are persisted before they take effect.</li>
+  <li>Deleting a topic purges its group offsets, producer windows and cold-tier data.</li>
+  <li>Produce requests with too many records are refused before decoding.</li>
+  <li><code>es-tools dump</code> always writes a fresh 0600 file. The restore staging directory can no longer be
+    redirected through a symlink.</li>
+  <li>Wire encoders refuse over-long fields instead of truncating them. The pipelined client no longer hangs after
+    its connection fails.</li>
+  <li>The <code>es</code> CLI warns when a token would be sent over plain <code>http://</code> or read from a file
+    other users can read.</li>
+  <li>CI workflows are read-only by default.</li>
+</ul>
+
+<h3>Also since 0.2.0</h3>
+<ul>
+  <li>Fixes from the first security and performance audit:
+    <ul>
+      <li>With auth disabled, the broker binds loopback only and checks <code>Host</code>, and sends no CORS headers
+        unless <code>--cors-origin</code> is set.</li>
+      <li>TLS covers the binary listener as well.</li>
+      <li>Tenants are isolated by ACL prefix.</li>
+      <li>Group commit gives one fsync per request.</li>
+      <li>Snapshots are streamed, and compaction is crash-safe.</li>
+    </ul>
+  </li>
+  <li>Raft clustering is configurable from the command line, and <code>GET /raft</code> reports replication
+    status.</li>
+  <li><a href="<%= docs_clients_path() %>"><code>es-client</code></a>: a blocking Rust client for the binary
+    protocol, without tokio or the broker.</li>
+  <li>Release binaries for Linux (amd64, arm64) and macOS (arm64, amd64), each with a <code>.sha256</code>, and a
+    multi-arch Docker image on GHCR.</li>
+  <li>This documentation site, redesigned.</li>
+</ul>
+
+<h2 id="v0-2-0">0.2.0 <small>2026-07-05</small></h2>
+<ul>
+  <li>Raft transport authenticated with a pre-shared secret; state machine hardened against crafted messages.</li>
+  <li><a href="<%= docs_tools_path() %>"><code>es-tools</code></a> backup and restore, with path-traversal-safe
+    extraction.</li>
+  <li>Bounded allocations on the wire and in Raft, capped gzip decompression, validated identifiers.</li>
+  <li>Authorization on schema reads, group offsets and coordinator calls.</li>
+  <li>Connection limits and timeouts on the binary listener; <code>--auth-file</code> for the CLI.</li>
+</ul>
+
+<h2 id="v0-1">0.1.x</h2>
+<p>
+  The first releases: a single-node broker with segments, retention, compaction, metrics, TLS, token auth with ACLs,
+  quotas, idempotent producers and the binary protocol.
+</p>

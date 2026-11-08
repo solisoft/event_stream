@@ -214,6 +214,9 @@ impl Partition {
                     Some(o) => o,
                     None => next,
                 };
+                let after = offset
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("partition {}: offset {offset} overflows", self.id))?;
                 let need = record_disk_size(r.key.as_ref().map(|k| k.len()), r.value.len()) as u64;
                 let pending = app.size_bytes + batch.log.len() as u64;
                 if pending > 0 && pending + need > segment_bytes {
@@ -235,11 +238,11 @@ impl Partition {
                 }
                 batch.min_ts = batch.min_ts.min(ts);
                 batch.max_ts = batch.max_ts.max(ts);
-                batch.next = offset + 1;
+                batch.next = after;
                 batch.count += 1;
                 fresh += 1;
                 offsets.push(offset);
-                next = offset + 1;
+                next = after;
             }
             let wrote = fresh > 0;
             self.commit_batch(&mut app, &mut batch)?;
@@ -464,17 +467,23 @@ impl Partition {
     /// unlinking cannot pull data out from under them; the grace period only
     /// keeps the files visible to operators for a moment.
     ///
+    /// `victims` are the segments the caller planned against, not base
+    /// offsets: compaction can swap in a merged segment under a victim's base
+    /// offset while the reaper is offloading, and matching by offset then
+    /// unlinked the freshly compacted data (Bonfire #708). A victim that is no
+    /// longer the very segment in the snapshot is left alone.
+    ///
     /// Returns bytes reclaimed.
     pub async fn drop_sealed_segments(
         self: &Arc<Self>,
-        victim_bases: &[u64],
+        victims: &[Arc<Segment>],
         grace: Duration,
         cancel: &CancellationToken,
     ) -> Result<u64> {
         // The appender lock can be held across a roll's fsync; wait for it on
         // a blocking thread, not a runtime worker.
         let me = self.clone();
-        let victims = victim_bases.to_vec();
+        let victims = victims.to_vec();
         let victim_paths = tokio::task::spawn_blocking(move || me.unlink_plan(&victims))
             .await
             .map_err(|e| anyhow!("retention task: {e}"))?;
@@ -511,10 +520,13 @@ impl Partition {
         .map_err(|e| anyhow!("retention task: {e}"))
     }
 
-    /// Take `victim_bases` out of the snapshot; return their file paths.
-    fn unlink_plan(&self, victim_bases: &[u64]) -> Vec<(PathBuf, PathBuf, u64)> {
-        use std::collections::HashSet;
-
+    /// Take `victims` out of the snapshot; return their file paths.
+    ///
+    /// Runs under the appender lock, as does compaction's swap, so the two are
+    /// atomic with respect to each other. A victim matches only by identity
+    /// (`Arc::ptr_eq`) — the same check compaction makes before its swap — and
+    /// never the active segment.
+    fn unlink_plan(&self, victims: &[Arc<Segment>]) -> Vec<(PathBuf, PathBuf, u64)> {
         let victim_paths: Vec<(PathBuf, PathBuf, u64)>;
         {
             let _guard = self.lock_appender();
@@ -522,22 +534,21 @@ impl Partition {
             if cur.len() <= 1 {
                 return Vec::new();
             }
-            let active_base = cur.last().unwrap().base_offset;
-            let victims: HashSet<u64> = victim_bases
-                .iter()
-                .copied()
-                .filter(|b| *b < active_base)
-                .collect();
-            if victims.is_empty() {
+            let active = cur.last().unwrap().clone();
+            let is_victim = |s: &Arc<Segment>| {
+                !Arc::ptr_eq(s, &active) && victims.iter().any(|v| Arc::ptr_eq(v, s))
+            };
+            if !cur.iter().any(is_victim) {
                 return Vec::new();
             }
+            let active_base = active.base_offset;
 
             let mut reclaimed = 0u64;
             let mut paths = Vec::with_capacity(victims.len());
             let new_vec: Vec<Arc<Segment>> = cur
                 .iter()
                 .filter(|s| {
-                    if victims.contains(&s.base_offset) {
+                    if is_victim(s) {
                         reclaimed += s.size_bytes.load(Ordering::Acquire);
                         paths.push((s.log_path.clone(), s.index_path.clone(), s.base_offset));
                         false

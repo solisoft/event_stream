@@ -25,7 +25,7 @@ pub struct RaftConfig {
     pub bind: Option<SocketAddr>,
     pub peer_addrs: BTreeMap<crate::raft::NodeId, SocketAddr>,
     /// Pre-shared secret peers must present in the raft handshake.
-    pub shared_secret: Option<String>,
+    pub shared_secret: Option<crate::raft::SharedSecret>,
 }
 
 impl Default for RaftConfig {
@@ -182,15 +182,15 @@ impl PartitionHandle {
 
     pub async fn drop_sealed_segments(
         &self,
-        victim_bases: &[u64],
+        victims: &[Arc<Segment>],
         grace: Duration,
         cancel: &CancellationToken,
     ) -> Result<u64> {
         match self {
-            Self::Plain(p) => p.drop_sealed_segments(victim_bases, grace, cancel).await,
+            Self::Plain(p) => p.drop_sealed_segments(victims, grace, cancel).await,
             Self::Raft(p) => {
                 p.partition()
-                    .drop_sealed_segments(victim_bases, grace, cancel)
+                    .drop_sealed_segments(victims, grace, cancel)
                     .await
             }
         }

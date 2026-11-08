@@ -11,7 +11,7 @@
 //! arrival order, and answers each with its `request_id`.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -39,6 +39,9 @@ struct Inner {
     write: Mutex<WriteHalf<Box<dyn IoStream>>>,
     pending: DashMap<u32, oneshot::Sender<FrameOutcome>>,
     next_id: AtomicU32,
+    /// Set by the reader as it exits. A request registered after that would
+    /// otherwise wait forever for a response nobody is left to deliver.
+    closed: AtomicBool,
     gzip: bool,
     cancel: CancellationToken,
     reader: Mutex<Option<JoinHandle<()>>>,
@@ -59,6 +62,7 @@ impl PipelinedClient {
             write: Mutex::new(write_half),
             pending: DashMap::new(),
             next_id: AtomicU32::new(1),
+            closed: AtomicBool::new(false),
             gzip,
             cancel: cancel.clone(),
             reader: Mutex::new(None),
@@ -75,40 +79,49 @@ impl PipelinedClient {
         self.inner.gzip
     }
 
-    fn next_id(&self) -> u32 {
-        self.inner.next_id.fetch_add(1, Ordering::Relaxed)
+    /// Register a waiter under a fresh request id. An id that wrapped around
+    /// to one still pending is skipped: replacing its sender would hand that
+    /// caller's response to this one.
+    fn register(&self) -> Result<Pending<'_>> {
+        let (tx, rx) = oneshot::channel();
+        let mut tx = Some(tx);
+        let id = loop {
+            let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
+            if let dashmap::mapref::entry::Entry::Vacant(v) = self.inner.pending.entry(id) {
+                v.insert(tx.take().expect("sender is inserted once"));
+                break id;
+            }
+        };
+        let pending = Pending {
+            inner: &self.inner,
+            id,
+            rx: Some(rx),
+        };
+        // Checked after the insert: the reader sets `closed` before failing
+        // what is pending, so either it sees this entry or we see the flag.
+        if self.inner.closed.load(Ordering::SeqCst) {
+            return Err(anyhow!("connection closed"));
+        }
+        Ok(pending)
     }
 
     async fn round_trip(&self, opcode: Opcode, payload: Vec<u8>) -> Result<(Opcode, Vec<u8>)> {
-        let id = self.next_id();
-        let (tx, rx) = oneshot::channel();
-        self.inner.pending.insert(id, tx);
+        let mut pending = self.register()?;
+        let id = pending.id;
 
         let body = if self.inner.gzip {
             codec::compress(&payload)?
         } else {
             payload
         };
-        let frame = match codec::encode_frame(id, opcode, &body) {
-            Ok(f) => f,
-            Err(e) => {
-                self.inner.pending.remove(&id);
-                return Err(e);
-            }
-        };
+        let frame = codec::encode_frame(id, opcode, &body)?;
         {
             let mut w = self.inner.write.lock().await;
-            let res = async {
-                w.write_all(&frame).await?;
-                w.flush().await
-            }
-            .await;
-            if let Err(e) = res {
-                self.inner.pending.remove(&id);
-                return Err(e.into());
-            }
+            w.write_all(&frame).await?;
+            w.flush().await?;
         }
 
+        let rx = pending.rx.as_mut().expect("receiver is taken only on drop");
         match rx.await {
             Ok(Ok(pair)) => Ok(pair),
             Ok(Err(msg)) => Err(anyhow!("server error: {}", msg)),
@@ -127,7 +140,7 @@ impl PipelinedClient {
             producer_id: producer_id.map(|s| s.to_string()),
             records,
         };
-        let payload = encode_produce_request(&req);
+        let payload = encode_produce_request(&req)?;
         let (opcode, body) = self.round_trip(Opcode::Produce, payload).await?;
         match opcode {
             Opcode::ProduceOk => Ok(decode_produce_response(&body)?),
@@ -150,7 +163,7 @@ impl PipelinedClient {
             max_records,
             max_bytes,
         };
-        let payload = encode_consume_request(&req);
+        let payload = encode_consume_request(&req)?;
         let (opcode, body) = self.round_trip(Opcode::Consume, payload).await?;
         match opcode {
             Opcode::ConsumeOk => Ok(decode_consume_response(&body)?),
@@ -173,6 +186,27 @@ impl PipelinedClient {
 impl Drop for Inner {
     fn drop(&mut self) {
         self.cancel.cancel();
+    }
+}
+
+/// A registered request. Dropping it — on any error, or when the caller's
+/// future is cancelled mid-flight — removes its `pending` entry, which used
+/// to stay behind until the connection closed.
+struct Pending<'a> {
+    inner: &'a Inner,
+    id: u32,
+    rx: Option<oneshot::Receiver<FrameOutcome>>,
+}
+
+impl Drop for Pending<'_> {
+    fn drop(&mut self) {
+        // Our receiver goes first, so our sender — if it is still there —
+        // reports closed; an entry under the same id with a live receiver
+        // belongs to someone else and is left alone.
+        drop(self.rx.take());
+        self.inner
+            .pending
+            .remove_if(&self.id, |_, tx| tx.is_closed());
     }
 }
 
@@ -222,5 +256,81 @@ async fn reader_loop(mut read: ReadHalf<Box<dyn IoStream>>, inner: Arc<Inner>) {
             }
         }
     }
+    inner.closed.store(true, Ordering::SeqCst);
     fail_all(&inner, "connection closed");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A client whose server end is the returned duplex half, already past
+    /// the handshake.
+    fn client() -> (PipelinedClient, tokio::io::DuplexStream) {
+        let (ours, theirs) = tokio::io::duplex(1 << 16);
+        let stream: Box<dyn IoStream> = Box::new(ours);
+        let (read_half, write_half) = tokio::io::split(stream);
+        let inner = Arc::new(Inner {
+            write: Mutex::new(write_half),
+            pending: DashMap::new(),
+            next_id: AtomicU32::new(1),
+            closed: AtomicBool::new(false),
+            gzip: false,
+            cancel: CancellationToken::new(),
+            reader: Mutex::new(None),
+        });
+        let for_reader = inner.clone();
+        tokio::spawn(async move { reader_loop(read_half, for_reader).await });
+        (PipelinedClient { inner }, theirs)
+    }
+
+    #[tokio::test]
+    async fn a_request_after_the_reader_exits_fails_instead_of_hanging() {
+        let (c, server) = client();
+        drop(server);
+        // Wait for the reader to notice the close.
+        for _ in 0..100 {
+            if c.inner.closed.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(c.inner.closed.load(Ordering::SeqCst));
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            c.round_trip(Opcode::Ping, Vec::new()),
+        )
+        .await
+        .expect("round_trip must not hang on a closed connection");
+        assert!(res.is_err());
+        assert!(c.inner.pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_request_leaves_no_pending_entry() {
+        let (c, _server) = client();
+        // The server never answers; the caller gives up.
+        let res = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            c.round_trip(Opcode::Ping, Vec::new()),
+        )
+        .await;
+        assert!(res.is_err());
+        assert!(c.inner.pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_wrapped_id_skips_one_still_pending() {
+        let (c, _server) = client();
+        let (live_tx, _live_rx) = oneshot::channel();
+        c.inner.pending.insert(u32::MAX, live_tx);
+        c.inner.next_id.store(u32::MAX, Ordering::Relaxed);
+        let p = c.register().unwrap();
+        assert_eq!(p.id, 0, "wrapped past the pending id");
+        // The older waiter's sender is still the one under its id.
+        assert!(!c.inner.pending.get(&u32::MAX).unwrap().is_closed());
+        drop(p);
+        assert!(c.inner.pending.get(&0).is_none());
+        assert!(c.inner.pending.get(&u32::MAX).is_some());
+    }
 }

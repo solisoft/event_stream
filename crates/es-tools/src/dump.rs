@@ -88,24 +88,90 @@ pub fn dump(
     };
 
     // The archive holds every tenant's data (and with --include-keys, key
-    // hashes): created 0600, not under the umask.
-    let out_file = {
+    // hashes). It is written to a fresh 0600 file beside `output` and renamed
+    // over it once complete: opening `output` itself kept the mode of a file
+    // already there and followed a symlink planted at that name (Bonfire
+    // #719). A rename replaces the link, never its target.
+    let (tmp_path, out_file) = create_temp_beside(Path::new(output))?;
+    let written = write_archive(out_file, &manifest, &entries, &data_dir, verify).and_then(|()| {
+        fs::rename(&tmp_path, output)
+            .with_context(|| format!("move archive into place at '{}'", output))
+    });
+    if let Err(e) = written {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+
+    let output_size = fs::metadata(output).map(|m| m.len()).unwrap_or(0);
+    eprintln!(
+        "backup created: {} ({:.1} MiB, {} segment(s) across {} topic(s))",
+        output,
+        output_size as f64 / (1024.0 * 1024.0),
+        entries.log_files.len(),
+        entries.topics.len(),
+    );
+
+    Ok(())
+}
+
+/// Create `.<name>.tmp-<random>` next to `output`: `create_new`, mode 0600, so
+/// neither an existing file nor a symlink is ever opened.
+fn create_temp_beside(output: &Path) -> Result<(PathBuf, File)> {
+    let dir = match output.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let name = output
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .ok_or_else(|| anyhow::anyhow!("output '{}' has no file name", output.display()))?;
+    let mut last_err = None;
+    for _ in 0..8 {
+        let tmp = dir.join(format!(".{}.tmp-{:016x}", name, random_u64()));
         let mut o = fs::OpenOptions::new();
-        o.write(true).create(true).truncate(true);
+        o.write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             o.mode(0o600);
         }
-        o.open(output)
-            .with_context(|| format!("create output file '{}'", output))?
-    };
+        match o.open(&tmp) {
+            Ok(f) => return Ok((tmp, f)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => last_err = Some(e),
+            Err(e) => {
+                return Err(e).with_context(|| format!("create output file '{}'", output.display()))
+            }
+        }
+    }
+    Err(anyhow::anyhow!(
+        "create output file '{}': {}",
+        output.display(),
+        last_err.map(|e| e.to_string()).unwrap_or_default()
+    ))
+}
+
+/// 64 unpredictable bits without a `rand` dependency: std seeds every
+/// `RandomState` from the OS generator.
+fn random_u64() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u32(std::process::id());
+    h.finish()
+}
+
+fn write_archive(
+    out_file: File,
+    manifest: &Manifest,
+    entries: &DiscoveredFiles,
+    data_dir: &Path,
+    verify: bool,
+) -> Result<()> {
     let encoder = GzEncoder::new(BufWriter::new(out_file), Compression::default());
     let mut tar = tar::Builder::new(encoder);
 
     // Write manifest
     {
-        let manifest_json = serde_json::to_vec_pretty(&manifest)?;
+        let manifest_json = serde_json::to_vec_pretty(manifest)?;
         let mut header = tar::Header::new_gnu();
         header.set_path("manifest.json")?;
         header.set_size(manifest_json.len() as u64);
@@ -117,7 +183,7 @@ pub fn dump(
     // Write metadata files
     for meta_path in &entries.metadata_files {
         let rel = meta_path
-            .strip_prefix(&data_dir)
+            .strip_prefix(data_dir)
             .unwrap_or(meta_path)
             .to_string_lossy()
             .replace('\\', "/");
@@ -132,13 +198,13 @@ pub fn dump(
     for log_entry in &entries.log_files {
         let rel_log = log_entry
             .path
-            .strip_prefix(&data_dir)
+            .strip_prefix(data_dir)
             .unwrap_or(&log_entry.path)
             .to_string_lossy()
             .replace('\\', "/");
         let rel_index = log_entry
             .index_path
-            .strip_prefix(&data_dir)
+            .strip_prefix(data_dir)
             .unwrap_or(&log_entry.index_path)
             .to_string_lossy()
             .replace('\\', "/");
@@ -156,17 +222,11 @@ pub fn dump(
     }
 
     let encoder = tar.into_inner()?;
-    encoder.finish()?;
-
-    let output_size = fs::metadata(output).map(|m| m.len()).unwrap_or(0);
-    eprintln!(
-        "backup created: {} ({:.1} MiB, {} segment(s) across {} topic(s))",
-        output,
-        output_size as f64 / (1024.0 * 1024.0),
-        entries.log_files.len(),
-        entries.topics.len(),
-    );
-
+    let file = encoder
+        .finish()?
+        .into_inner()
+        .map_err(|e| anyhow::anyhow!("flush archive: {}", e.error()))?;
+    file.sync_all()?;
     Ok(())
 }
 
@@ -640,5 +700,57 @@ mod tests {
             .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, vec!["a.log", "b.log"]);
+    }
+
+    /// Bonfire #719: an existing file at --output kept its looser mode, and a
+    /// symlink there was followed. Now the archive is a fresh 0600 file
+    /// renamed into place, and a link is replaced, not written through.
+    #[cfg(unix)]
+    #[test]
+    fn output_is_private_and_never_written_through_a_link() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        fs::create_dir_all(src.join("groups")).unwrap();
+        fs::write(src.join("groups/g.json"), b"{}").unwrap();
+
+        let out = dir.path().join("b.tar.gz");
+        fs::write(&out, b"old").unwrap();
+        fs::set_permissions(&out, fs::Permissions::from_mode(0o644)).unwrap();
+        dump(
+            src.to_str().unwrap(),
+            out.to_str().unwrap(),
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        let meta = fs::symlink_metadata(&out).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert_ne!(fs::read(&out).unwrap(), b"old");
+
+        let victim = dir.path().join("victim");
+        fs::write(&victim, b"precious").unwrap();
+        let link = dir.path().join("link.tar.gz");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        dump(
+            src.to_str().unwrap(),
+            link.to_str().unwrap(),
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(fs::read(&victim).unwrap(), b"precious");
+        let meta = fs::symlink_metadata(&link).unwrap();
+        assert!(meta.file_type().is_file(), "the link was replaced");
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+
+        let stray: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp-"))
+            .collect();
+        assert!(stray.is_empty(), "temp files left behind: {stray:?}");
     }
 }
