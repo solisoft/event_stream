@@ -148,7 +148,7 @@ pub async fn produce(
     if let Some(pid) = producer_id {
         let g = broker
             .producers
-            .admit(pid, &key.key_id)
+            .admit(pid, &key.key_id, key.may_claim(pid))
             .await
             .map_err(|e| match e {
                 AdmitError::Forbidden(m) => DataError::Forbidden(m),
@@ -270,7 +270,7 @@ pub struct Fetched {
 }
 
 /// Read from `topic_name`/`partition` as `key`. Limits are clamped to the
-/// broker's; the consume quota is checked before and charged after.
+/// broker's; the consume quota is reserved before the read and settled after.
 pub async fn consume(
     broker: &Arc<Broker>,
     key: &ApiKey,
@@ -293,18 +293,44 @@ pub async fn consume(
         .partitions
         .get(partition as usize)
         .ok_or_else(|| DataError::BadRequest(format!("partition {} out of range", partition)))?;
-    if let Err(retry_after) = broker.keys.check_consume(&key.key_id) {
-        return Err(DataError::RateLimited(retry_after));
-    }
     let max_records = max_records.clamp(1, broker.config.max_fetch_records);
     let max_bytes = max_bytes.clamp(1, broker.config.max_fetch_bytes);
-    let (records, next_offset, high_watermark) =
-        part.read_raw(offset, max_records, max_bytes).await?;
-    let consumed_bytes: u64 = records
-        .iter()
-        .map(|r| record_bytes(r.key.as_deref(), &r.value))
-        .sum();
-    broker.keys.charge_consume(&key.key_id, consumed_bytes);
+    // Reserve the quota before reading and read no more than was reserved;
+    // settle with the actual size after. The storage layer returns the first
+    // record whatever its size, so a consumer progresses on a budget smaller
+    // than a record — but only a read holding a full second of budget may
+    // take such a record (and the debt it leaves). Any concurrent read would
+    // otherwise hold a sliver of budget and return one whole record each.
+    let reservation = broker
+        .keys
+        .reserve_consume(&key.key_id, max_bytes as u64)
+        .map_err(DataError::RateLimited)?;
+    let read_bytes = match reservation {
+        Some(r) => max_bytes.min(usize::try_from(r.granted).unwrap_or(usize::MAX)),
+        None => max_bytes,
+    };
+    let read = part.read_raw(offset, max_records, read_bytes).await;
+    let mut consumed_bytes: u64 = match &read {
+        Ok((records, _, _)) => records
+            .iter()
+            .map(|r| record_bytes(r.key.as_deref(), &r.value))
+            .sum(),
+        Err(_) => 0,
+    };
+    let overshoot = matches!(reservation, Some(r) if !r.whole && consumed_bytes > r.granted);
+    if overshoot {
+        consumed_bytes = 0;
+    }
+    if let Some(r) = reservation {
+        broker
+            .keys
+            .settle_consume(&key.key_id, r.granted, consumed_bytes);
+    }
+    if overshoot {
+        // A bucket not in debt is full again within a second.
+        return Err(DataError::RateLimited(1.0));
+    }
+    let (records, next_offset, high_watermark) = read?;
     topic
         .records_consumed_total
         .fetch_add(records.len() as u64, Ordering::Relaxed);

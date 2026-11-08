@@ -290,7 +290,34 @@ impl Broker {
         })
         .await
         .map_err(|e| anyhow!("delete task: {e}"))?;
+        self.purge_topic_state(name).await;
         Ok(topic)
+    }
+
+    /// What outlives a topic's own directories: group offsets, producer
+    /// sequence windows and cold segments. A topic recreated under the same
+    /// name inherited all three — consumers resumed at offsets of the old
+    /// log, producers' records were dropped as "duplicates" of old offsets.
+    /// The topic is already gone when this runs, so a failure is logged
+    /// rather than reported as a failed delete.
+    async fn purge_topic_state(&self, name: &str) {
+        if let Err(e) = self.groups.purge_topic(name).await {
+            tracing::warn!(topic = name, error = %e, "failed to purge group offsets of deleted topic");
+        }
+        if let Err(e) = self.producers.purge_topic(name).await {
+            tracing::warn!(topic = name, error = %e, "failed to purge producer state of deleted topic");
+        }
+        if let Some(store) = self.tiered_store.clone() {
+            let name = name.to_string();
+            let res = tokio::task::spawn_blocking(move || store.purge_topic(&name)).await;
+            match res {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "failed to purge cold segments of deleted topic")
+                }
+                Err(e) => tracing::warn!(error = %e, "cold purge task failed"),
+            }
+        }
     }
 }
 

@@ -7,7 +7,10 @@
 //! * **Ownership.** A producer id belongs to the API key that first used it.
 //!   Another key presenting the same id is refused — otherwise a co-tenant
 //!   could advance someone else's sequence and have their next real record
-//!   acknowledged as a "duplicate" and silently dropped.
+//!   acknowledged as a "duplicate" and silently dropped. A key may only
+//!   claim an id under one of its ACL prefixes, so no tenant can squat
+//!   another's ids, and an id the caller may not use is refused in the same
+//!   words whether or not it exists.
 //! * **Atomicity.** The caller holds the producer's lock from the sequence
 //!   check through the append to recording the offset, so two concurrent
 //!   retries cannot both be accepted.
@@ -283,11 +286,13 @@ impl ProducerRegistry {
     }
 
     /// Validate `producer_id`, check it belongs to `owner` (claiming it if it
-    /// is new), and return its state locked for the caller's request.
+    /// is new or unowned and `may_claim` — see [`crate::auth::ApiKey::may_claim`]),
+    /// and return its state locked for the caller's request.
     pub async fn admit(
         &self,
         producer_id: &str,
         owner: &str,
+        may_claim: bool,
     ) -> Result<OwnedMutexGuard<ProducerState>, AdmitError> {
         if producer_id.is_empty() || producer_id.len() > 200 {
             return Err(AdmitError::Invalid(
@@ -302,9 +307,18 @@ impl ProducerRegistry {
                 "producer_id may only contain ASCII alphanumerics, '_', '-', '.'".into(),
             ));
         }
+        let unavailable = || {
+            AdmitError::Forbidden(format!(
+                "producer_id '{}' is not available to this key",
+                producer_id
+            ))
+        };
         let slot = match self.state.get(producer_id).map(|s| s.clone()) {
             Some(s) => s,
             None => {
+                if !may_claim {
+                    return Err(unavailable());
+                }
                 if self.state.len() >= MAX_PRODUCERS {
                     return Err(AdmitError::Limit(format!(
                         "producer limit reached ({})",
@@ -337,17 +351,14 @@ impl ProducerRegistry {
             }
         };
         let mut guard = slot.lock_owned().await;
-        if guard.owner.is_empty() {
+        if guard.owner.is_empty() && may_claim {
             // State persisted before ownership existed: first key to use it
             // after the upgrade claims it.
             guard.owner = owner.to_string();
             *self.per_owner.entry(owner.to_string()).or_insert(0) += 1;
         }
         if guard.owner != owner {
-            return Err(AdmitError::Forbidden(format!(
-                "producer_id '{}' belongs to another key",
-                producer_id
-            )));
+            return Err(unavailable());
         }
         guard.touch();
         Ok(guard)
@@ -429,6 +440,28 @@ impl ProducerRegistry {
         self.dirty.store(true, Ordering::Release);
         // Immediately: a revoked producer replayed from the journal on the
         // next boot would come back.
+        self.flush().await
+    }
+
+    /// Forget every producer's sequence window on a deleted topic, durably.
+    /// A topic recreated under the same name used to inherit them: the
+    /// producer's restarted sequence was refused as too low, or acknowledged
+    /// as a "duplicate" of an offset in the deleted log and dropped.
+    pub async fn purge_topic(&self, topic: &str) -> Result<()> {
+        let slots: Vec<Slot> = self.state.iter().map(|kv| kv.value().clone()).collect();
+        let mut changed = false;
+        for slot in slots {
+            let mut g = slot.lock().await;
+            let before = g.partitions.len();
+            g.partitions.retain(|(t, _), _| t != topic);
+            changed |= g.partitions.len() != before;
+        }
+        if !changed {
+            return Ok(());
+        }
+        self.dirty.store(true, Ordering::Release);
+        // Now, not at the next periodic flush: the journal replayed on the
+        // next boot would bring the windows back.
         self.flush().await
     }
 
@@ -568,11 +601,57 @@ mod tests {
     async fn another_key_cannot_use_a_producer_id() {
         let dir = tempfile::tempdir().unwrap();
         let reg = ProducerRegistry::open(dir.path().to_path_buf()).unwrap();
-        drop(reg.admit("p1", "key_a").await.unwrap());
+        drop(reg.admit("p1", "key_a", true).await.unwrap());
         assert!(matches!(
-            reg.admit("p1", "key_b").await,
+            reg.admit("p1", "key_b", true).await,
             Err(AdmitError::Forbidden(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn purging_a_topic_forgets_its_windows_across_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let reg = ProducerRegistry::open(dir.path().to_path_buf()).unwrap();
+            let mut g = reg.admit("p1", "k", true).await.unwrap();
+            g.record("gone", 0, 5, 50);
+            g.record("kept", 0, 6, 60);
+            drop(g);
+            reg.journal(
+                "p1",
+                "k",
+                &[("gone".into(), 0, 5, 50), ("kept".into(), 0, 6, 60)],
+            )
+            .unwrap();
+            reg.purge_topic("gone").await.unwrap();
+        }
+        let reg = ProducerRegistry::open(dir.path().to_path_buf()).unwrap();
+        let g = reg.admit("p1", "k", true).await.unwrap();
+        assert_eq!(g.check("gone", 0, 0), DedupeOutcome::Accept);
+        assert_eq!(
+            g.check("kept", 0, 6),
+            DedupeOutcome::Duplicate { prev_offset: 60 }
+        );
+    }
+
+    #[tokio::test]
+    async fn ids_outside_the_namespace_cannot_be_claimed_and_answer_alike() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = ProducerRegistry::open(dir.path().to_path_buf()).unwrap();
+        drop(reg.admit("taken", "key_a", true).await.unwrap());
+        let foreign = reg.admit("taken", "key_b", false).await.err().unwrap();
+        let unknown = reg.admit("free", "key_b", false).await.err().unwrap();
+        assert!(matches!(foreign, AdmitError::Forbidden(_)));
+        assert!(matches!(unknown, AdmitError::Forbidden(_)));
+        assert_eq!(
+            foreign.to_string().replace("taken", "X"),
+            unknown.to_string().replace("free", "X"),
+            "an unknown id and another key's must be indistinguishable"
+        );
+        // Refused claims create nothing.
+        assert_eq!(reg.list().await.len(), 1);
+        // The owner keeps its id even where it could no longer claim it.
+        drop(reg.admit("taken", "key_a", false).await.unwrap());
     }
 
     #[test]
@@ -595,14 +674,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let reg = ProducerRegistry::open(dir.path().to_path_buf()).unwrap();
-            let mut g = reg.admit("p1", "k").await.unwrap();
+            let mut g = reg.admit("p1", "k", true).await.unwrap();
             g.record("t", 0, 5, 42);
             drop(g);
             reg.journal("p1", "k", &[("t".into(), 0, 5, 42)]).unwrap();
             // No flush: simulates a crash before the periodic compaction.
         }
         let reg = ProducerRegistry::open(dir.path().to_path_buf()).unwrap();
-        let g = reg.admit("p1", "k").await.unwrap();
+        let g = reg.admit("p1", "k", true).await.unwrap();
         assert_eq!(
             g.check("t", 0, 5),
             DedupeOutcome::Duplicate { prev_offset: 42 }
@@ -613,7 +692,7 @@ mod tests {
     async fn flush_compacts_the_journal() {
         let dir = tempfile::tempdir().unwrap();
         let reg = ProducerRegistry::open(dir.path().to_path_buf()).unwrap();
-        let mut g = reg.admit("p1", "k").await.unwrap();
+        let mut g = reg.admit("p1", "k", true).await.unwrap();
         g.record("t", 0, 1, 7);
         drop(g);
         reg.journal("p1", "k", &[("t".into(), 0, 1, 7)]).unwrap();
@@ -621,7 +700,7 @@ mod tests {
         assert!(!dir.path().join("producers.journal").exists());
         drop(reg);
         let reg = ProducerRegistry::open(dir.path().to_path_buf()).unwrap();
-        let g = reg.admit("p1", "k").await.unwrap();
+        let g = reg.admit("p1", "k", true).await.unwrap();
         assert_eq!(
             g.check("t", 0, 1),
             DedupeOutcome::Duplicate { prev_offset: 7 }

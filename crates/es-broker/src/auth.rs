@@ -65,8 +65,11 @@ pub struct AclRule {
     pub topic_prefix: String,
 }
 
-/// Characters that separate the components of a hierarchical topic name.
-const NAME_SEPARATORS: [char; 3] = ['.', '-', '_'];
+/// The character that separates the components of a hierarchical topic
+/// name. Only `.`: `-` and `_` used to count as well, so a grant on `acme`
+/// covered `acme-corp.*` and `acme_payroll` — other tenants whose names
+/// merely begin with the same word.
+const NAME_SEPARATOR: char = '.';
 
 impl AclRule {
     fn matches(&self, action: AclAction, topic: &str) -> bool {
@@ -84,11 +87,11 @@ impl AclRule {
 /// Whether an ACL prefix covers `topic`.
 ///
 /// `*` covers everything. Otherwise the prefix covers the topic of that exact
-/// name and the topics below it — where "below" starts at a name separator
-/// (`.`, `-`, `_`). A plain `starts_with` let a grant on `orders` cover
-/// `ordersarchive` and every other tenant whose name happened to begin with
-/// the same letters. A prefix that itself ends in a separator (`orders.`)
-/// covers exactly the names that start with it.
+/// name and the topics below it — where "below" starts at a `.`. A plain
+/// `starts_with` let a grant on `orders` cover `ordersarchive` and every
+/// other tenant whose name happened to begin with the same letters. A prefix
+/// that itself ends in `.`, `-` or `_` (`orders.`, `acme-`) covers exactly the
+/// names that start with it: there the admin spelled out the boundary.
 pub fn prefix_matches(prefix: &str, topic: &str) -> bool {
     if prefix == "*" {
         return true;
@@ -96,10 +99,10 @@ pub fn prefix_matches(prefix: &str, topic: &str) -> bool {
     if prefix.is_empty() || !topic.starts_with(prefix) {
         return false;
     }
-    if topic.len() == prefix.len() || prefix.ends_with(NAME_SEPARATORS) {
+    if topic.len() == prefix.len() || prefix.ends_with([NAME_SEPARATOR, '-', '_']) {
         return true;
     }
-    topic[prefix.len()..].starts_with(NAME_SEPARATORS)
+    topic[prefix.len()..].starts_with(NAME_SEPARATOR)
 }
 
 /// Validate an ACL prefix supplied by an admin. An empty prefix used to match
@@ -164,6 +167,23 @@ impl ApiKey {
         self.acls.iter().any(|r| r.matches(action, topic))
     }
 
+    /// Whether this key may claim `name` as a consumer group or producer id:
+    /// the name must fall under one of its ACL prefixes (any action). The
+    /// group and producer-id namespaces are global and first-come, so without
+    /// this any tenant could take `billing-service` before its real owner
+    /// and lock it out. A global admin (and so everyone, with auth disabled)
+    /// may claim anything.
+    pub fn may_claim(&self, name: &str) -> bool {
+        if self.disabled {
+            return false;
+        }
+        self.is_admin()
+            || self
+                .acls
+                .iter()
+                .any(|r| prefix_matches(&r.topic_prefix, name))
+    }
+
     /// A global admin grant (`admin` on `*`): broker-wide operations.
     pub fn is_admin(&self) -> bool {
         if self.disabled {
@@ -220,11 +240,12 @@ struct PersistedKeyStore {
 
 /// A byte-rate token bucket holding at most one second of budget.
 ///
-/// Unlike `governor`'s GCRA it can go into debt: consume quotas are charged
-/// *after* the read, when the size is known, and the next read is refused
-/// until the debt is repaid. With `governor` a denied post-charge consumed
-/// nothing and the next call was not refused either, so consume quotas never
-/// limited anything.
+/// Unlike `governor`'s GCRA it can go into debt: a consume cannot know the
+/// size of what it returns before reading it (the first record is returned
+/// whatever its size, so a consumer always progresses), and the next read is
+/// refused until the debt is repaid. With `governor` a denied post-charge
+/// consumed nothing and the next call was not refused either, so consume
+/// quotas never limited anything.
 struct Bucket {
     rate: f64,
     tokens: f64,
@@ -263,21 +284,49 @@ impl Bucket {
         }
     }
 
-    /// Refuse while in debt.
-    fn check_credit(&mut self) -> Result<(), f64> {
+    /// Before a read: debit up to `want` bytes of what is available, at least
+    /// one, and return the reservation — the read is then limited to it.
+    /// Refused while in debt.
+    ///
+    /// Checking for credit and charging after the read let every concurrent
+    /// read pass the check before any of them was charged, each reading the
+    /// full fetch limit; and the debt they left was capped, so most of it was
+    /// forgiven. Debiting under the lock before the read makes concurrent
+    /// reads share the budget instead of each seeing all of it.
+    fn reserve(&mut self, want: u64) -> Result<Reservation, f64> {
         self.refill();
-        if self.tokens > 0.0 {
-            Ok(())
-        } else {
-            Err((-self.tokens + 1.0) / self.rate)
+        if self.tokens <= 0.0 {
+            return Err((-self.tokens + 1.0) / self.rate);
         }
+        let whole = self.tokens >= self.rate;
+        let granted = (want as f64).min(self.tokens.floor()).max(1.0);
+        self.tokens -= granted;
+        Ok(Reservation {
+            granted: granted as u64,
+            whole,
+        })
     }
 
-    /// Charge `n`, going into debt if need be (bounded at ten seconds' worth).
-    fn charge(&mut self, n: u64) {
+    /// After a read: settle a reservation of `reserved` bytes against the
+    /// `used` bytes actually returned. Unused budget goes back; a first
+    /// record larger than the reservation goes into debt, which is not
+    /// capped — no read starts while in debt, so it is bounded by one record.
+    fn settle(&mut self, reserved: u64, used: u64) {
         self.refill();
-        self.tokens = (self.tokens - n as f64).max(-10.0 * self.rate);
+        self.tokens = (self.tokens + reserved as f64 - used as f64).min(self.rate);
     }
+}
+
+/// Consume budget debited before a read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reservation {
+    /// Bytes debited; the read is limited to them.
+    pub granted: u64,
+    /// Taken from a full bucket. Only such a read may return a first record
+    /// larger than `granted` (and go into debt for it): otherwise every
+    /// concurrent read holding a sliver of budget could return one whole
+    /// record each, up to 8 MiB apiece, before any debt was recorded.
+    pub whole: bool,
 }
 
 struct KeyLimiters {
@@ -290,10 +339,11 @@ pub struct KeyStore {
     keys: DashMap<String, Arc<ApiKey>>,
     by_hash: DashMap<[u8; 32], String>,
     limiters: DashMap<String, KeyLimiters>,
-    /// Serializes `persist`: the snapshot is taken under it, so the last
-    /// writer always writes the newest state. Without it a create and a revoke
-    /// racing could persist in the wrong order and bring a revoked key back
-    /// after a restart.
+    /// Serializes changes and their persistence: the snapshot is taken under
+    /// it, so the last writer always writes the newest state, and a change
+    /// whose write failed is rolled back before anyone else writes it.
+    /// Without it a create and a revoke racing could persist in the wrong
+    /// order and bring a revoked key back after a restart.
     persist_lock: Mutex<()>,
     /// Bumped on every revocation, so long-lived connections can tell cheaply
     /// that they must re-check their key.
@@ -399,8 +449,10 @@ impl KeyStore {
         Ok((store, bootstrap_secret))
     }
 
-    fn persist(&self) -> Result<()> {
-        let _guard = self.persist_lock.lock().unwrap_or_else(|e| e.into_inner());
+    /// Write the store out. The caller holds `persist_lock` across its change
+    /// to memory and this write, so it can roll the change back if the write
+    /// fails before anyone else persists it.
+    fn persist_locked(&self, _guard: &std::sync::MutexGuard<'_, ()>) -> Result<()> {
         let snapshot: Vec<PersistedKey> = self
             .keys
             .iter()
@@ -475,11 +527,21 @@ impl KeyStore {
             created_at_ms: now_ms(),
             disabled: false,
         });
+        // A change is applied to memory, then written; if the write fails it
+        // is undone. Applied to memory only, a created key worked until the
+        // next restart and a revoked one came back at it — while the admin
+        // was told the operation had failed.
+        let guard = self.persist_lock.lock().unwrap_or_else(|e| e.into_inner());
         self.limiters
             .insert(key_id.clone(), make_limiters(&api_key));
         self.by_hash.insert(hash, key_id.clone());
-        self.keys.insert(key_id, api_key.clone());
-        self.persist()?;
+        self.keys.insert(key_id.clone(), api_key.clone());
+        if let Err(e) = self.persist_locked(&guard) {
+            self.keys.remove(&key_id);
+            self.by_hash.remove(&hash);
+            self.limiters.remove(&key_id);
+            return Err(e);
+        }
         Ok((api_key, secret))
     }
 
@@ -490,6 +552,7 @@ impl KeyStore {
     }
 
     pub fn revoke(&self, key_id: &str) -> Result<()> {
+        let guard = self.persist_lock.lock().unwrap_or_else(|e| e.into_inner());
         let key = match self.keys.get(key_id) {
             Some(k) => k.value().clone(),
             None => return Err(anyhow!("key '{}' not found", key_id)),
@@ -499,8 +562,13 @@ impl KeyStore {
             ..(*key).clone()
         });
         self.keys.insert(key_id.to_string(), new_key);
+        if let Err(e) = self.persist_locked(&guard) {
+            // Restored: the revocation is reported as failed, so it must not
+            // hold until a restart quietly undoes it. The admin retries.
+            self.keys.insert(key_id.to_string(), key);
+            return Err(e);
+        }
         self.revocations.fetch_add(1, Ordering::AcqRel);
-        self.persist()?;
         Ok(())
     }
 
@@ -543,22 +611,32 @@ impl KeyStore {
         }
     }
 
-    /// Before a read: refuse while the consume budget is in debt.
-    pub fn check_consume(&self, key_id: &str) -> Result<(), f64> {
+    /// Before a read: reserve up to `want` bytes of the consume budget.
+    /// `Ok(None)` means the key has no consume quota; otherwise the read must
+    /// be limited to the reservation, then settled with
+    /// [`Self::settle_consume`]. Err carries a retry hint in seconds.
+    pub fn reserve_consume(&self, key_id: &str, want: u64) -> Result<Option<Reservation>, f64> {
         match self.limiters.get(key_id) {
             Some(l) => match &l.consume {
-                Some(b) => b.lock().unwrap_or_else(|e| e.into_inner()).check_credit(),
-                None => Ok(()),
+                Some(b) => b
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .reserve(want)
+                    .map(Some),
+                None => Ok(None),
             },
-            None => Ok(()),
+            None => Ok(None),
         }
     }
 
-    /// After a read: charge what was actually returned.
-    pub fn charge_consume(&self, key_id: &str, n_bytes: u64) {
+    /// After a read: refund what a reservation did not use, or charge what
+    /// the read returned beyond it.
+    pub fn settle_consume(&self, key_id: &str, reserved: u64, used: u64) {
         if let Some(l) = self.limiters.get(key_id) {
             if let Some(b) = &l.consume {
-                b.lock().unwrap_or_else(|e| e.into_inner()).charge(n_bytes);
+                b.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .settle(reserved, used);
             }
         }
     }
@@ -637,9 +715,13 @@ mod tests {
         assert!(prefix_matches("*", "anything"));
         assert!(prefix_matches("orders", "orders"));
         assert!(prefix_matches("orders", "orders.eu"));
-        assert!(prefix_matches("orders", "orders-archive"));
         assert!(prefix_matches("orders.", "orders.eu"));
         assert!(!prefix_matches("orders", "ordersarchive"));
+        // `-` and `_` are part of a name, not boundaries.
+        assert!(!prefix_matches("orders", "orders-archive"));
+        assert!(!prefix_matches("acme", "acme-corp.billing"));
+        assert!(!prefix_matches("acme", "acme_payroll"));
+        assert!(prefix_matches("acme-", "acme-corp"));
         assert!(!prefix_matches("orders.", "orders"));
         assert!(!prefix_matches("", "orders"));
     }
@@ -655,12 +737,39 @@ mod tests {
     #[test]
     fn consume_debt_blocks_the_next_read() {
         let mut b = Bucket::new(100);
-        assert!(b.check_credit().is_ok());
-        b.charge(1000);
-        assert!(
-            b.check_credit().is_err(),
-            "a debt must refuse the next read"
-        );
+        let r = b.reserve(10).unwrap();
+        assert!(r.whole);
+        b.settle(r.granted, 1000);
+        assert!(b.reserve(1).is_err(), "a debt must refuse the next read");
+    }
+
+    #[test]
+    fn consume_reservations_share_the_budget() {
+        let mut b = Bucket::new(1000);
+        // A read asking for far more than the budget is limited to it...
+        let first = b.reserve(8 << 20).unwrap();
+        assert_eq!(first.granted, 1000);
+        assert!(first.whole);
+        // ...and a concurrent one, reserved before the first is settled, gets
+        // at most what refilled meanwhile — and may not overshoot it.
+        if let Ok(r) = b.reserve(8 << 20) {
+            assert!(r.granted <= 1 && !r.whole, "{r:?}");
+        }
+        // What the first read did not use comes back.
+        b.settle(first.granted, 400);
+        let again = b.reserve(8 << 20).unwrap();
+        assert!((590..=1000).contains(&again.granted), "{again:?}");
+        assert!(!again.whole);
+    }
+
+    #[test]
+    fn consume_debt_is_not_forgiven() {
+        let mut b = Bucket::new(10);
+        let r = b.reserve(10).unwrap();
+        // One oversized first record: 100 seconds' worth. The old cap at ten
+        // seconds forgave nine tenths of it.
+        b.settle(r.granted, 1000);
+        assert!(b.tokens < -900.0, "{}", b.tokens);
     }
 
     #[test]
@@ -686,5 +795,44 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o600);
         }
+    }
+
+    /// Make the next write of `api_keys.json` fail: a non-empty directory
+    /// cannot be renamed over (works as root too, unlike a read-only dir).
+    fn break_persistence(dir: &std::path::Path) {
+        let f = dir.join("api_keys.json");
+        let _ = std::fs::remove_file(&f);
+        std::fs::create_dir_all(f.join("blocker")).unwrap();
+    }
+
+    fn request(name: &str) -> CreateKeyRequest {
+        CreateKeyRequest {
+            name: name.into(),
+            acls: vec![AclRuleDto {
+                action: AclActionDto::Read,
+                topic_prefix: "t".into(),
+            }],
+            produce_bytes_per_sec: None,
+            consume_bytes_per_sec: None,
+        }
+    }
+
+    #[test]
+    fn a_failed_write_leaves_no_change_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let (s, _) = KeyStore::open(dir.path().to_path_buf(), false).unwrap();
+        let (kept, secret) = s.create_key(&request("kept")).unwrap();
+        break_persistence(dir.path());
+
+        assert!(s.create_key(&request("lost")).is_err());
+        assert_eq!(s.list().len(), 1, "a key that was not saved must not exist");
+
+        let epoch = s.revocation_epoch();
+        assert!(s.revoke(&kept.key_id).is_err());
+        assert!(
+            s.authenticate(&secret).is_some(),
+            "a revocation that was not saved must not hold until a restart"
+        );
+        assert_eq!(s.revocation_epoch(), epoch);
     }
 }
