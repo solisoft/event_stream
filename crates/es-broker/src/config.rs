@@ -73,6 +73,16 @@ pub struct Config {
     pub raft_bind: Option<SocketAddr>,
     pub raft_peer_addrs: BTreeMap<u32, SocketAddr>,
 
+    /// Each peer's client-facing HTTP API, as a base URL
+    /// (`http(s)://host:port`). A follower forwards a produce to the
+    /// partition's leader there, as the original caller. A peer with no entry
+    /// is never forwarded to: a produce whose leader it is fails with a
+    /// retryable "not leader" error naming it, as it did before forwarding.
+    pub raft_peer_apis: BTreeMap<u32, String>,
+    /// PEM file of the certificate authorities trusted for `https` peer APIs.
+    /// `None` trusts the public web roots.
+    pub raft_peer_api_ca: Option<PathBuf>,
+
     /// Pre-shared secret that peers must present in the Raft transport
     /// handshake. When `None`, the raft port performs no peer authentication,
     /// which the transport allows only on a loopback bind. The type refuses a
@@ -115,6 +125,12 @@ impl Config {
                  without one this broker would serve every topic from its own unreplicated copy"
             ),
             (None, None) => {
+                if !self.raft_peer_apis.is_empty() {
+                    anyhow::bail!(
+                        "--raft-peer-api was given without --raft-node-id: there is no leader to \
+                         forward to on a broker that is not a cluster member"
+                    );
+                }
                 if !self.raft_peer_addrs.is_empty() {
                     anyhow::bail!(
                         "--raft-peer was given without --raft-node-id: peers were named but this \
@@ -159,6 +175,8 @@ impl Config {
             }
         }
 
+        self.validate_peer_apis()?;
+
         let members = self.raft_peer_addrs.len() + 1;
         if members.is_multiple_of(2) {
             tracing::warn!(
@@ -166,6 +184,43 @@ impl Config {
                 "an even member count survives no more failures than {} would, and costs more",
                 members - 1
             );
+        }
+        Ok(())
+    }
+
+    /// Reject peer API addresses a follower could not, or must not, forward to.
+    fn validate_peer_apis(&self) -> anyhow::Result<()> {
+        let tls = self.tls_cert_path.is_some();
+        for (peer, url) in &self.raft_peer_apis {
+            if !self.raft_peer_addrs.contains_key(peer) {
+                anyhow::bail!(
+                    "--raft-peer-api names node {peer}, which is not a --raft-peer: only a member \
+                     can lead a partition"
+                );
+            }
+            let rest = if let Some(r) = url.strip_prefix("https://") {
+                r
+            } else if let Some(r) = url.strip_prefix("http://") {
+                // The caller's key travels with a forwarded produce. A broker
+                // that clients reach over TLS must not send it on in clear.
+                if tls {
+                    anyhow::bail!(
+                        "--raft-peer-api {peer}={url} is plain http while this broker serves TLS: \
+                         a forwarded produce carries the caller's key, so it must go over https"
+                    );
+                }
+                r
+            } else {
+                anyhow::bail!(
+                    "--raft-peer-api {peer}={url}: expected an http:// or https:// base URL"
+                );
+            };
+            if rest.is_empty() || rest.contains(['/', '?', '#', '@']) {
+                anyhow::bail!(
+                    "--raft-peer-api {peer}={url}: give only a scheme, host and port, such as \
+                     https://broker-2:9000"
+                );
+            }
         }
         Ok(())
     }
@@ -204,8 +259,69 @@ impl Config {
             raft_node_id: None,
             raft_bind: None,
             raft_peer_addrs: BTreeMap::new(),
+            raft_peer_apis: BTreeMap::new(),
+            raft_peer_api_ca: None,
             raft_shared_secret: None,
             cold_storage_dir: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn member() -> Config {
+        let mut c = Config::new(
+            PathBuf::from("."),
+            "127.0.0.1:9000".parse().unwrap(),
+            1 << 20,
+        );
+        c.raft_node_id = Some(1);
+        c.raft_bind = Some("127.0.0.1:7001".parse().unwrap());
+        c.raft_peer_addrs
+            .insert(2, "127.0.0.1:7002".parse().unwrap());
+        c
+    }
+
+    #[test]
+    fn peer_apis_are_checked_with_the_cluster() {
+        let mut c = member();
+        c.raft_peer_apis.insert(2, "http://broker-2:9000".into());
+        c.validate_raft().unwrap();
+
+        // Only a member can lead a partition.
+        let mut c = member();
+        c.raft_peer_apis.insert(3, "http://broker-3:9000".into());
+        assert!(c.validate_raft().is_err());
+
+        // A base URL, nothing more.
+        for bad in [
+            "broker-2:9000",
+            "ftp://broker-2",
+            "http://",
+            "http://broker-2:9000/api",
+            "http://user@broker-2:9000",
+        ] {
+            let mut c = member();
+            c.raft_peer_apis.insert(2, bad.into());
+            assert!(c.validate_raft().is_err(), "{bad}");
+        }
+
+        // Not a member at all.
+        let mut c = Config::new(PathBuf::from("."), "127.0.0.1:9000".parse().unwrap(), 1);
+        c.raft_peer_apis.insert(2, "http://broker-2:9000".into());
+        assert!(c.validate_raft().is_err());
+    }
+
+    #[test]
+    fn a_tls_broker_forwards_keys_over_https_only() {
+        let mut c = member();
+        c.tls_cert_path = Some(PathBuf::from("cert.pem"));
+        c.raft_peer_apis.insert(2, "http://broker-2:9000".into());
+        let e = c.validate_raft().unwrap_err().to_string();
+        assert!(e.contains("https"), "{e}");
+        c.raft_peer_apis.insert(2, "https://broker-2:9000".into());
+        c.validate_raft().unwrap();
     }
 }

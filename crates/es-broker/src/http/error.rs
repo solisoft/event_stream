@@ -68,6 +68,11 @@ impl From<DataError> for AppError {
                 retry_after: Some(s),
                 ..Self::too_many_requests(format!("rate limit exceeded; retry in {:.1}s", s))
             },
+            // Retryable: 503, with a hint to come back shortly.
+            DataError::Unavailable(m) => Self {
+                retry_after: Some(1.0),
+                ..Self::new(StatusCode::SERVICE_UNAVAILABLE, m)
+            },
             DataError::Internal(e) => Self::from(e),
         }
     }

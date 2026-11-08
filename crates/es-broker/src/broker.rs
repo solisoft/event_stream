@@ -30,6 +30,9 @@ pub struct Broker {
     pub schemas: Arc<SchemaStore>,
     pub tiered_store: Option<Arc<dyn TieredStore>>,
     pub shutdown: CancellationToken,
+    /// Sends a produce on to the partition's leader. `None` when no peer API
+    /// address is configured.
+    pub forwarder: Option<Arc<crate::forward::Forwarder>>,
     background: Mutex<Vec<JoinHandle<()>>>,
     /// The shared Raft transport, once `start_raft` has bound it. `None` on a
     /// broker that is not a cluster member.
@@ -88,6 +91,8 @@ impl Broker {
                 store
             });
 
+        let forwarder = crate::forward::Forwarder::from_config(&config)?.map(Arc::new);
+
         Ok(Arc::new(Self {
             config,
             topics,
@@ -98,6 +103,7 @@ impl Broker {
             schemas,
             tiered_store,
             shutdown: CancellationToken::new(),
+            forwarder,
             background: Mutex::new(Vec::new()),
             raft_hub: Mutex::new(None),
         }))

@@ -19,7 +19,7 @@ use es_protocol::wire::{
 use crate::auth::{AclAction, ApiKey, AuthMode, ANONYMOUS_ADMIN};
 use crate::broker::Broker;
 use crate::config::Config;
-use crate::dataplane::{self, IncomingRecord, MAX_RECORDS_PER_REQUEST};
+use crate::dataplane::{self, IncomingRecord, Origin, MAX_RECORDS_PER_REQUEST};
 
 use super::codec::{self, IoStream};
 
@@ -339,7 +339,7 @@ async fn write_handshake<S: AsyncWrite + Unpin>(
 async fn handshake(
     broker: &Broker,
     stream: &mut Box<dyn IoStream>,
-) -> Result<Option<(Arc<ApiKey>, bool)>> {
+) -> Result<Option<(Arc<ApiKey>, Option<Arc<str>>, bool)>> {
     let (magic, client_features, token_bytes, token_too_long) = read_handshake(stream).await?;
     if magic != WIRE_MAGIC {
         write_handshake(stream, HandshakeStatus::BadMagic, 0, "bad magic").await?;
@@ -357,8 +357,10 @@ async fn handshake(
     }
     let token = String::from_utf8(token_bytes).unwrap_or_default();
 
-    let key: Arc<ApiKey> = if broker.config.auth_mode != AuthMode::Required {
-        ANONYMOUS_ADMIN.clone()
+    let (key, credential): (Arc<ApiKey>, Option<Arc<str>>) = if broker.config.auth_mode
+        != AuthMode::Required
+    {
+        (ANONYMOUS_ADMIN.clone(), None)
     } else {
         if token.is_empty() {
             write_handshake(
@@ -371,7 +373,9 @@ async fn handshake(
             return Ok(None);
         }
         match broker.keys.authenticate(&token) {
-            Some(k) => k,
+            // The token is kept: a produce forwarded to a partition's leader
+            // presents it there, and the leader authenticates the caller again.
+            Some(k) => (k, Some(Arc::from(token))),
             None => {
                 write_handshake(stream, HandshakeStatus::AuthFailed, 0, "invalid token").await?;
                 return Ok(None);
@@ -383,7 +387,7 @@ async fn handshake(
     // intersection of what the client requested and what we know about.
     let negotiated = client_features & FEATURE_GZIP;
     write_handshake(stream, HandshakeStatus::Ok, negotiated, "").await?;
-    Ok(Some((key, negotiated & FEATURE_GZIP != 0)))
+    Ok(Some((key, credential, negotiated & FEATURE_GZIP != 0)))
 }
 
 /// A frame on its way to the writer, with the memory reservation it is
@@ -466,12 +470,13 @@ async fn serve(
     deadline: Instant,
     pre_auth: PreAuthSlot,
 ) -> Result<()> {
-    let (mut key, gzip) = match timeout_at(deadline, handshake(&broker, &mut stream)).await {
-        Ok(Ok(Some(v))) => v,
-        Ok(Ok(None)) => return Ok(()),
-        Ok(Err(e)) => return Err(e),
-        Err(_) => return Ok(()), // handshake timed out; drop the connection
-    };
+    let (mut key, credential, gzip) =
+        match timeout_at(deadline, handshake(&broker, &mut stream)).await {
+            Ok(Ok(Some(v))) => v,
+            Ok(Ok(None)) => return Ok(()),
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Ok(()), // handshake timed out; drop the connection
+        };
     drop(pre_auth);
     let auth_required = broker.config.auth_mode == AuthMode::Required;
     let mut epoch = broker.keys.revocation_epoch();
@@ -603,6 +608,7 @@ async fn serve(
                     };
                     let broker = broker.clone();
                     let key = key.clone();
+                    let credential = credential.clone();
                     let out_tx = out_tx.clone();
                     let global = budgets.global.clone();
                     let global_kib = budgets.global_kib;
@@ -620,6 +626,7 @@ async fn serve(
                             opcode,
                             payload,
                             inflate_cap,
+                            credential,
                         };
                         let (op, body) =
                             process(&broker, &key, req, &mut mem, (&global, global_kib), &cancel)
@@ -724,6 +731,9 @@ struct Request {
     payload: Vec<u8>,
     /// Decompression cap when the payload is gzip.
     inflate_cap: Option<usize>,
+    /// The token the connection authenticated with, for a produce forwarded
+    /// to a partition's leader.
+    credential: Option<Arc<str>>,
 }
 
 /// Run one produce or consume. Returns the response opcode and the
@@ -742,6 +752,7 @@ async fn process(
         opcode,
         payload,
         inflate_cap,
+        credential,
     } = req;
     let payload = match inflate_cap {
         // Room to inflate into was reserved with the frame.
@@ -778,8 +789,22 @@ async fn process(
                     sequence: r.sequence,
                 })
                 .collect();
-            match dataplane::produce(broker, key, &req.topic, records, req.producer_id.as_deref())
-                .await
+            // Forwarded over HTTP when the leader is another broker; the
+            // per-topic chain holds the next produce until this one is
+            // answered, so a pipelined client keeps its order through the hop.
+            let origin = Origin {
+                credential: credential.as_deref(),
+                forwarded: false,
+            };
+            match dataplane::produce(
+                broker,
+                key,
+                &req.topic,
+                records,
+                req.producer_id.as_deref(),
+                origin,
+            )
+            .await
             {
                 Ok(produced) => {
                     let results: Vec<WireProduceResult> = produced

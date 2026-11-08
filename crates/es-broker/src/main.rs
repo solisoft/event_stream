@@ -149,6 +149,19 @@ struct Args {
     /// address cannot be declared.
     #[arg(long = "raft-peer", value_parser = parse_raft_peer)]
     raft_peers: Vec<(u32, SocketAddr)>,
+
+    /// A peer's client-facing HTTP API, as `<node-id>=<http(s)://host:port>`.
+    /// Repeat once per peer. A produce sent to a follower is forwarded there
+    /// when that peer leads the partition; without it, the produce fails with
+    /// a retryable "not leader" error. Must be https when this broker serves
+    /// TLS.
+    #[arg(long = "raft-peer-api", value_parser = parse_raft_peer_api)]
+    raft_peer_apis: Vec<(u32, String)>,
+
+    /// PEM file of the certificate authorities trusted when forwarding to an
+    /// https peer API. Without it, the public web roots are trusted.
+    #[arg(long)]
+    raft_peer_api_ca: Option<PathBuf>,
 }
 
 /// A secret as clap received it. Kept opaque until it is checked, so neither
@@ -185,6 +198,19 @@ fn parse_raft_peer(s: &str) -> Result<(u32, SocketAddr), String> {
         .parse()
         .map_err(|_| format!("'{addr}' is not a host:port address"))?;
     Ok((id, addr))
+}
+
+/// Parse `<node-id>=<http(s)://host:port>`. The URL itself is checked by
+/// `Config::validate_raft`, with the rest of the cluster settings.
+fn parse_raft_peer_api(s: &str) -> Result<(u32, String), String> {
+    let (id, url) = s
+        .split_once('=')
+        .ok_or_else(|| format!("expected <node-id>=<http(s)://host:port>, got '{s}'"))?;
+    let id: u32 = id
+        .trim()
+        .parse()
+        .map_err(|_| format!("'{id}' is not a node id"))?;
+    Ok((id, url.trim().trim_end_matches('/').to_string()))
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -311,6 +337,14 @@ async fn main() -> Result<()> {
             );
         }
     }
+    for (id, url) in args.raft_peer_apis {
+        if let Some(prev) = config.raft_peer_apis.insert(id, url.clone()) {
+            anyhow::bail!(
+                "--raft-peer-api {id} was given twice ({prev} then {url}); one address per peer"
+            );
+        }
+    }
+    config.raft_peer_api_ca = args.raft_peer_api_ca;
     // Refuse here rather than at the first append: a broker that got its
     // cluster settings wrong must not reach the point of accepting writes.
     config.validate_raft()?;

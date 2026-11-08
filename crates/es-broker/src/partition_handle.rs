@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::partition::{AppendRecord, Durability, Partition};
 use crate::raft::{RaftHub, Timing};
-use crate::raft_partition::{RaftPartition, RaftPartitionConfig, RaftTransportConfig};
+use crate::raft_partition::{Leadership, RaftPartition, RaftPartitionConfig, RaftTransportConfig};
 use crate::storage::record::Record;
 use crate::storage::segment::Segment;
 use es_protocol::RecordDto;
@@ -274,6 +274,14 @@ impl PartitionHandle {
         match self {
             Self::Plain(_) => Ok(()),
             Self::Raft(p) => p.attach_to_hub(hub, group),
+        }
+    }
+
+    /// Who leads this partition. A plain partition is always written here.
+    pub async fn leadership(&self) -> Leadership {
+        match self {
+            Self::Plain(_) => Leadership::Local,
+            Self::Raft(p) => p.leadership().await,
         }
     }
 

@@ -175,6 +175,35 @@ fn decode_command(bytes: &[u8]) -> Result<Command> {
 /// cluster commits in the time one round trip takes.
 const COMMIT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// A proposal refused because this node does not lead the partition. Typed so
+/// the produce path can tell it from a failure and answer with a retryable
+/// error rather than an internal one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotLeader {
+    pub leader_hint: Option<NodeId>,
+}
+
+impl std::fmt::Display for NotLeader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "not leader (hint: {:?}); produce must be routed to the leader",
+            self.leader_hint
+        )
+    }
+}
+
+impl std::error::Error for NotLeader {}
+
+/// Who leads a partition, as this node sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Leadership {
+    /// This node: a write can be proposed here.
+    Local,
+    /// Another node, if this one knows which.
+    Remote(Option<NodeId>),
+}
+
 #[derive(Debug)]
 pub struct AppendResult {
     pub offset: u64,
@@ -454,6 +483,18 @@ impl RaftPartition {
         &self.partition
     }
 
+    /// Whether this node leads the partition, and if not, who it believes
+    /// does. Leadership can move right after this returns; a proposal made on
+    /// the strength of `Local` can still be refused with [`NotLeader`].
+    pub async fn leadership(&self) -> Leadership {
+        let state = self.raft.state.lock().await;
+        if state.role == crate::raft::state::Role::Leader {
+            Leadership::Local
+        } else {
+            Leadership::Remote(state.leader_hint.filter(|l| *l != self.raft.id && *l != 0))
+        }
+    }
+
     pub async fn append(&self, key: Option<&[u8]>, value: &[u8]) -> Result<u64> {
         let offs = self
             .append_batch(vec![AppendRecord::new(
@@ -513,10 +554,7 @@ impl RaftPartition {
             Ok(ProposeReply::Accepted { index }) => index,
             Ok(ProposeReply::NotLeader { leader_hint }) => {
                 self.waiters.lock().unwrap().remove(&proposal);
-                return Err(anyhow!(
-                    "not leader (hint: {:?}); produce must be routed to the leader",
-                    leader_hint
-                ));
+                return Err(NotLeader { leader_hint }.into());
             }
             Err(e) => {
                 self.waiters.lock().unwrap().remove(&proposal);
