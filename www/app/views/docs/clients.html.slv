@@ -28,13 +28,13 @@ ES_AUTH=esk_mR3jH8cN...              # with --auth required</pre>
 ES.emit("orders", order.user_id.to_s, {"event": "order.created", "order_id": order.id})
 
 # Read from the group's committed offset, handle, then commit.
-page = ES.group_consume("billing", "orders", 0, {"max_records": 500})
+page = ES.group_consume("orders.billing", "orders", 0, {"max_records": 500})
 page["records"].each { |record| handle(JSON.parse(record["value"])) }
-ES.commit("billing", "orders", 0, page["next_offset"])</pre>
+ES.commit("orders.billing", "orders", 0, page["next_offset"])</pre>
 </figure>
 <p>
   A <code>producer_id</code> with a <code>sequence</code> makes retries safe
-  (<code>ES.emit(topic, key, value, {"producer_id": "web-1", "sequence": n})</code>); consumer groups are
+  (<code>ES.emit(topic, key, value, {"producer_id": "orders.web-1", "sequence": n})</code>); consumer groups are
   <code>ES.join</code>, <code>ES.heartbeat</code> and <code>ES.leave</code>. A produce whose connection breaks is
   not retried by the driver, since the broker may already have appended it.
 </p>

@@ -78,17 +78,17 @@ es consume --topic orders --partition 0 --group analytics  <span class="c-com">#
 <figure class="code">
   <figcaption><span>shell</span></figcaption>
 <pre>es produce --topic orders --partition 0 --value <span class="c-str">'…'</span> \
-  --producer-id checkout-svc-1 --sequence 42
+  --producer-id orders.checkout-svc-1 --sequence 42
 <span class="c-dim">partition=0 offset=57</span>
 <span class="c-com"># Running it again changes nothing</span>
 <span class="c-dim">partition=0 offset=57 (duplicate)</span>
 
 <span class="c-com"># From a file, sequences count up from --sequence</span>
 es produce --topic orders --partition 0 --from-file events.jsonl \
-  --producer-id checkout-svc-1 --sequence 100
+  --producer-id orders.checkout-svc-1 --sequence 100
 
 es producer list
-es producer revoke --id checkout-svc-1</pre>
+es producer revoke --id orders.checkout-svc-1</pre>
 </figure>
 
 <h2>Consumer groups</h2>
