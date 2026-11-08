@@ -13,7 +13,7 @@ es-tools dump --data-dir ./data --output full.tar.gz --include-keys --verify</pr
 </figure>
 <dl class="defs">
   <div><dt><code>--data-dir</code></dt><dd>The broker's data directory. Default <code>./data</code>.</dd></div>
-  <div><dt><code>--output</code></dt><dd>Archive to write. Default <code>backup.tar.gz</code>. Created readable only by you.</dd></div>
+  <div><dt><code>--output</code></dt><dd>Archive to write. Default <code>backup.tar.gz</code>. Written to a new file readable only by you and renamed into place, so a file already there is replaced (not reused with its old mode) and a symlink there is replaced, never followed.</dd></div>
   <div><dt><code>--topics</code></dt><dd>Comma-separated topics to include. Default: all.</dd></div>
   <div><dt><code>--include-keys</code></dt><dd>Include <code>api_keys.json</code> (key hashes and grants). <code>bootstrap.key</code>, a plaintext secret, is never included.</dd></div>
   <div><dt><code>--verify</code></dt><dd>Check every record's CRC while copying. Slower; stops at the first corrupt record.</dd></div>
@@ -30,17 +30,21 @@ es-tools dump --data-dir ./data --output full.tar.gz --include-keys --verify</pr
 <figure class="code">
   <figcaption><span>shell</span></figcaption>
 <pre>es-tools restore --input backup.tar.gz --data-dir ./new-data
-es-tools restore --input backup.tar.gz --data-dir ./data --force</pre>
+es-tools restore --input backup.tar.gz --data-dir ./data --force
+es-tools restore --input full.tar.gz --data-dir ./data --with-keys</pre>
 </figure>
 <dl class="defs">
   <div><dt><code>--input</code></dt><dd>Archive to restore. Default <code>backup.tar.gz</code>.</dd></div>
   <div><dt><code>--data-dir</code></dt><dd>Where to restore. Default <code>./data</code>.</dd></div>
   <div><dt><code>--force</code></dt><dd>Replace a directory that already holds data. Its contents are moved aside, not deleted.</dd></div>
+  <div><dt><code>--with-keys</code></dt><dd>Restore <code>api_keys.json</code>. Without it the key file is skipped, even when the archive says it holds one: an archive can claim anything, and restoring keys installs credentials.</dd></div>
+  <div><dt><code>--max-bytes</code></dt><dd>Most bytes read from the archive, every entry counted, extracted or skipped. Default 1 TiB.</dd></div>
+  <div><dt><code>--max-entries</code></dt><dd>Most entries read from the archive, directories and empty files included. Default 1,000,000.</dd></div>
 </dl>
 <p>Nothing in the target is touched until the archive has been checked:</p>
 <ol class="steps">
-  <li><p><strong>Extract to a staging directory</strong> next to the target, writing every file readable only by you, whatever mode the archive records.</p></li>
-  <li><p><strong>Check the archive.</strong> <code>manifest.json</code> must come first and be a version this tool reads. Only paths a broker would create are extracted; links, <code>..</code> and anything else, such as a planted <code>bootstrap.key</code> or an <code>api_keys.json</code> the manifest did not declare, are skipped. The data may not exceed what the manifest declares.</p></li>
+  <li><p><strong>Extract to a staging directory</strong> next to the target, under a fresh random name readable only by you, writing every file the same way whatever mode the archive records.</p></li>
+  <li><p><strong>Check the archive.</strong> <code>manifest.json</code> must come first and be a version this tool reads. Only paths a broker would create are extracted; links, <code>..</code> and anything else, such as a planted <code>bootstrap.key</code> or an <code>api_keys.json</code> without <code>--with-keys</code>, are skipped. The data may exceed neither what the manifest declares nor <code>--max-bytes</code> and <code>--max-entries</code>. Every <code>topic.json</code> must be one the broker will open: 1 to 10,000 partitions, a valid configuration, no partition directory beyond the count.</p></li>
   <li><p><strong>Move the old directory aside</strong> to <code>&lt;dir&gt;.pre-restore-&lt;timestamp&gt;</code> (with <code>--force</code>) and the restored one into its place. Delete the old copy once you have checked the restore.</p></li>
 </ol>
 <p>
@@ -74,7 +78,7 @@ systemctl stop es-broker
 es-tools dump --data-dir /var/lib/es --output es.tar.gz --include-keys --verify
 
 <span class="c-com"># On the new machine</span>
-es-tools restore --input es.tar.gz --data-dir /var/lib/es
+es-tools restore --input es.tar.gz --data-dir /var/lib/es --with-keys
 es-broker --data-dir /var/lib/es --bind 10.0.0.9:9000 --auth required
 
 <span class="c-com"># Check</span>

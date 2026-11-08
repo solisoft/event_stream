@@ -110,6 +110,8 @@ cargo test --release --test bench -- --ignored --nocapture  # throughput bench
 # Backup & restore
 ./target/release/es-tools dump --data-dir ./data --output backup.tar.gz
 ./target/release/es-tools restore --input backup.tar.gz --data-dir ./new-data
+# API keys come back only on request, whatever the archive claims
+./target/release/es-tools restore --input backup.tar.gz --data-dir ./new-data --with-keys
 ```
 
 ## License
