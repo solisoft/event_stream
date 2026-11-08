@@ -612,6 +612,8 @@ fn spawn_router(
                     Outbound::Broadcast(m) => {
                         (inbound.keys().copied().filter(|t| *t != from).collect(), m)
                     }
+                    // A membership view is for the transport, not a peer.
+                    Outbound::Membership(_) => continue,
                 };
                 for to in targets {
                     let blocked = {

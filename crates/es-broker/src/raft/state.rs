@@ -1527,21 +1527,22 @@ mod tests {
         }
     }
 
-    fn ack(s: &mut RaftState, peer: NodeId, index: LogIndex) -> Vec<Action> {
+    fn member_ack(s: &mut RaftState, peer: NodeId, index: LogIndex) -> Vec<Action> {
         s.on_message(Message::AppendEntriesResp(AppendEntriesResp {
             term: s.current_term,
             success: true,
             responder_id: peer,
             match_index: index,
+            read_seq: 0,
         }))
     }
 
     /// A leader of {1, 2, 3} that has committed an entry of its term, and so
     /// may change the configuration.
-    fn ready_leader() -> RaftState {
+    fn member_ready_leader() -> RaftState {
         let mut s = leader_of_three();
         s.try_propose(b"x".to_vec());
-        ack(&mut s, 2, 1);
+        member_ack(&mut s, 2, 1);
         assert_eq!(s.commit_index, 1);
         s
     }
@@ -1562,12 +1563,13 @@ mod tests {
             prev_log_term: 0,
             entries,
             leader_commit: commit,
+            read_seq: 0,
         })
     }
 
     #[test]
     fn a_change_takes_effect_when_appended_not_when_committed() {
-        let mut s = ready_leader();
+        let mut s = member_ready_leader();
         let (index, actions) = s.propose_member_change(&add(4)).unwrap();
         assert_eq!(index, 2);
         assert!(s.config.contains(4) && s.peers.contains(&4));
@@ -1585,9 +1587,9 @@ mod tests {
             Some("10.0.0.4:6000")
         );
 
-        ack(&mut s, 2, 2);
+        member_ack(&mut s, 2, 2);
         assert_eq!(s.commit_index, 1, "two of four is not a majority any more");
-        ack(&mut s, 4, 2);
+        member_ack(&mut s, 4, 2);
         assert_eq!(s.commit_index, 2);
         assert!(s.committed_config.contains(4));
         assert!(!s.has_uncommitted_change());
@@ -1595,7 +1597,7 @@ mod tests {
 
     #[test]
     fn a_second_change_is_refused_while_the_first_is_uncommitted() {
-        let mut s = ready_leader();
+        let mut s = member_ready_leader();
         s.propose_member_change(&add(4)).unwrap();
         assert_eq!(
             s.propose_member_change(&add(5)).unwrap_err(),
@@ -1606,8 +1608,8 @@ mod tests {
                 .unwrap_err(),
             ChangeRefused::InProgress(2)
         );
-        ack(&mut s, 2, 2);
-        ack(&mut s, 3, 2);
+        member_ack(&mut s, 2, 2);
+        member_ack(&mut s, 3, 2);
         assert!(s.propose_member_change(&add(5)).is_ok(), "once committed");
     }
 
@@ -1627,7 +1629,7 @@ mod tests {
 
     #[test]
     fn a_change_already_in_effect_or_removing_the_last_voter_is_refused() {
-        let mut s = ready_leader();
+        let mut s = member_ready_leader();
         assert_eq!(
             s.propose_member_change(&add(2)).unwrap_err(),
             ChangeRefused::AlreadyInEffect
@@ -1669,7 +1671,7 @@ mod tests {
 
     #[test]
     fn a_removed_leader_steps_down_once_the_change_commits() {
-        let mut s = ready_leader();
+        let mut s = member_ready_leader();
         s.propose_member_change(&MemberChange::Remove { id: 1 })
             .unwrap();
         assert_eq!(
@@ -1678,12 +1680,12 @@ mod tests {
             "it manages the change until it commits"
         );
         assert_eq!(s.peers, vec![2, 3]);
-        ack(&mut s, 2, 2);
+        member_ack(&mut s, 2, 2);
         assert_eq!(
             s.commit_index, 1,
             "the leader does not count itself in a configuration it is not in"
         );
-        let actions = ack(&mut s, 3, 2);
+        let actions = member_ack(&mut s, 3, 2);
         assert_eq!(s.commit_index, 2);
         assert_eq!(s.role, Role::Follower);
         for peer in [2, 3] {
@@ -1734,10 +1736,10 @@ mod tests {
 
     #[test]
     fn a_snapshot_records_the_membership_and_a_restart_restores_it() {
-        let mut s = ready_leader();
+        let mut s = member_ready_leader();
         s.propose_member_change(&add(4)).unwrap();
-        ack(&mut s, 2, 2);
-        ack(&mut s, 3, 2);
+        member_ack(&mut s, 2, 2);
+        member_ack(&mut s, 3, 2);
         let snap = s.take_snapshot(Vec::new(), None).unwrap();
         assert!(snap.members.as_ref().unwrap().contains(4));
         assert!(s.log.entries.is_empty(), "the config entry was compacted");

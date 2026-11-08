@@ -459,6 +459,7 @@ async fn read_barrier_sees_a_just_acknowledged_write() -> Result<()> {
             raft_store_path: tmp.path().join("raft.json"),
             timing: test_timing(),
             snapshot_after_applies: 0,
+            joining: false,
         },
     )?;
     // Poll until the single node has elected itself and serves a barrier.
