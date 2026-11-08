@@ -10,8 +10,10 @@ on:
   # artifacts): the way to try a change to build-binaries before a tag does.
   workflow_dispatch:
 
+# Read-only by default: test, clippy, fmt and audit run on pull requests and
+# need nothing more. The jobs that publish ask for write themselves.
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -70,14 +72,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: EmbarkStudios/cargo-deny-action@v1
+      # advisories included: deny.toml's advisory policy (and its one accepted
+      # exception) only applies when this check runs.
+      - uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          command: check bans licenses sources
+          command: check advisories bans licenses sources
 
   release:
     needs: [test, clippy, fmt, audit]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v5
 
@@ -203,6 +209,8 @@ jobs:
     needs: [build-binaries]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v5
 
@@ -217,6 +225,7 @@ jobs:
     needs: publish-release
     runs-on: ubuntu-latest
     permissions:
+      contents: read
       packages: write
     steps:
       - uses: actions/checkout@v5
@@ -240,6 +249,11 @@ jobs:
           ARG TARGETARCH
           RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
           COPY bin/${TARGETARCH}/es-broker bin/${TARGETARCH}/es bin/${TARGETARCH}/es-tools /usr/local/bin/
+          # The broker needs no privilege: run it as its own user, with its
+          # data under a directory that user owns.
+          RUN useradd --system --uid 10001 --home-dir /var/lib/es --create-home es
+          USER es
+          WORKDIR /var/lib/es
           ENTRYPOINT ["/usr/local/bin/es-broker"]
           EOF
 
