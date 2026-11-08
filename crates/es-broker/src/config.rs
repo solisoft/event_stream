@@ -80,6 +80,17 @@ pub struct Config {
     /// keeps it out of this struct's `Debug` output.
     pub raft_shared_secret: Option<crate::raft::SharedSecret>,
 
+    /// Per-broker identity on the Raft port: this broker's certificate and key,
+    /// and the CA that signs every member's. All three or none. See
+    /// [`crate::raft::tls`] for the naming rule.
+    pub raft_tls_cert: Option<PathBuf>,
+    pub raft_tls_key: Option<PathBuf>,
+    pub raft_tls_ca: Option<PathBuf>,
+
+    /// Accept the 0.2 Raft handshake, and use it to reach 0.2 brokers. Only
+    /// for a rolling upgrade from 0.2.1; deprecated, removed in 0.4.
+    pub raft_legacy_handshake: bool,
+
     /// Cold-storage directory for tiered storage. When set, sealed segments are
     /// offloaded here instead of being deleted by retention.
     pub cold_storage_dir: Option<PathBuf>,
@@ -115,6 +126,15 @@ impl Config {
                  without one this broker would serve every topic from its own unreplicated copy"
             ),
             (None, None) => {
+                let any_tls = self.raft_tls_cert.is_some()
+                    || self.raft_tls_key.is_some()
+                    || self.raft_tls_ca.is_some();
+                if any_tls || self.raft_legacy_handshake {
+                    anyhow::bail!(
+                        "--raft-tls-* or --raft-legacy-handshake was given without \
+                         --raft-node-id: they configure a Raft port this broker does not open"
+                    );
+                }
                 if !self.raft_peer_addrs.is_empty() {
                     anyhow::bail!(
                         "--raft-peer was given without --raft-node-id: peers were named but this \
@@ -124,6 +144,27 @@ impl Config {
                 return Ok(());
             }
             (Some(_), Some(_)) => {}
+        }
+
+        // Two of three is the mistake this catches: a broker with a
+        // certificate but no CA would trust nothing, and one with a CA but no
+        // certificate could prove nothing — either way no peer connects.
+        let tls_given = [
+            self.raft_tls_cert.is_some(),
+            self.raft_tls_key.is_some(),
+            self.raft_tls_ca.is_some(),
+        ];
+        if tls_given.iter().any(|g| *g) && !tls_given.iter().all(|g| *g) {
+            anyhow::bail!(
+                "--raft-tls-cert, --raft-tls-key and --raft-tls-ca must be given together: mTLS \
+                 needs this broker's identity and the CA that signs every member's"
+            );
+        }
+        if self.raft_tls().is_some() && self.raft_legacy_handshake {
+            anyhow::bail!(
+                "--raft-legacy-handshake cannot be combined with --raft-tls-*: a 0.2 broker cannot \
+                 speak TLS. Finish the upgrade, then enable mTLS on every member."
+            );
         }
 
         let node_id = self.raft_node_id.unwrap();
@@ -170,6 +211,14 @@ impl Config {
         Ok(())
     }
 
+    /// The mTLS files, when all three are set.
+    pub fn raft_tls(&self) -> Option<(&PathBuf, &PathBuf, &PathBuf)> {
+        match (&self.raft_tls_cert, &self.raft_tls_key, &self.raft_tls_ca) {
+            (Some(c), Some(k), Some(ca)) => Some((c, k, ca)),
+            _ => None,
+        }
+    }
+
     pub fn new(data_dir: PathBuf, bind: SocketAddr, segment_bytes: u64) -> Self {
         Self {
             data_dir,
@@ -205,7 +254,52 @@ impl Config {
             raft_bind: None,
             raft_peer_addrs: BTreeMap::new(),
             raft_shared_secret: None,
+            raft_tls_cert: None,
+            raft_tls_key: None,
+            raft_tls_ca: None,
+            raft_legacy_handshake: false,
             cold_storage_dir: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn member() -> Config {
+        let mut c = Config::new("/tmp".into(), "127.0.0.1:9000".parse().unwrap(), 1024);
+        c.raft_node_id = Some(1);
+        c.raft_bind = Some("127.0.0.1:6000".parse().unwrap());
+        c
+    }
+
+    #[test]
+    fn raft_tls_needs_all_three_files() {
+        let mut c = member();
+        c.raft_tls_cert = Some("node1.pem".into());
+        c.raft_tls_key = Some("node1.key".into());
+        let err = c.validate_raft().unwrap_err().to_string();
+        assert!(err.contains("must be given together"), "{err}");
+        c.raft_tls_ca = Some("ca.pem".into());
+        c.validate_raft().unwrap();
+    }
+
+    #[test]
+    fn raft_tls_and_the_legacy_handshake_exclude_each_other() {
+        let mut c = member();
+        c.raft_tls_cert = Some("node1.pem".into());
+        c.raft_tls_key = Some("node1.key".into());
+        c.raft_tls_ca = Some("ca.pem".into());
+        c.raft_legacy_handshake = true;
+        let err = c.validate_raft().unwrap_err().to_string();
+        assert!(err.contains("cannot speak TLS"), "{err}");
+    }
+
+    #[test]
+    fn raft_transport_flags_need_a_raft_node() {
+        let mut c = Config::new("/tmp".into(), "127.0.0.1:9000".parse().unwrap(), 1024);
+        c.raft_legacy_handshake = true;
+        assert!(c.validate_raft().is_err());
     }
 }

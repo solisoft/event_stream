@@ -11,7 +11,7 @@ use crate::config::Config;
 use crate::coord::GroupCoordinator;
 use crate::groups::GroupStore;
 use crate::producers::ProducerRegistry;
-use crate::raft::RaftHub;
+use crate::raft::{HubOptions, RaftHub, RaftTls};
 use crate::schema::SchemaStore;
 use crate::tiered_storage::TieredStore;
 use crate::topic::{Topic, TopicConfig};
@@ -116,12 +116,25 @@ impl Broker {
             _ => return Ok(()),
         };
 
-        let hub = RaftHub::bind(
+        let tls = match self.config.raft_tls() {
+            Some((cert, key, ca)) => Some(Arc::new(
+                RaftTls::from_pem_files(node_id, cert, key, ca)
+                    .context("load the raft mTLS identity")?,
+            )),
+            None => None,
+        };
+        let options = HubOptions {
+            shared_secret: self.config.raft_shared_secret.clone(),
+            tls,
+            legacy_handshake: self.config.raft_legacy_handshake,
+            ..HubOptions::default()
+        };
+        let hub = RaftHub::bind_with_options(
             node_id,
             bind,
             self.config.raft_peer_addrs.clone(),
             RAFT_RECONNECT_BACKOFF,
-            self.config.raft_shared_secret.clone(),
+            options,
         )
         .await
         .with_context(|| format!("bind the raft transport on {bind}"))?;

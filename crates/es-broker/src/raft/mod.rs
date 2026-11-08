@@ -6,6 +6,7 @@
 //! * `log` — the in-memory log and the durable, append-only store.
 //! * `transport` — one authenticated connection per peer, many groups over it.
 //! * `secret` — the cluster's shared secret: long enough, never printed.
+//! * `tls` — per-broker identity: mTLS certificates that name the node id.
 //!
 //! Not implemented: joint-consensus membership changes (config entries are
 //! applied, but there is no safe reconfiguration protocol on top of them) and
@@ -19,6 +20,7 @@ pub mod messages;
 pub mod node;
 pub mod secret;
 pub mod state;
+pub mod tls;
 pub mod transport;
 
 pub use log::{
@@ -31,4 +33,5 @@ pub use node::{
 };
 pub use secret::SharedSecret;
 pub use state::{Action, RaftState, Role};
-pub use transport::{group_key, spawn_transport, RaftHub, Transport};
+pub use tls::RaftTls;
+pub use transport::{group_key, spawn_transport, HubOptions, RaftHub, Transport};

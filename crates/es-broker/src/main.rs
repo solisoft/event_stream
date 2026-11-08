@@ -149,6 +149,27 @@ struct Args {
     /// address cannot be declared.
     #[arg(long = "raft-peer", value_parser = parse_raft_peer)]
     raft_peers: Vec<(u32, SocketAddr)>,
+
+    /// This broker's Raft certificate (PEM, leaf first). It must name the broker
+    /// as subjectAltName DNS:es-node-<id> and allow serverAuth and clientAuth.
+    /// With --raft-tls-key and --raft-tls-ca, every Raft connection is mutual
+    /// TLS and a member can no longer act as another.
+    #[arg(long, requires_all = ["raft_tls_key", "raft_tls_ca"])]
+    raft_tls_cert: Option<PathBuf>,
+
+    /// Private key for --raft-tls-cert (PEM).
+    #[arg(long, requires_all = ["raft_tls_cert", "raft_tls_ca"])]
+    raft_tls_key: Option<PathBuf>,
+
+    /// CA certificate(s) that sign every member's Raft certificate (PEM).
+    #[arg(long, requires_all = ["raft_tls_cert", "raft_tls_key"])]
+    raft_tls_ca: Option<PathBuf>,
+
+    /// Accept the 0.2 Raft handshake, and use it to reach brokers still on 0.2.
+    /// Only while upgrading a cluster from 0.2.1 one broker at a time; remove it
+    /// once every member runs 0.3. Deprecated: removed in 0.4.
+    #[arg(long)]
+    raft_legacy_handshake: bool,
 }
 
 /// A secret as clap received it. Kept opaque until it is checked, so neither
@@ -304,6 +325,10 @@ async fn main() -> Result<()> {
     };
     config.raft_node_id = args.raft_node_id;
     config.raft_bind = args.raft_bind;
+    config.raft_tls_cert = args.raft_tls_cert;
+    config.raft_tls_key = args.raft_tls_key;
+    config.raft_tls_ca = args.raft_tls_ca;
+    config.raft_legacy_handshake = args.raft_legacy_handshake;
     for (id, addr) in args.raft_peers {
         if let Some(prev) = config.raft_peer_addrs.insert(id, addr) {
             anyhow::bail!(
@@ -327,10 +352,11 @@ async fn main() -> Result<()> {
              record data are sent unencrypted. Restrict it to a trusted network."
         );
     }
-    if config.raft_node_id.is_some() {
+    if config.raft_node_id.is_some() && config.raft_tls().is_none() {
         tracing::warn!(
-            "raft replication traffic is authenticated but not encrypted: keep --raft-bind on a \
-             private network"
+            "raft replication traffic is authenticated but not encrypted, and members share one \
+             identity: keep --raft-bind on a private network, or set --raft-tls-cert, \
+             --raft-tls-key and --raft-tls-ca"
         );
     }
     raise_fd_limit();

@@ -16,10 +16,10 @@
     follows the current membership, so a removed broker can no longer connect.</li>
   <li><strong>Linearizable reads, as an opt-in.</strong> Read-index or lease reads, for consumers that must not see a
     stale replica.</li>
-  <li><strong>Per-broker identity.</strong> mTLS with the broker id in the certificate, so one broker cannot act as
-    another. Today brokers share one secret, which keeps outsiders out but lets any broker that holds it act as any
-    member. With it: an idle timeout on Raft connections, and a handshake where the dialing broker proves itself
-    first.</li>
+  <li><strong>Per-broker identity.</strong> Done: optional mTLS with the broker id in the certificate, so one broker
+    cannot act as another (<a href="<%= docs_cluster_path() %>">Clustering with Raft</a>). With it: keepalives and an
+    idle timeout on Raft connections, and a handshake where the dialing broker proves itself first. The 0.2 handshake
+    is accepted behind <code>--raft-legacy-handshake</code> for rolling upgrades, and removed in 0.4.</li>
   <li><strong>Topic deletion and consumer groups.</strong> A deleted topic is removed from the groups subscribed to
     it.</li>
 </ul>

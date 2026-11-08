@@ -52,7 +52,7 @@ es-broker --data-dir /var/lib/es --bind 10.0.0.1:9000 --auth required \
 </aside>
 <p>
   The broker refuses a configuration that cannot work: a node id of 0, a peer listed twice or sharing an address, a node
-  listing itself, or a Raft port reachable from the network without a shared secret.
+  listing itself, or a Raft port reachable from the network without a shared secret or mTLS.
 </p>
 
 <h3>A single node</h3>
@@ -99,9 +99,11 @@ es-broker --data-dir /var/lib/es --bind 10.0.0.1:9000 --auth required \
 <h2>Transport and security</h2>
 <p>
   Brokers authenticate each other with the shared secret, without sending it: each side proves it knows the secret
-  against a random challenge from the other, so a recorded handshake cannot be replayed. The dialing broker checks it
-  reached the node it meant to; the listening broker checks the dialer is a configured member, and closes connections
-  from any address that is not a peer's before they reach the handshake.
+  against a random challenge from the other, so a recorded handshake cannot be replayed. The dialing broker proves
+  itself first, and the listening broker answers with its own proof only once the dialer's has checked out, so a
+  connection that has proved nothing learns nothing derived from the secret. The dialing broker checks it reached the
+  node it meant to; the listening broker checks the dialer is a current member, and closes connections from any address
+  that is not a peer's before they reach the handshake.
 </p>
 <p>
   The secret must be at least 32 bytes; the broker refuses to start with a shorter one. Generate it with
@@ -115,19 +117,68 @@ es-broker --data-dir /var/lib/es --bind 10.0.0.1:9000 --auth required \
   ignored.
 </p>
 <p>
-  There is one secret for the whole cluster, so it separates members from outsiders, not members from each other. The
-  id a broker announces in the handshake is not proved by anything only that broker holds: a broker with the secret
-  can connect as any member and vote, acknowledge or replicate in its name. Treat every holder of the secret as
-  trusted with the whole cluster. Per-member keys are not implemented.
+  A connection with nothing to carry sends a keepalive every 5 seconds, in both directions. A broker that hears nothing
+  on a connection for 15 seconds closes it, and the dialing side redials. A peer that vanished without closing its
+  connections, after a power cut or a dropped route, is noticed within that time instead of hours later.
 </p>
+
+<h3>Per-broker identity with mTLS</h3>
+<p>
+  There is one secret for the whole cluster, so on its own it separates members from outsiders, not members from each
+  other: a broker with the secret can connect as any member and vote, acknowledge or replicate in its name. To tell
+  members apart, give every broker its own certificate, signed by a CA the members share:
+</p>
+<figure class="code">
+  <figcaption><span>node 1</span></figcaption>
+<pre>es-broker --data-dir /var/lib/es --bind 10.0.0.1:9000 --auth required \
+  --raft-node-id 1 --raft-bind 10.0.0.1:6000 \
+  --raft-peer 2=10.0.0.2:6000 --raft-peer 3=10.0.0.3:6000 \
+  --raft-tls-cert /etc/es/raft/node1.pem \
+  --raft-tls-key /etc/es/raft/node1.key \
+  --raft-tls-ca /etc/es/raft/ca.pem</pre>
+</figure>
+<ul>
+  <li><strong>The certificate names the broker.</strong> Node 7's certificate carries the subjectAltName
+    <code>DNS:es-node-7</code>, and its extended key usage allows both <code>serverAuth</code> and
+    <code>clientAuth</code>, because every broker both listens and dials. A broker refuses to start with a certificate
+    that does not name its own <code>--raft-node-id</code>.</li>
+  <li><strong>The listener takes the dialer's id from its certificate.</strong> A dialer must present a certificate the
+    CA signed, naming exactly one current member; if the id it announces in the handshake is not that one, the
+    connection is refused. Holding node 2's certificate does not let a broker speak as node 3.</li>
+  <li><strong>The dialer checks the listener's certificate</strong> names the node it meant to reach, and refuses a
+    certificate for any other node.</li>
+  <li><strong>Traffic is encrypted.</strong> Every connection is TLS 1.3.</li>
+</ul>
+<p>
+  With mTLS the shared secret is optional, even on a routable address; set both and the secret's handshake runs inside
+  TLS. Enable mTLS on every member at the same restart: a broker with it and a broker without it cannot connect.
+</p>
+<figure class="code">
+  <figcaption><span>a certificate for node 1, with openssl</span></figcaption>
+<pre>openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -keyout node1.key -subj <span class="c-str">'/CN=es-node-1'</span> -out node1.csr
+printf <span class="c-str">'subjectAltName=DNS:es-node-1\nextendedKeyUsage=serverAuth,clientAuth\n'</span> &gt; node1.ext
+openssl x509 -req -in node1.csr -CA ca.pem -CAkey ca.key -days 365 -extfile node1.ext -out node1.pem</pre>
+</figure>
 <aside class="note warn">
-  <p>Replication traffic is not encrypted</p>
-  <p>It is authenticated and tamper-proof, but readable on the wire. Keep <code>--raft-bind</code> on a private network.</p>
+  <p>Without mTLS, replication traffic is not encrypted</p>
+  <p>It is authenticated and tamper-proof, but readable on the wire. Keep <code>--raft-bind</code> on a private network,
+    or configure <code>--raft-tls-*</code>.</p>
 </aside>
+
+<h3>Upgrading from 0.2</h3>
+<p>
+  0.3 brokers speak version 3 of the handshake (<code>RAF3</code>), in which the dialer proves itself first. A 0.2
+  broker speaks version 2 (<code>RAF2</code>), in which the listener did, and a 0.3 broker refuses it by default. To
+  upgrade one broker at a time, start each upgraded broker with <code>--raft-legacy-handshake</code>: it then accepts
+  version 2 from the brokers still on 0.2, and when a 0.2 broker closes its version-3 hello unanswered, it retries in
+  version 2. Once every member runs 0.3, restart each without the flag. The flag is deprecated and goes away in 0.4; it
+  cannot be combined with mTLS, which 0.2 does not speak. Do not change the membership during the upgrade.
+</p>
 <p class="small">
-  Without a secret the same handshake runs with no authentication, and the broker only allows that on a loopback
-  address. Brokers from before this transport (handshake <code>RAFT</code> rather than <code>RAF2</code>) cannot join;
-  upgrade every member together. Raft state from older versions is converted on first start.
+  Without a secret or mTLS the same handshake runs with no authentication, and the broker only allows that on a
+  loopback address. Brokers from before 0.2 (handshake <code>RAFT</code>) cannot join; upgrade them to 0.2 first. Raft
+  state from older versions is converted on first start.
 </p>
 
 <h2>Durability of Raft state</h2>
