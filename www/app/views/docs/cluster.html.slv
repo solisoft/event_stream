@@ -71,7 +71,33 @@ es-broker --data-dir /var/lib/es --bind 10.0.0.1:9000 --auth required \
 <ul>
   <li><strong>Produce to any broker.</strong> A follower forwards a produce to the partition's leader and returns the leader's answer; see <a href="#leader-routing">Leader routing</a>. <code>GET /raft</code> shows each partition's leader, for clients that would rather skip the hop.</li>
   <li><strong>Acknowledgement means a majority has it.</strong> The leader appends the entry durably, replicates it, and answers once a majority of members have it on disk and it is applied.</li>
-  <li><strong>Reads come from what a broker has applied.</strong> A follower can be slightly behind the leader; reads are not linearizable.</li>
+  <li><strong>Reads come from what a broker has applied</strong>, by default. A follower can be slightly behind the leader, and so can a leader that has lost its majority without knowing it yet. Ask for a <a href="#linearizable-reads">linearizable read</a> when that matters.</li>
+</ul>
+
+<h2 id="linearizable-reads">Linearizable reads</h2>
+<p>
+  With <code>consistency=linearizable</code> over HTTP, or the linearizable flag over the binary protocol, a consume
+  returns every record whose produce was acknowledged before the consume was sent, by whichever broker was leader at the
+  time. Two consumers that read one after the other never see the second read go back in time. Without it, a consumer
+  reading from a follower that is behind, or from an old leader cut off from the others that has not noticed yet, can
+  miss writes the cluster already acknowledged.
+</p>
+<p>The leader serves it with Raft's read index:</p>
+<ol class="steps">
+  <li><p><strong>Fix a read index.</strong> The leader notes its commit index. A leader just elected waits until it has committed an entry of its own term (its empty first entry), so that the index covers everything its predecessors committed.</p></li>
+  <li><p><strong>Confirm leadership.</strong> It sends a heartbeat round to the followers, numbered so that only answers to this round or a later one count, and waits until a majority, itself included, has answered. A newer leader would have had to win those same followers' votes first, so none existed when the read began.</p></li>
+  <li><p><strong>Apply, then read.</strong> It waits until its partition has applied everything up to the read index, then reads.</p></li>
+</ol>
+<p>
+  The cost is one heartbeat round trip to the nearest majority per read, and no disk write.
+  No clock is involved: a lease read would skip the round trip but would be safe only if the brokers' clocks never
+  drifted beyond a bound, which <code>es</code> does not assume.
+</p>
+<ul>
+  <li><strong>Only the leader serves them.</strong> A follower answers <code>503</code> (binary: an <code>unavailable:</code> error) naming the leader when it knows it. It could instead ask the leader for a read index and wait to apply up to it, but that needs a new message between brokers, which brokers of earlier versions would reject, and the client would still wait for the follower to catch up to what the leader already has. Read from the leader, as you produce to it.</li>
+  <li><strong>Bounded.</strong> A leader that cannot confirm its leadership and apply within 5 seconds answers <code>503</code>. Retrying is safe: a read changes nothing.</li>
+  <li><strong>Mixed versions.</strong> The heartbeat round number is an optional field that older brokers neither send nor read. Until every member runs 0.3, a leader may not gather a majority of numbered answers, and its linearizable reads time out; default reads are unaffected.</li>
+  <li><strong>A single broker</strong>, with or without Raft, already serves every read linearizably; the option costs nothing there.</li>
 </ul>
 
 <h2 id="leader-routing">Leader routing</h2>
@@ -184,7 +210,7 @@ es-broker --data-dir /var/lib/es --bind 10.0.0.1:9000 --auth required \
   <li><strong>Idempotent-producer state is per broker.</strong> It lives on the leader that accepted the writes; after
     a leadership change, the new leader does not know the producer's earlier sequences.</li>
   <li><strong>Static membership.</strong> Adding or removing a broker means restarting every broker with the new peer list.</li>
-  <li><strong>No linearizable reads.</strong> A follower serves what it has applied.</li>
+  <li><strong>Linearizable reads go to the leader.</strong> Followers serve default reads only.</li>
   <li><strong>No pre-vote.</strong> A rejoining broker cannot win an election against a healthy leader, but its higher term can make the leader step down once.</li>
   <li><strong>Topics are created per broker.</strong> Create each topic, with the same partition count, on every member.</li>
 </ul>

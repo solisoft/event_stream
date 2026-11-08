@@ -6,9 +6,10 @@ use anyhow::{anyhow, Result};
 use tokio::io::AsyncWriteExt;
 
 use es_protocol::wire::{
-    decode_consume_response, decode_produce_response, encode_consume_request,
+    decode_consume_response, decode_produce_response, encode_consume_request_with_flags,
     encode_produce_request, Opcode, WireConsumeRequest, WireConsumeResponse, WireProduceRecord,
-    WireProduceRequest, WireProduceResult,
+    WireProduceRequest, WireProduceResult, CONSUME_FLAG_LINEARIZABLE, FEATURE_CONSUME_FLAGS,
+    FEATURE_GZIP,
 };
 
 use super::codec::{self, ClientTls, IoStream, MAX_FRAME_BYTES};
@@ -26,6 +27,8 @@ pub struct BinaryClient {
     sock: Box<dyn IoStream>,
     next_request_id: u32,
     gzip: bool,
+    /// Whether the server understands consume flags.
+    consume_flags: bool,
 }
 
 impl BinaryClient {
@@ -36,11 +39,13 @@ impl BinaryClient {
     /// Open a connection and run the handshake with the given options.
     /// `token` may be empty when the broker has auth disabled.
     pub async fn connect_with(addr: SocketAddr, token: &str, opts: ClientOptions) -> Result<Self> {
-        let (sock, gzip) = codec::connect(addr, token, opts.gzip, opts.tls.as_ref()).await?;
+        let (sock, features) =
+            codec::connect_with_features(addr, token, opts.gzip, opts.tls.as_ref()).await?;
         Ok(Self {
             sock,
             next_request_id: 1,
-            gzip,
+            gzip: features & FEATURE_GZIP != 0,
+            consume_flags: features & FEATURE_CONSUME_FLAGS != 0,
         })
     }
 
@@ -124,6 +129,48 @@ impl BinaryClient {
         max_records: u32,
         max_bytes: u32,
     ) -> Result<WireConsumeResponse> {
+        self.consume_with_flags(topic, partition, offset, max_records, max_bytes, 0)
+            .await
+    }
+
+    /// [`Self::consume`], linearizable: sees every write acknowledged before
+    /// the call. Must reach the partition's leader; a follower, or a leader
+    /// that cannot confirm its leadership in time, answers with a retryable
+    /// `unavailable:` error. Fails without sending anything if the server
+    /// predates linearizable reads.
+    pub async fn consume_linearizable(
+        &mut self,
+        topic: &str,
+        partition: u32,
+        offset: u64,
+        max_records: u32,
+        max_bytes: u32,
+    ) -> Result<WireConsumeResponse> {
+        if !self.consume_flags {
+            return Err(anyhow!(
+                "the broker does not support linearizable reads (no consume flags at handshake)"
+            ));
+        }
+        self.consume_with_flags(
+            topic,
+            partition,
+            offset,
+            max_records,
+            max_bytes,
+            CONSUME_FLAG_LINEARIZABLE,
+        )
+        .await
+    }
+
+    async fn consume_with_flags(
+        &mut self,
+        topic: &str,
+        partition: u32,
+        offset: u64,
+        max_records: u32,
+        max_bytes: u32,
+        flags: u8,
+    ) -> Result<WireConsumeResponse> {
         let req = WireConsumeRequest {
             topic: topic.to_string(),
             partition,
@@ -131,7 +178,7 @@ impl BinaryClient {
             max_records,
             max_bytes,
         };
-        let payload = encode_consume_request(&req)?;
+        let payload = encode_consume_request_with_flags(&req, flags)?;
         match self.round_trip(Opcode::Consume, &payload).await? {
             (Opcode::ConsumeOk, body) => Ok(decode_consume_response(&body)?),
             (Opcode::Error, body) => {

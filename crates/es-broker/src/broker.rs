@@ -252,6 +252,11 @@ impl Broker {
             .topics
             .remove(name)
             .ok_or_else(|| anyhow!("topic '{}' not found", name))?;
+        // Out of every group's subscription first, so the coordinator stops
+        // handing out its partitions while the files are still being removed.
+        // Done after the map removal: a join re-checks the topic under the
+        // group lock, so none can slip it back in once this has run.
+        self.coordinator.purge_topic(self, name).await;
         if let Some(hub) = self.raft_hub() {
             topic.detach_raft(&hub);
         }

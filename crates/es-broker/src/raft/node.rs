@@ -53,6 +53,20 @@ pub enum ProposeReply {
     NotLeader { leader_hint: Option<NodeId> },
 }
 
+/// Reply to a read-index request (dissertation §6.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadIndexReply {
+    /// Leadership was confirmed by a majority after the request arrived. A
+    /// read is linearizable once the state machine has applied every entry
+    /// up to `apply_through` — the last entry handed to the `committed`
+    /// stream when the read index was fixed, which covers every entry up to
+    /// the read index.
+    Ready { apply_through: LogIndex },
+    /// This node is not the leader, or stopped being it before the read was
+    /// confirmed.
+    NotLeader { leader_hint: Option<NodeId> },
+}
+
 /// Moves state-machine contents to a follower that is behind the leader's
 /// snapshot. Implemented by Raft partitions, which ship records rather than an
 /// opaque blob. All methods are blocking and are called on a blocking thread.
@@ -84,6 +98,17 @@ pub struct NodeOptions {
 struct ProposeReq {
     payload: Vec<u8>,
     ack: oneshot::Sender<ProposeReply>,
+}
+
+struct ReadReq {
+    ack: oneshot::Sender<ReadIndexReply>,
+}
+
+/// A read waiting for its round to be confirmed.
+struct PendingRead {
+    seq: u64,
+    term: u64,
+    ack: oneshot::Sender<ReadIndexReply>,
 }
 
 struct SnapshotReq {
@@ -131,6 +156,9 @@ pub struct NodeHandle {
     pub join: Option<JoinHandle<()>>,
     propose_tx: mpsc::UnboundedSender<ProposeReq>,
     snapshot_tx: mpsc::UnboundedSender<SnapshotReq>,
+    read_tx: mpsc::UnboundedSender<ReadReq>,
+    /// See [`Self::applied_at_start`].
+    applied_at_start: LogIndex,
     pub store: Arc<dyn RaftStore>,
     /// When each peer was last heard from, in monotonic time.
     ///
@@ -175,6 +203,30 @@ impl NodeHandle {
     }
     pub async fn last_log_index(&self) -> u64 {
         self.state.lock().await.log.last_index()
+    }
+
+    /// The index the state machine already reflects when the node starts:
+    /// the restored snapshot's. Entries after it reach the state machine
+    /// again through `committed`.
+    pub fn applied_at_start(&self) -> LogIndex {
+        self.applied_at_start
+    }
+
+    /// Ask for a read index (dissertation §6.4). On the leader, resolves once
+    /// a majority has acknowledged a heartbeat round sent after this call and
+    /// the leader has committed an entry of its own term. On any other node,
+    /// or if leadership is lost first, resolves to `NotLeader`.
+    ///
+    /// Does not time out by itself: a leader cut off from its majority keeps
+    /// the request pending until it learns of a newer term. Callers bound the
+    /// wait; a dropped request is forgotten at the next heartbeat.
+    pub async fn read_index(&self) -> Result<ReadIndexReply> {
+        let (tx, rx) = oneshot::channel();
+        self.read_tx
+            .send(ReadReq { ack: tx })
+            .map_err(|_| anyhow::anyhow!("node loop exited"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("read index ack dropped"))
     }
 
     pub async fn shutdown(mut self) {
@@ -257,6 +309,7 @@ pub fn spawn_node_with_options(
     let snap = store.load()?;
     let snapshot = store.load_snapshot()?;
     initial.restore(snap, snapshot.as_ref())?;
+    let applied_at_start = initial.last_applied;
     let state = Arc::new(Mutex::new(initial));
 
     let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel::<Message>();
@@ -264,6 +317,7 @@ pub fn spawn_node_with_options(
     let (committed_tx, committed_rx) = mpsc::unbounded_channel::<LogEntry>();
     let (propose_tx, mut propose_rx) = mpsc::unbounded_channel::<ProposeReq>();
     let (snapshot_tx, mut snapshot_rx) = mpsc::unbounded_channel::<SnapshotReq>();
+    let (read_tx, mut read_rx) = mpsc::unbounded_channel::<ReadReq>();
     let cancel = CancellationToken::new();
     let failed = Arc::new(AtomicBool::new(false));
 
@@ -283,12 +337,17 @@ pub fn spawn_node_with_options(
             timing,
             transfer: options.transfer,
             last_leader_contact: None,
+            last_handed: applied_at_start,
+            pending_reads: Vec::new(),
         };
         let mut heartbeat_tick = tokio::time::interval(timing.heartbeat);
         heartbeat_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         let outcome: Result<()> = async {
             loop {
+                // Whatever the last event was — an ack, a commit, a lost
+                // election — it may have settled a pending read.
+                d.resolve_reads().await;
                 let role = d.state.lock().await.role;
                 tokio::select! {
                     _ = cancel_for_task.cancelled() => return Ok(()),
@@ -322,6 +381,11 @@ pub fn spawn_node_with_options(
                         // before anyone is told it was accepted.
                         d.apply_and_persist(actions).await?;
                         let _ = req.ack.send(reply);
+                    }
+
+                    req = read_rx.recv() => {
+                        let Some(req) = req else { return Ok(()); };
+                        d.begin_read(req.ack).await?;
                     }
 
                     req = snapshot_rx.recv() => {
@@ -370,6 +434,8 @@ pub fn spawn_node_with_options(
         join: Some(join),
         propose_tx,
         snapshot_tx,
+        read_tx,
+        applied_at_start,
         store: store_for_handle,
         last_contact,
         failed,
@@ -393,9 +459,65 @@ struct Driver {
     /// When an AppendEntries / InstallSnapshot from a current leader last
     /// arrived.
     last_leader_contact: Option<Instant>,
+    /// Index of the last entry handed to the `committed` stream.
+    last_handed: LogIndex,
+    /// Reads waiting for a majority to confirm their round.
+    pending_reads: Vec<PendingRead>,
 }
 
 impl Driver {
+    /// Register a read and send its heartbeat round at once, rather than at
+    /// the next tick. A follower answers straight away: it does not ask the
+    /// leader for a read index (see `RaftPartition::read_barrier`).
+    async fn begin_read(&mut self, ack: oneshot::Sender<ReadIndexReply>) -> Result<()> {
+        let (started, term, hint) = {
+            let mut s = self.state.lock().await;
+            (s.begin_read(), s.current_term, s.leader_hint)
+        };
+        let Some((seq, actions)) = started else {
+            let _ = ack.send(ReadIndexReply::NotLeader { leader_hint: hint });
+            return Ok(());
+        };
+        self.pending_reads.push(PendingRead { seq, term, ack });
+        self.apply_and_persist(actions).await
+    }
+
+    /// Answer every pending read the state now settles: confirmed ones with
+    /// their read index, all of them with `NotLeader` once this node no
+    /// longer leads the term they were registered in. A read whose caller has
+    /// given up is dropped.
+    async fn resolve_reads(&mut self) {
+        if self.pending_reads.is_empty() {
+            return;
+        }
+        let (leading_term, hint, confirmed, ready) = {
+            let s = self.state.lock().await;
+            let leading = (s.role == Role::Leader).then_some(s.current_term);
+            (
+                leading,
+                s.leader_hint,
+                s.read_confirmed_seq(),
+                s.committed_in_current_term(),
+            )
+        };
+        // Every entry up to the commit index has been handed over by now:
+        // the state hands out committed entries in the same step that
+        // commits them, and the driver forwards them before coming back here.
+        let apply_through = self.last_handed;
+        for r in std::mem::take(&mut self.pending_reads) {
+            if r.ack.is_closed() {
+                continue;
+            }
+            if leading_term != Some(r.term) {
+                let _ = r.ack.send(ReadIndexReply::NotLeader { leader_hint: hint });
+            } else if ready && r.seq <= confirmed {
+                let _ = r.ack.send(ReadIndexReply::Ready { apply_through });
+            } else {
+                self.pending_reads.push(r);
+            }
+        }
+    }
+
     async fn on_message(&mut self, msg: Message) -> Result<()> {
         // Leader stickiness (Raft thesis §4.2.3): a node that heard from a live
         // leader within the minimum election timeout ignores vote requests. A
@@ -561,6 +683,7 @@ impl Driver {
                     self.election_deadline = randomized_deadline(self.timing);
                 }
                 Action::Apply(entry) => {
+                    self.last_handed = entry.index;
                     let _ = self.committed.send(entry);
                 }
                 Action::SendSnapshot(peer) => self.send_snapshot(peer).await,
@@ -784,6 +907,7 @@ mod tests {
                 prev_log_term: 0,
                 entries: vec![],
                 leader_commit: 0,
+                read_seq: 0,
             }))
             .unwrap();
         assert!(next_outbound(&mut h).await.is_some(), "heartbeat answered");

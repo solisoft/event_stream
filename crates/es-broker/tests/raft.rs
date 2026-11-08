@@ -579,3 +579,238 @@ async fn snapshot_sent_to_lagging_follower() -> Result<()> {
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Linearizable reads: read index (Bonfire #732)
+// ---------------------------------------------------------------------------
+
+use es_broker::raft::{Outbound, ReadIndexReply};
+use std::collections::BTreeSet;
+
+/// Route every node's outbound messages to the others in background tasks,
+/// dropping any message from or to a node in `cut`. Unlike `pump_outbound`
+/// it does not borrow the handles, so a test can await a node while traffic
+/// flows.
+fn spawn_router(
+    handles: &mut BTreeMap<NodeId, NodeHandle>,
+    cut: Arc<std::sync::Mutex<BTreeSet<NodeId>>>,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let inbound: BTreeMap<NodeId, _> = handles
+        .iter()
+        .map(|(id, h)| (*id, h.inbound.clone()))
+        .collect();
+    let mut tasks = Vec::new();
+    for (id, h) in handles.iter_mut() {
+        let from = *id;
+        let mut rx = h.take_outbound().expect("outbound not yet taken");
+        let inbound = inbound.clone();
+        let cut = cut.clone();
+        tasks.push(tokio::spawn(async move {
+            while let Some(out) = rx.recv().await {
+                let (targets, msg): (Vec<NodeId>, _) = match out {
+                    Outbound::SendTo(to, m) => (vec![to], m),
+                    Outbound::Broadcast(m) => {
+                        (inbound.keys().copied().filter(|t| *t != from).collect(), m)
+                    }
+                };
+                for to in targets {
+                    let blocked = {
+                        let c = cut.lock().unwrap();
+                        c.contains(&from) || c.contains(&to)
+                    };
+                    if !blocked {
+                        if let Some(tx) = inbound.get(&to) {
+                            let _ = tx.send(msg.clone());
+                        }
+                    }
+                }
+            }
+        }));
+    }
+    tasks
+}
+
+/// Poll until exactly one of `among` is leader in a term no other node of
+/// `among` has passed.
+async fn await_leader_among(
+    handles: &BTreeMap<NodeId, NodeHandle>,
+    among: &[NodeId],
+    deadline: Duration,
+) -> Option<NodeId> {
+    let give_up = Instant::now() + deadline;
+    while Instant::now() < give_up {
+        let mut leaders = Vec::new();
+        for id in among {
+            if handles[id].role().await == Role::Leader {
+                leaders.push(*id);
+            }
+        }
+        if leaders.len() == 1 {
+            return Some(leaders[0]);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    None
+}
+
+/// Propose on `leader` and poll until it has committed the entry.
+async fn commit_on(h: &NodeHandle, payload: &[u8]) -> Result<u64> {
+    let index = match h.propose(payload.to_vec()).await? {
+        ProposeReply::Accepted { index } => index,
+        other => anyhow::bail!("propose refused: {other:?}"),
+    };
+    let give_up = Instant::now() + Duration::from_secs(5);
+    while h.commit_index().await < index {
+        anyhow::ensure!(Instant::now() < give_up, "entry {index} never committed");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    Ok(index)
+}
+
+fn three_nodes() -> BTreeMap<NodeId, NodeHandle> {
+    let mut handles = BTreeMap::new();
+    for id in 1..=3u32 {
+        let peers: Vec<NodeId> = (1..=3u32).filter(|p| *p != id).collect();
+        handles.insert(id, spawn_node(id, peers, timing_fast()));
+    }
+    handles
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn linearizable_read_on_the_leader_covers_a_just_committed_write() -> Result<()> {
+    let mut handles = three_nodes();
+    let cut = Arc::new(std::sync::Mutex::new(BTreeSet::new()));
+    let router = spawn_router(&mut handles, cut);
+    let leader = await_leader_among(&handles, &[1, 2, 3], Duration::from_secs(10))
+        .await
+        .expect("no leader");
+
+    let index = commit_on(&handles[&leader], b"write").await?;
+    let reply = tokio::time::timeout(Duration::from_secs(5), handles[&leader].read_index())
+        .await
+        .expect("read index not confirmed")?;
+    match reply {
+        ReadIndexReply::Ready { apply_through } => assert!(
+            apply_through >= index,
+            "read index {apply_through} misses the committed write at {index}"
+        ),
+        other => panic!("leader refused a read: {other:?}"),
+    }
+
+    // A follower does not serve linearizable reads; it names the leader.
+    let follower = (1..=3u32).find(|id| *id != leader).unwrap();
+    let reply = handles[&follower].read_index().await?;
+    assert_eq!(
+        reply,
+        ReadIndexReply::NotLeader {
+            leader_hint: Some(leader)
+        }
+    );
+
+    for t in router {
+        t.abort();
+    }
+    for (_, h) in handles {
+        h.shutdown().await;
+    }
+    Ok(())
+}
+
+/// The case read-index exists for: a leader cut off from its majority still
+/// believes it leads, while the others elect a new leader and commit a write
+/// it never sees. It must not confirm a read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deposed_leader_does_not_serve_a_linearizable_read() -> Result<()> {
+    let mut handles = three_nodes();
+    let cut = Arc::new(std::sync::Mutex::new(BTreeSet::new()));
+    let router = spawn_router(&mut handles, cut.clone());
+    let old = await_leader_among(&handles, &[1, 2, 3], Duration::from_secs(10))
+        .await
+        .expect("no leader");
+    commit_on(&handles[&old], b"before").await?;
+
+    // Partition the leader away.
+    cut.lock().unwrap().insert(old);
+    let rest: Vec<NodeId> = (1..=3u32).filter(|id| *id != old).collect();
+    let new = await_leader_among(&handles, &rest, Duration::from_secs(10))
+        .await
+        .expect("the majority elected no new leader");
+    let stale_index = commit_on(&handles[&new], b"after").await?;
+
+    // The old leader has not heard of the new term: it still says Leader.
+    assert_eq!(handles[&old].role().await, Role::Leader);
+    assert!(handles[&old].commit_index().await < stale_index);
+    let read = tokio::time::timeout(Duration::from_millis(500), handles[&old].read_index()).await;
+    match read {
+        Err(_) => {} // timed out: nobody confirmed its leadership
+        Ok(Ok(ReadIndexReply::NotLeader { .. })) => {}
+        Ok(other) => panic!("a deposed leader confirmed a read: {other:?}"),
+    }
+
+    // The new leader serves one, covering the write the old one missed.
+    match handles[&new].read_index().await? {
+        ReadIndexReply::Ready { apply_through } => assert!(apply_through >= stale_index),
+        other => panic!("new leader refused a read: {other:?}"),
+    }
+
+    // Healed, the old leader learns of the newer term and refuses outright.
+    cut.lock().unwrap().clear();
+    let give_up = Instant::now() + Duration::from_secs(5);
+    while handles[&old].role().await == Role::Leader {
+        anyhow::ensure!(Instant::now() < give_up, "old leader never stepped down");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(matches!(
+        handles[&old].read_index().await?,
+        ReadIndexReply::NotLeader { .. }
+    ));
+
+    for t in router {
+        t.abort();
+    }
+    for (_, h) in handles {
+        h.shutdown().await;
+    }
+    Ok(())
+}
+
+/// A read pending on a leader that steps down is answered `NotLeader`, not
+/// left to time out — and never confirmed by acks of the old term.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pending_read_fails_when_its_leader_steps_down() -> Result<()> {
+    let mut handles = three_nodes();
+    let cut = Arc::new(std::sync::Mutex::new(BTreeSet::new()));
+    let router = spawn_router(&mut handles, cut.clone());
+    let old = await_leader_among(&handles, &[1, 2, 3], Duration::from_secs(10))
+        .await
+        .expect("no leader");
+    commit_on(&handles[&old], b"x").await?;
+
+    cut.lock().unwrap().insert(old);
+    let rest: Vec<NodeId> = (1..=3u32).filter(|id| *id != old).collect();
+    let new = await_leader_among(&handles, &rest, Duration::from_secs(10))
+        .await
+        .expect("no new leader");
+    commit_on(&handles[&new], b"y").await?;
+
+    let (reply, ()) = tokio::join!(
+        tokio::time::timeout(Duration::from_secs(5), handles[&old].read_index()),
+        async {
+            // Heal once the read is registered and its round is lost.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            cut.lock().unwrap().clear();
+        }
+    );
+    match reply.expect("the read was never answered")? {
+        ReadIndexReply::NotLeader { .. } => {}
+        other => panic!("a read from a deposed leader was confirmed: {other:?}"),
+    }
+
+    for t in router {
+        t.abort();
+    }
+    for (_, h) in handles {
+        h.shutdown().await;
+    }
+    Ok(())
+}

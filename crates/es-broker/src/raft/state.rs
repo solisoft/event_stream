@@ -74,6 +74,13 @@ pub struct RaftState {
     /// waiting for a client write.
     pub noop_on_elect: bool,
 
+    /// Latest read-index round handed out (§6.4). Never reset, so a round
+    /// number is never reused, not even across terms.
+    read_seq: u64,
+    /// Leader-only: the highest read round each peer has acknowledged in the
+    /// current term. Cleared on every change of role.
+    read_acks: BTreeMap<NodeId, u64>,
+
     votes_received: HashSet<NodeId>,
     pending: Vec<PersistOp>,
 }
@@ -143,6 +150,8 @@ impl RaftState {
             next_index: BTreeMap::new(),
             snapshot_cursor: BTreeMap::new(),
             noop_on_elect: false,
+            read_seq: 0,
+            read_acks: BTreeMap::new(),
             votes_received: HashSet::new(),
             pending: Vec::new(),
         }
@@ -310,6 +319,52 @@ impl RaftState {
         } else {
             Action::SendTo(peer, self.build_append_for(peer))
         }
+    }
+
+    // ---------- read index (dissertation §6.4) ----------
+
+    /// Start a read-index round: a new round number, and an AppendEntries to
+    /// every peer carrying it. The read may be served once
+    /// [`Self::read_confirmed_seq`] reaches the returned round and
+    /// [`Self::committed_in_current_term`] holds; its read index is the
+    /// commit index at that moment.
+    ///
+    /// Only answers sent for this round (or a later one) count. An answer to
+    /// an earlier AppendEntries may have been written before the read began,
+    /// and proves nothing about who led the cluster when it did. `None` when
+    /// not leader.
+    pub fn begin_read(&mut self) -> Option<(u64, Vec<Action>)> {
+        if self.role != Role::Leader {
+            return None;
+        }
+        self.read_seq += 1;
+        Some((self.read_seq, self.on_heartbeat_tick()))
+    }
+
+    /// The highest read round a majority (counting this leader) has
+    /// acknowledged in the current term: every read registered at or below
+    /// it was started while this node was still the leader a majority
+    /// followed. Zero when not leader.
+    pub fn read_confirmed_seq(&self) -> u64 {
+        if self.role != Role::Leader {
+            return 0;
+        }
+        let mut acks: Vec<u64> = self
+            .peers
+            .iter()
+            .map(|p| self.read_acks.get(p).copied().unwrap_or(0))
+            .collect();
+        acks.push(self.read_seq);
+        acks.sort_unstable();
+        acks[acks.len() - self.quorum()]
+    }
+
+    /// Whether this leader has committed an entry of its own term. Until it
+    /// has, its commit index may lag entries a previous leader committed, so
+    /// it cannot be a read index (§6.4 step 1; the election no-op is what
+    /// makes this hold one round trip after winning).
+    pub fn committed_in_current_term(&self) -> bool {
+        self.role == Role::Leader && self.log.term_at(self.commit_index) == Some(self.current_term)
     }
 
     // ---------- message handlers ----------
@@ -483,6 +538,7 @@ impl RaftState {
         self.role = Role::Follower;
         self.votes_received.clear();
         self.leader_hint = None;
+        self.read_acks.clear();
         self.match_index.clear();
         self.next_index.clear();
         self.snapshot_cursor.clear();
@@ -631,6 +687,7 @@ impl RaftState {
             success,
             responder_id: self.me,
             match_index,
+            read_seq: ae.read_seq,
         });
         let mut out = vec![Action::SendTo(ae.leader_id, resp)];
         // Any AppendEntries from the current leader proves it is alive, even
@@ -647,6 +704,12 @@ impl RaftState {
             return Vec::new();
         }
         let peer = aer.responder_id;
+        // Any answer in our term — a rejection included — shows the peer
+        // still followed us when it wrote it, which is all a read round asks.
+        if aer.read_seq > 0 {
+            let acked = self.read_acks.entry(peer).or_insert(0);
+            *acked = (*acked).max(aer.read_seq.min(self.read_seq));
+        }
         if aer.success {
             // Clamp a peer-reported match_index to our own last index — a peer
             // can't have replicated further than we've written.
@@ -762,6 +825,7 @@ impl RaftState {
     fn become_leader(&mut self) {
         self.role = Role::Leader;
         self.leader_hint = Some(self.me);
+        self.read_acks.clear();
         self.match_index.clear();
         self.next_index.clear();
         self.snapshot_cursor.clear();
@@ -791,6 +855,7 @@ impl RaftState {
             prev_log_term,
             entries,
             leader_commit: self.commit_index,
+            read_seq: self.read_seq,
         })
     }
 
@@ -887,6 +952,7 @@ mod tests {
                 payload: vec![],
             }],
             leader_commit: 0,
+            read_seq: 0,
         }));
         let rejected = actions.iter().any(|a| {
             matches!(
@@ -916,6 +982,7 @@ mod tests {
             success: true,
             responder_id: 2,
             match_index: 1,
+            read_seq: 0,
         }));
         assert_eq!(s.commit_index, 1);
     }
@@ -951,6 +1018,7 @@ mod tests {
             prev_log_term: 1,
             entries: vec![],
             leader_commit: 3,
+            read_seq: 0,
         }));
         let mi = actions
             .iter()
@@ -974,6 +1042,7 @@ mod tests {
             success: true,
             responder_id: 2,
             match_index: 1,
+            read_seq: 0,
         }));
         assert!(
             actions.iter().all(|a| !matches!(a, Action::SendTo(2, _))),
@@ -1023,6 +1092,7 @@ mod tests {
             prev_log_term: 0,
             entries: vec![],
             leader_commit: 0,
+            read_seq: 0,
         })
     }
 
@@ -1112,6 +1182,121 @@ mod tests {
         assert_eq!(s.match_index.get(&2), Some(&1));
         assert_eq!(s.next_index.get(&2), Some(&2));
         assert!(!s.snapshot_cursor.contains_key(&2));
+    }
+
+    fn ack(term: Term, from: NodeId, match_index: LogIndex, read_seq: u64) -> Message {
+        Message::AppendEntriesResp(AppendEntriesResp {
+            term,
+            success: true,
+            responder_id: from,
+            match_index,
+            read_seq,
+        })
+    }
+
+    /// A leader of {1, 2, 3} that has committed an entry of its term.
+    fn ready_leader() -> RaftState {
+        let mut s = leader_of_three();
+        let _ = s.try_propose(b"a".to_vec());
+        s.on_message(ack(s.current_term, 2, 1, 0));
+        assert!(s.committed_in_current_term());
+        s
+    }
+
+    #[test]
+    fn a_read_round_is_confirmed_by_a_majority_of_its_own_acks() {
+        let mut s = ready_leader();
+        let term = s.current_term;
+        let (seq, actions) = s.begin_read().expect("leader");
+        assert_eq!(seq, 1);
+        // The round goes out at once, to every peer, carrying its number.
+        for peer in [2, 3] {
+            assert!(
+                actions.iter().any(|a| matches!(a,
+                    Action::SendTo(p, Message::AppendEntries(ae)) if *p == peer && ae.read_seq == seq)),
+                "{actions:?}"
+            );
+        }
+        assert_eq!(s.read_confirmed_seq(), 0, "the leader alone is no majority");
+
+        // An answer to an AppendEntries sent before the read began does not
+        // count, however recent it is.
+        s.on_message(ack(term, 2, 1, 0));
+        assert_eq!(s.read_confirmed_seq(), 0);
+
+        // A rejection still shows the peer follows us.
+        s.on_message(Message::AppendEntriesResp(AppendEntriesResp {
+            term,
+            success: false,
+            responder_id: 3,
+            match_index: 0,
+            read_seq: seq,
+        }));
+        assert_eq!(s.read_confirmed_seq(), seq);
+
+        // A later round needs its own acks; the earlier one stays confirmed.
+        let (seq2, _) = s.begin_read().unwrap();
+        assert_eq!(s.read_confirmed_seq(), seq);
+        s.on_message(ack(term, 2, 1, seq2));
+        assert_eq!(s.read_confirmed_seq(), seq2);
+    }
+
+    #[test]
+    fn read_acks_from_another_term_or_beyond_the_round_do_not_count() {
+        let mut s = ready_leader();
+        let term = s.current_term;
+        let (seq, _) = s.begin_read().unwrap();
+        // A forged round far ahead is clamped to the rounds really issued.
+        s.on_message(ack(term, 2, 1, u64::MAX));
+        assert_eq!(s.read_confirmed_seq(), seq);
+        let (seq2, _) = s.begin_read().unwrap();
+        assert_eq!(s.read_confirmed_seq(), seq, "{seq2} was never acked");
+
+        // A newer term deposes the leader and forgets every ack.
+        s.on_message(ack(term + 1, 3, 0, seq2));
+        assert_eq!(s.role, Role::Follower);
+        assert!(s.begin_read().is_none());
+        assert_eq!(s.read_confirmed_seq(), 0);
+        assert!(!s.committed_in_current_term());
+    }
+
+    #[test]
+    fn a_new_leader_is_not_read_ready_until_it_commits_in_its_term() {
+        let mut s = leader_of_three();
+        let (seq, _) = s.begin_read().unwrap();
+        s.on_message(ack(s.current_term, 2, 0, seq));
+        assert_eq!(s.read_confirmed_seq(), seq);
+        assert!(
+            !s.committed_in_current_term(),
+            "its commit index may still lag what the previous leader committed"
+        );
+    }
+
+    #[test]
+    fn a_single_node_confirms_its_own_reads() {
+        let mut s = n(1, &[]);
+        s.noop_on_elect = true;
+        s.on_election_timeout();
+        let (seq, actions) = s.begin_read().unwrap();
+        assert!(actions.is_empty());
+        assert_eq!(s.read_confirmed_seq(), seq);
+        assert!(s.committed_in_current_term());
+    }
+
+    #[test]
+    fn followers_echo_the_read_round() {
+        let mut f = n(2, &[1, 3]);
+        let actions = f.on_message(Message::AppendEntries(AppendEntries {
+            term: 1,
+            leader_id: 1,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![],
+            leader_commit: 0,
+            read_seq: 42,
+        }));
+        assert!(actions.iter().any(|a| matches!(a,
+            Action::SendTo(1, Message::AppendEntriesResp(r)) if r.read_seq == 42)));
     }
 
     #[test]

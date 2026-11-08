@@ -8,7 +8,7 @@ use anyhow::Result;
 use es_broker::partition_handle::{PartitionHandle, RaftConfig};
 use es_broker::raft::Timing;
 use es_broker::raft_partition::{
-    test_timing, RaftPartition, RaftPartitionConfig, RaftTransportConfig,
+    test_timing, RaftPartition, RaftPartitionConfig, RaftTransportConfig, ReadBarrierError,
 };
 use tempfile::TempDir;
 
@@ -418,7 +418,53 @@ async fn two_node_tcp_replication() -> Result<()> {
         assert_eq!(records[i + 1].value, format!("v{}", i).into_bytes());
     }
 
+    // Linearizable reads (Bonfire #732): the leader confirms with the
+    // follower and serves; the follower refuses and names the leader.
+    leader.read_barrier(Duration::from_secs(5)).await?;
+    let leader_id = leader.raft_state().lock().await.me;
+    assert_eq!(
+        follower.read_barrier(Duration::from_secs(5)).await,
+        Err(ReadBarrierError::NotLeader {
+            leader_hint: Some(leader_id)
+        })
+    );
+
     rp1.shutdown().await;
     rp2.shutdown().await;
+    Ok(())
+}
+
+/// A linearizable read right after a write sees it: the barrier returns
+/// only once the partition has applied through the read index.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_barrier_sees_a_just_acknowledged_write() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let rp = RaftPartition::open(
+        tmp.path().join("p0"),
+        0,
+        1 << 20,
+        1,
+        RaftPartitionConfig {
+            node_id: 1,
+            peers: vec![],
+            raft_store_path: tmp.path().join("raft.json"),
+            timing: test_timing(),
+            snapshot_after_applies: 0,
+        },
+    )?;
+    // Poll until the single node has elected itself and serves a barrier.
+    let give_up = std::time::Instant::now() + Duration::from_secs(5);
+    while rp.read_barrier(Duration::from_millis(200)).await.is_err() {
+        anyhow::ensure!(std::time::Instant::now() < give_up, "never became leader");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    for i in 0..10u64 {
+        let off = rp.append(None, format!("v{i}").as_bytes()).await?;
+        rp.read_barrier(Duration::from_secs(5)).await?;
+        let (records, _, hwm) = rp.partition().read_records_raw(off, 1, 1 << 20)?;
+        assert_eq!(hwm, off + 1);
+        assert_eq!(records[0].value, format!("v{i}").into_bytes());
+    }
+    rp.shutdown().await;
     Ok(())
 }

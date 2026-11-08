@@ -43,6 +43,13 @@ impl AppError {
     pub fn too_many_requests(msg: impl Into<String>) -> Self {
         Self::new(StatusCode::TOO_MANY_REQUESTS, msg)
     }
+    /// Retryable: `503` with `Retry-After: 1`.
+    pub fn unavailable(msg: impl Into<String>) -> Self {
+        Self {
+            retry_after: Some(1.0),
+            ..Self::new(StatusCode::SERVICE_UNAVAILABLE, msg)
+        }
+    }
 
     /// A server-side failure. The detail (file paths, io errors, anyhow
     /// chains) goes to the log; the client gets a generic message and an id
@@ -68,11 +75,7 @@ impl From<DataError> for AppError {
                 retry_after: Some(s),
                 ..Self::too_many_requests(format!("rate limit exceeded; retry in {:.1}s", s))
             },
-            // Retryable: 503, with a hint to come back shortly.
-            DataError::Unavailable(m) => Self {
-                retry_after: Some(1.0),
-                ..Self::new(StatusCode::SERVICE_UNAVAILABLE, m)
-            },
+            DataError::Unavailable(m) => Self::unavailable(m),
             DataError::Internal(e) => Self::from(e),
         }
     }

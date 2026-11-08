@@ -18,8 +18,9 @@ use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use es_protocol::wire::{
-    decode_consume_response, decode_produce_response, encode_consume_request,
-    encode_produce_request, HandshakeStatus, Opcode, WireProduceRequest, FEATURE_GZIP, WIRE_MAGIC,
+    decode_consume_response, decode_produce_response, encode_consume_request_with_flags,
+    encode_produce_request, HandshakeStatus, Opcode, WireProduceRequest, CONSUME_FLAG_LINEARIZABLE,
+    FEATURE_CONSUME_FLAGS, FEATURE_GZIP, WIRE_MAGIC,
 };
 pub use es_protocol::wire::{
     WireConsumeRequest, WireConsumeResponse, WireProduceRecord, WireProduceResult, WireRecord,
@@ -58,6 +59,15 @@ impl Error {
     /// Whether the connection can carry another request after this error.
     pub fn connection_usable(&self) -> bool {
         matches!(self, Error::Server(_) | Error::Invalid(_))
+    }
+
+    /// Whether the same request may succeed if sent again: the broker was
+    /// rate limiting, or could not serve it now (`unavailable:` — a
+    /// linearizable read sent to a follower, or whose leader could not
+    /// confirm its leadership in time; the message names the leader when it
+    /// is known).
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, Error::Server(m) if m.starts_with("unavailable:") || m.starts_with("rate limited:"))
     }
 }
 
@@ -215,6 +225,8 @@ pub struct Client {
     stream: Stream,
     next_request_id: u32,
     gzip: bool,
+    /// Whether the server understands consume flags.
+    consume_flags: bool,
 }
 
 impl Client {
@@ -252,13 +264,14 @@ impl Client {
         #[cfg(not(feature = "tls"))]
         let mut stream = Stream::Plain(sock);
 
-        let gzip = handshake(&mut stream, &options.token, options.gzip)?;
+        let features = handshake(&mut stream, &options.token, options.gzip)?;
         stream.tcp().set_read_timeout(options.io_timeout)?;
         stream.tcp().set_write_timeout(options.io_timeout)?;
         Ok(Self {
             stream,
             next_request_id: 1,
-            gzip,
+            gzip: features & FEATURE_GZIP != 0,
+            consume_flags: features & FEATURE_CONSUME_FLAGS != 0,
         })
     }
 
@@ -344,7 +357,41 @@ impl Client {
     /// Read from `request.partition` of `request.topic`, starting at
     /// `request.offset`.
     pub fn consume(&mut self, request: &WireConsumeRequest) -> Result<WireConsumeResponse> {
-        let payload = encode_consume_request(request).map_err(|e| Error::Invalid(e.to_string()))?;
+        self.consume_with_flags(request, 0)
+    }
+
+    /// [`Self::consume`], linearizable: the response reflects every write
+    /// acknowledged before the call. The broker must be the partition's
+    /// leader; a follower, or a leader that cannot confirm its leadership in
+    /// time, answers with a retryable error ([`Error::is_retryable`]).
+    ///
+    /// A broker older than 0.3 would ignore the request's flag and serve a
+    /// plain read, so against one this fails with [`Error::Invalid`] and
+    /// sends nothing.
+    pub fn consume_linearizable(
+        &mut self,
+        request: &WireConsumeRequest,
+    ) -> Result<WireConsumeResponse> {
+        if !self.consume_flags {
+            return Err(Error::Invalid(
+                "the broker does not support linearizable reads".to_string(),
+            ));
+        }
+        self.consume_with_flags(request, CONSUME_FLAG_LINEARIZABLE)
+    }
+
+    /// Whether the broker supports [`Self::consume_linearizable`].
+    pub fn supports_linearizable_reads(&self) -> bool {
+        self.consume_flags
+    }
+
+    fn consume_with_flags(
+        &mut self,
+        request: &WireConsumeRequest,
+        flags: u8,
+    ) -> Result<WireConsumeResponse> {
+        let payload = encode_consume_request_with_flags(request, flags)
+            .map_err(|e| Error::Invalid(e.to_string()))?;
         match self.round_trip(Opcode::Consume, &payload)? {
             (Opcode::ConsumeOk, body) => {
                 decode_consume_response(&body).map_err(|e| Error::Protocol(e.to_string()))
@@ -391,8 +438,10 @@ fn unexpected<T>(op: Opcode, body: &[u8]) -> Result<T> {
     }
 }
 
-fn handshake(stream: &mut Stream, token: &str, want_gzip: bool) -> Result<bool> {
-    let requested: u32 = if want_gzip { FEATURE_GZIP } else { 0 };
+/// Returns the feature bits the server agreed to.
+fn handshake(stream: &mut Stream, token: &str, want_gzip: bool) -> Result<u32> {
+    // Consume flags cost nothing unused, so they are always asked for.
+    let requested: u32 = FEATURE_CONSUME_FLAGS | if want_gzip { FEATURE_GZIP } else { 0 };
     let token = token.as_bytes();
     let token_len =
         u32::try_from(token.len()).map_err(|_| Error::Protocol("token too long".to_string()))?;
@@ -427,7 +476,7 @@ fn handshake(stream: &mut Stream, token: &str, want_gzip: bool) -> Result<bool> 
             message: String::from_utf8_lossy(&msg).into_owned(),
         });
     }
-    Ok(want_gzip && features & FEATURE_GZIP != 0)
+    Ok(features & requested)
 }
 
 /// `len | request_id | opcode | payload`.
