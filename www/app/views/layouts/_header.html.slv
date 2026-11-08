@@ -10,6 +10,6 @@
       <a href="<%= docs_api_path() %>" <% if current == "api" %>aria-current="page"<% end %>>HTTP API</a>
       <a href="<%= docs_cluster_path() %>" <% if current == "cluster" %>aria-current="page"<% end %>>Clustering</a>
     </nav>
-    <span class="version">v0.2.0</span>
+    <span class="version">v0.2.1</span>
   </div>
 </header>

@@ -390,7 +390,7 @@ dependencies = [
 
 [[package]]
 name = "es-broker"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -426,7 +426,7 @@ dependencies = [
 
 [[package]]
 name = "es-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -439,14 +439,14 @@ dependencies = [
 
 [[package]]
 name = "es-protocol"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "es-tools"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "clap",
