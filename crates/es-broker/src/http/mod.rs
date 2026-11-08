@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod admin_keys;
 pub mod admin_producers;
+pub mod admin_raft;
 pub mod admin_tiered;
 pub mod auth_ext;
 pub mod consume;
@@ -62,6 +63,11 @@ pub fn router(broker: Arc<Broker>) -> Router {
         .route("/groups/:group/assignment", get(coord::assignment))
         .route("/admin/run-retention", post(admin::run_retention))
         .route("/admin/run-compaction", post(admin::run_compaction))
+        .route(
+            "/admin/raft/members",
+            get(admin_raft::list).post(admin_raft::add),
+        )
+        .route("/admin/raft/members/:id", delete(admin_raft::remove))
         .route(
             "/admin/keys",
             get(admin_keys::list).post(admin_keys::create),

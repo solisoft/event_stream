@@ -12,6 +12,8 @@
 
 use std::io;
 
+use super::membership::Membership;
+
 pub const TAG_REQUEST_VOTE: u8 = 0x01;
 pub const TAG_REQUEST_VOTE_RESP: u8 = 0x02;
 pub const TAG_APPEND_ENTRIES: u8 = 0x03;
@@ -51,6 +53,12 @@ pub struct AppendEntries {
     pub prev_log_term: Term,
     pub entries: Vec<LogEntry>,
     pub leader_commit: LogIndex,
+    /// The leader's latest read-index round (dissertation §6.4), echoed back
+    /// in the response. A response carrying round `n` proves the follower
+    /// still followed this leader after every read registered up to round
+    /// `n` began. Zero when no read is in flight, and on the wire an optional
+    /// trailing field: a node that predates it neither sends nor reads it.
+    pub read_seq: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +70,9 @@ pub struct AppendEntriesResp {
     /// the leader (`prev_log_index + entries.len()`). On failure: the
     /// follower's last log index, a hint for where the leader should back up to.
     pub match_index: LogIndex,
+    /// [`AppendEntries::read_seq`] of the request this answers. Optional
+    /// trailing field on the wire, zero when absent.
+    pub read_seq: u64,
 }
 
 /// One chunk of a snapshot transfer.
@@ -80,6 +91,11 @@ pub struct InstallSnapshot {
     pub offset: u64,
     pub done: bool,
     pub data: Vec<u8>,
+    /// The group's voters as of `last_index`: the configuration a follower
+    /// must adopt with the snapshot, because the config entries it covers are
+    /// no longer in the leader's log. Trails the message on the wire, so a 0.2
+    /// node ignores it and a 0.2 leader simply sends none.
+    pub members: Option<Membership>,
 }
 
 /// `InstallSnapshot::offset` of a probe.
@@ -183,6 +199,7 @@ impl Message {
                     buf.extend_from_slice(&e.payload);
                 }
                 buf.extend_from_slice(&m.leader_commit.to_be_bytes());
+                buf.extend_from_slice(&m.read_seq.to_be_bytes());
             }
             Self::AppendEntriesResp(m) => {
                 buf.push(TAG_APPEND_ENTRIES_RESP);
@@ -190,6 +207,7 @@ impl Message {
                 buf.push(if m.success { 1 } else { 0 });
                 buf.extend_from_slice(&m.responder_id.to_be_bytes());
                 buf.extend_from_slice(&m.match_index.to_be_bytes());
+                buf.extend_from_slice(&m.read_seq.to_be_bytes());
             }
             Self::InstallSnapshot(m) => {
                 buf.push(TAG_INSTALL_SNAPSHOT);
@@ -201,6 +219,9 @@ impl Message {
                 buf.push(if m.done { 1 } else { 0 });
                 buf.extend_from_slice(&(m.data.len() as u32).to_be_bytes());
                 buf.extend_from_slice(&m.data);
+                if let Some(members) = &m.members {
+                    members.encode(&mut buf);
+                }
             }
             Self::InstallSnapshotResp(m) => {
                 buf.push(TAG_INSTALL_SNAPSHOT_RESP);
@@ -253,6 +274,7 @@ impl Message {
                     });
                 }
                 let leader_commit = r.u64()?;
+                let read_seq = r.trailing_u64()?;
                 Ok(Self::AppendEntries(AppendEntries {
                     term,
                     leader_id,
@@ -260,6 +282,7 @@ impl Message {
                     prev_log_term,
                     entries,
                     leader_commit,
+                    read_seq,
                 }))
             }
             TAG_APPEND_ENTRIES_RESP => Ok(Self::AppendEntriesResp(AppendEntriesResp {
@@ -267,6 +290,7 @@ impl Message {
                 success: r.u8()? != 0,
                 responder_id: r.u32()?,
                 match_index: r.u64()?,
+                read_seq: r.trailing_u64()?,
             })),
             TAG_INSTALL_SNAPSHOT => {
                 let term = r.u64()?;
@@ -277,6 +301,13 @@ impl Message {
                 let done = r.u8()? != 0;
                 let data_len = r.u32()? as usize;
                 let data = r.bytes(data_len)?;
+                let members = if r.remaining() > 0 {
+                    Some(Membership::decode(&r.bytes[r.pos..]).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "bad snapshot membership")
+                    })?)
+                } else {
+                    None
+                };
                 Ok(Self::InstallSnapshot(InstallSnapshot {
                     term,
                     leader_id,
@@ -285,6 +316,7 @@ impl Message {
                     offset,
                     done,
                     data,
+                    members,
                 }))
             }
             TAG_INSTALL_SNAPSHOT_RESP => Ok(Self::InstallSnapshotResp(InstallSnapshotResp {
@@ -343,6 +375,16 @@ impl<'a> Reader<'a> {
         self.pos += 8;
         Ok(v)
     }
+    /// A field added after the message's first version: absent (zero) when
+    /// the sender predates it. Older decoders ignore trailing bytes, which is
+    /// what makes adding one compatible in both directions.
+    fn trailing_u64(&mut self) -> io::Result<u64> {
+        if self.remaining() == 0 {
+            Ok(0)
+        } else {
+            self.u64()
+        }
+    }
     fn bytes(&mut self, n: usize) -> io::Result<Vec<u8>> {
         self.ensure(n)?;
         let v = self.bytes[self.pos..self.pos + n].to_vec();
@@ -396,6 +438,7 @@ mod tests {
                 },
             ],
             leader_commit: 5,
+            read_seq: 9,
         });
         let bytes = m.encode();
         let back = Message::decode(&bytes).unwrap();
@@ -405,8 +448,82 @@ mod tests {
                 assert_eq!(v.entries.len(), 2);
                 assert_eq!(v.entries[0].payload, vec![0xAB, 0xCD]);
                 assert_eq!(v.entries[1].payload.len(), 0);
+                assert_eq!(v.read_seq, 9);
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    /// A node that predates read-index sends neither trailing field; a new
+    /// node reads them as zero, and an old node reading a new message stops
+    /// before them.
+    #[test]
+    fn read_seq_is_an_optional_trailing_field() {
+        let ae = Message::AppendEntries(AppendEntries {
+            term: 2,
+            leader_id: 1,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![],
+            leader_commit: 3,
+            read_seq: 7,
+        });
+        let resp = Message::AppendEntriesResp(AppendEntriesResp {
+            term: 2,
+            success: true,
+            responder_id: 2,
+            match_index: 3,
+            read_seq: 7,
+        });
+        for m in [ae, resp] {
+            let new = m.encode();
+            let old = &new[..new.len() - 8];
+            match Message::decode(old).unwrap() {
+                Message::AppendEntries(v) => {
+                    assert_eq!((v.leader_commit, v.read_seq), (3, 0))
+                }
+                Message::AppendEntriesResp(v) => {
+                    assert_eq!((v.match_index, v.read_seq), (3, 0))
+                }
+                _ => panic!("wrong variant"),
+            }
+            // A truncated trailing field is still an error, not a zero.
+            assert!(Message::decode(&new[..new.len() - 3]).is_err());
+        }
+    }
+
+    fn snapshot(members: Option<Membership>) -> Message {
+        Message::InstallSnapshot(InstallSnapshot {
+            term: 3,
+            leader_id: 1,
+            last_index: 40,
+            last_term: 2,
+            offset: 0,
+            done: true,
+            data: b"end".to_vec(),
+            members,
+        })
+    }
+
+    #[test]
+    fn install_snapshot_carries_its_membership() {
+        let mut m = Membership::new([1, 2]);
+        m.voters.insert(4, "10.0.0.4:6000".into());
+        match Message::decode(&snapshot(Some(m.clone())).encode()).unwrap() {
+            Message::InstallSnapshot(is) => {
+                assert_eq!(is.members, Some(m));
+                assert_eq!(is.data, b"end");
+            }
+            _ => panic!("wrong variant"),
+        }
+        // From a 0.2 leader: nothing trails the data.
+        match Message::decode(&snapshot(None).encode()).unwrap() {
+            Message::InstallSnapshot(is) => assert_eq!(is.members, None),
+            _ => panic!("wrong variant"),
+        }
+        // A trailing membership that does not parse is refused, not ignored.
+        let mut bad = snapshot(None).encode();
+        bad.extend_from_slice(&[0, 0, 0, 9]);
+        assert!(Message::decode(&bad).is_err());
     }
 }

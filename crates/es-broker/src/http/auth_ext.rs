@@ -3,6 +3,7 @@ use std::sync::Arc;
 use axum::async_trait;
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
+use axum::http::HeaderMap;
 
 use crate::auth::{ApiKey, AuthMode, ANONYMOUS_ADMIN};
 use crate::broker::Broker;
@@ -22,7 +23,7 @@ impl FromRequestParts<Arc<Broker>> for AuthedKey {
         match broker.config.auth_mode {
             AuthMode::Disabled => Ok(AuthedKey(ANONYMOUS_ADMIN.clone())),
             AuthMode::Required => {
-                let token = extract_bearer(parts)?;
+                let token = extract_bearer(&parts.headers)?;
                 let key = broker
                     .keys
                     .authenticate(&token)
@@ -33,8 +34,10 @@ impl FromRequestParts<Arc<Broker>> for AuthedKey {
     }
 }
 
-fn extract_bearer(parts: &Parts) -> Result<String, AppError> {
-    if let Some(v) = parts.headers.get("authorization") {
+/// The credential a request presents, as `Authorization: Bearer` or
+/// `X-Es-Key`.
+pub(crate) fn extract_bearer(headers: &HeaderMap) -> Result<String, AppError> {
+    if let Some(v) = headers.get("authorization") {
         let s = v
             .to_str()
             .map_err(|_| AppError::unauthorized("invalid Authorization header encoding"))?;
@@ -45,7 +48,7 @@ fn extract_bearer(parts: &Parts) -> Result<String, AppError> {
             "Authorization header must use Bearer scheme",
         ));
     }
-    if let Some(v) = parts.headers.get("x-es-key") {
+    if let Some(v) = headers.get("x-es-key") {
         return Ok(v
             .to_str()
             .map_err(|_| AppError::unauthorized("invalid X-Es-Key header encoding"))?

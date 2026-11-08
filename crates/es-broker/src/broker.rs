@@ -11,7 +11,7 @@ use crate::config::Config;
 use crate::coord::GroupCoordinator;
 use crate::groups::GroupStore;
 use crate::producers::ProducerRegistry;
-use crate::raft::RaftHub;
+use crate::raft::{HubOptions, RaftHub, RaftTls};
 use crate::schema::SchemaStore;
 use crate::tiered_storage::TieredStore;
 use crate::topic::{Topic, TopicConfig};
@@ -30,10 +30,16 @@ pub struct Broker {
     pub schemas: Arc<SchemaStore>,
     pub tiered_store: Option<Arc<dyn TieredStore>>,
     pub shutdown: CancellationToken,
+    /// Sends a produce on to the partition's leader. `None` when no peer API
+    /// address is configured.
+    pub forwarder: Option<Arc<crate::forward::Forwarder>>,
     background: Mutex<Vec<JoinHandle<()>>>,
     /// The shared Raft transport, once `start_raft` has bound it. `None` on a
     /// broker that is not a cluster member.
     raft_hub: Mutex<Option<Arc<RaftHub>>>,
+    /// Held while `/admin/raft/members` applies a change, so two requests
+    /// to this broker cannot interleave theirs across partitions.
+    pub membership_lock: tokio::sync::Mutex<()>,
 }
 
 impl Broker {
@@ -88,6 +94,8 @@ impl Broker {
                 store
             });
 
+        let forwarder = crate::forward::Forwarder::from_config(&config)?.map(Arc::new);
+
         Ok(Arc::new(Self {
             config,
             topics,
@@ -98,8 +106,10 @@ impl Broker {
             schemas,
             tiered_store,
             shutdown: CancellationToken::new(),
+            forwarder,
             background: Mutex::new(Vec::new()),
             raft_hub: Mutex::new(None),
+            membership_lock: tokio::sync::Mutex::new(()),
         }))
     }
 
@@ -116,12 +126,25 @@ impl Broker {
             _ => return Ok(()),
         };
 
-        let hub = RaftHub::bind(
+        let tls = match self.config.raft_tls() {
+            Some((cert, key, ca)) => Some(Arc::new(
+                RaftTls::from_pem_files(node_id, cert, key, ca)
+                    .context("load the raft mTLS identity")?,
+            )),
+            None => None,
+        };
+        let options = HubOptions {
+            shared_secret: self.config.raft_shared_secret.clone(),
+            tls,
+            legacy_handshake: self.config.raft_legacy_handshake,
+            ..HubOptions::default()
+        };
+        let hub = RaftHub::bind_with_options(
             node_id,
             bind,
             self.config.raft_peer_addrs.clone(),
             RAFT_RECONNECT_BACKOFF,
-            self.config.raft_shared_secret.clone(),
+            options,
         )
         .await
         .with_context(|| format!("bind the raft transport on {bind}"))?;
@@ -140,8 +163,23 @@ impl Broker {
         Ok(())
     }
 
-    fn raft_hub(&self) -> Option<Arc<RaftHub>> {
+    pub fn raft_hub(&self) -> Option<Arc<RaftHub>> {
         self.raft_hub.lock().unwrap().clone()
+    }
+
+    /// The broker config with the hub's live membership in place of
+    /// `--raft-peer` and `--raft-join`, once a group has reported one.
+    fn live_raft_config(&self) -> Option<Config> {
+        let hub = self.raft_hub()?;
+        let voter = hub.is_voter()?;
+        let mut config = (*self.config).clone();
+        config.raft_peer_addrs = hub
+            .members()
+            .into_iter()
+            .filter_map(|(id, addr)| addr.map(|a| (id, a)))
+            .collect();
+        config.raft_join = !voter;
+        Some(config)
     }
 
     /// Spawn the retention reaper, the compactor, and the producer-state flusher.
@@ -197,11 +235,15 @@ impl Broker {
         if self.topics.contains_key(name) {
             return Err(anyhow!("topic '{}' already exists", name));
         }
+        // A topic created after a membership change starts from the current
+        // membership, not the one on the command line: its groups would
+        // otherwise count a removed broker, or leave out an added one.
+        let live = self.live_raft_config();
         let topic = Topic::create(
             &topics_root(&self.config.data_dir),
             name,
             partitions,
-            &self.config,
+            live.as_ref().unwrap_or(self.config.as_ref()),
             patch,
         )?;
         // Topics are created while the broker is running, so a new one has to
@@ -246,6 +288,11 @@ impl Broker {
             .topics
             .remove(name)
             .ok_or_else(|| anyhow!("topic '{}' not found", name))?;
+        // Out of every group's subscription first, so the coordinator stops
+        // handing out its partitions while the files are still being removed.
+        // Done after the map removal: a join re-checks the topic under the
+        // group lock, so none can slip it back in once this has run.
+        self.coordinator.purge_topic(self, name).await;
         if let Some(hub) = self.raft_hub() {
             topic.detach_raft(&hub);
         }

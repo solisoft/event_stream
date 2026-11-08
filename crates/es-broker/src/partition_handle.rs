@@ -10,7 +10,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::partition::{AppendRecord, Durability, Partition};
 use crate::raft::{RaftHub, Timing};
-use crate::raft_partition::{RaftPartition, RaftPartitionConfig, RaftTransportConfig};
+use crate::raft_partition::{
+    Leadership, RaftPartition, RaftPartitionConfig, RaftTransportConfig, ReadBarrierError,
+};
 use crate::storage::record::Record;
 use crate::storage::segment::Segment;
 use es_protocol::RecordDto;
@@ -22,6 +24,9 @@ pub struct RaftConfig {
     pub raft_store_dir: PathBuf,
     pub timing: Timing,
     pub snapshot_after_applies: u32,
+    /// Start outside the group's configuration, waiting to be added
+    /// (`--raft-join`).
+    pub joining: bool,
     pub bind: Option<SocketAddr>,
     pub peer_addrs: BTreeMap<crate::raft::NodeId, SocketAddr>,
     /// Pre-shared secret peers must present in the raft handshake.
@@ -36,6 +41,7 @@ impl Default for RaftConfig {
             raft_store_dir: PathBuf::from("."),
             timing: Timing::default(),
             snapshot_after_applies: 1024,
+            joining: false,
             bind: None,
             peer_addrs: BTreeMap::new(),
             shared_secret: None,
@@ -254,6 +260,7 @@ impl PartitionHandle {
                     raft_store_path: cfg.raft_store_dir.join(id.to_string()),
                     timing: cfg.timing,
                     snapshot_after_applies: cfg.snapshot_after_applies,
+                    joining: cfg.joining,
                 };
                 RaftPartition::open(dir, id, segment_bytes, flush_every_records, raft_cfg)
                     .map(Self::Raft)
@@ -274,6 +281,24 @@ impl PartitionHandle {
         match self {
             Self::Plain(_) => Ok(()),
             Self::Raft(p) => p.attach_to_hub(hub, group),
+        }
+    }
+
+    /// Who leads this partition. A plain partition is always written here.
+    pub async fn leadership(&self) -> Leadership {
+        match self {
+            Self::Plain(_) => Leadership::Local,
+            Self::Raft(p) => p.leadership().await,
+        }
+    }
+
+    /// Make the next read of this partition linearizable (see
+    /// [`RaftPartition::read_barrier`]). A plain partition has one copy, and
+    /// a write is in it before it is acknowledged, so every read already is.
+    pub async fn read_barrier(&self, timeout: Duration) -> Result<(), ReadBarrierError> {
+        match self {
+            Self::Plain(_) => Ok(()),
+            Self::Raft(p) => p.read_barrier(timeout).await,
         }
     }
 

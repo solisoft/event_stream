@@ -149,6 +149,47 @@ struct Args {
     /// address cannot be declared.
     #[arg(long = "raft-peer", value_parser = parse_raft_peer)]
     raft_peers: Vec<(u32, SocketAddr)>,
+
+    /// A peer's client-facing HTTP API, as `<node-id>=<http(s)://host:port>`.
+    /// Repeat once per peer. A produce sent to a follower is forwarded there
+    /// when that peer leads the partition; without it, the produce fails with
+    /// a retryable "not leader" error. Must be https when this broker serves
+    /// TLS.
+    #[arg(long = "raft-peer-api", value_parser = parse_raft_peer_api)]
+    raft_peer_apis: Vec<(u32, String)>,
+
+    /// PEM file of the certificate authorities trusted when forwarding to an
+    /// https peer API. Without it, the public web roots are trusted.
+    #[arg(long)]
+    raft_peer_api_ca: Option<PathBuf>,
+
+    /// This broker's Raft certificate (PEM, leaf first). It must name the broker
+    /// as subjectAltName DNS:es-node-<id> and allow serverAuth and clientAuth.
+    /// With --raft-tls-key and --raft-tls-ca, every Raft connection is mutual
+    /// TLS and a member can no longer act as another.
+    #[arg(long, requires_all = ["raft_tls_key", "raft_tls_ca"])]
+    raft_tls_cert: Option<PathBuf>,
+
+    /// Private key for --raft-tls-cert (PEM).
+    #[arg(long, requires_all = ["raft_tls_cert", "raft_tls_ca"])]
+    raft_tls_key: Option<PathBuf>,
+
+    /// CA certificate(s) that sign every member's Raft certificate (PEM).
+    #[arg(long, requires_all = ["raft_tls_cert", "raft_tls_key"])]
+    raft_tls_ca: Option<PathBuf>,
+
+    /// Accept the 0.2 Raft handshake, and use it to reach brokers still on 0.2.
+    /// Only while upgrading a cluster from 0.2.1 one broker at a time; remove it
+    /// once every member runs 0.3. Deprecated: removed in 0.4.
+    #[arg(long)]
+    raft_legacy_handshake: bool,
+
+    /// Join a running cluster: start outside its membership, with --raft-peer
+    /// naming the current members, and wait to be added with
+    /// `POST /admin/raft/members` on the leaders. Without it a new broker counts
+    /// itself a voter from the start, and campaigns.
+    #[arg(long)]
+    raft_join: bool,
 }
 
 /// A secret as clap received it. Kept opaque until it is checked, so neither
@@ -185,6 +226,19 @@ fn parse_raft_peer(s: &str) -> Result<(u32, SocketAddr), String> {
         .parse()
         .map_err(|_| format!("'{addr}' is not a host:port address"))?;
     Ok((id, addr))
+}
+
+/// Parse `<node-id>=<http(s)://host:port>`. The URL itself is checked by
+/// `Config::validate_raft`, with the rest of the cluster settings.
+fn parse_raft_peer_api(s: &str) -> Result<(u32, String), String> {
+    let (id, url) = s
+        .split_once('=')
+        .ok_or_else(|| format!("expected <node-id>=<http(s)://host:port>, got '{s}'"))?;
+    let id: u32 = id
+        .trim()
+        .parse()
+        .map_err(|_| format!("'{id}' is not a node id"))?;
+    Ok((id, url.trim().trim_end_matches('/').to_string()))
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -304,6 +358,11 @@ async fn main() -> Result<()> {
     };
     config.raft_node_id = args.raft_node_id;
     config.raft_bind = args.raft_bind;
+    config.raft_tls_cert = args.raft_tls_cert;
+    config.raft_tls_key = args.raft_tls_key;
+    config.raft_tls_ca = args.raft_tls_ca;
+    config.raft_legacy_handshake = args.raft_legacy_handshake;
+    config.raft_join = args.raft_join;
     for (id, addr) in args.raft_peers {
         if let Some(prev) = config.raft_peer_addrs.insert(id, addr) {
             anyhow::bail!(
@@ -311,6 +370,14 @@ async fn main() -> Result<()> {
             );
         }
     }
+    for (id, url) in args.raft_peer_apis {
+        if let Some(prev) = config.raft_peer_apis.insert(id, url.clone()) {
+            anyhow::bail!(
+                "--raft-peer-api {id} was given twice ({prev} then {url}); one address per peer"
+            );
+        }
+    }
+    config.raft_peer_api_ca = args.raft_peer_api_ca;
     // Refuse here rather than at the first append: a broker that got its
     // cluster settings wrong must not reach the point of accepting writes.
     config.validate_raft()?;
@@ -327,10 +394,11 @@ async fn main() -> Result<()> {
              record data are sent unencrypted. Restrict it to a trusted network."
         );
     }
-    if config.raft_node_id.is_some() {
+    if config.raft_node_id.is_some() && config.raft_tls().is_none() {
         tracing::warn!(
-            "raft replication traffic is authenticated but not encrypted: keep --raft-bind on a \
-             private network"
+            "raft replication traffic is authenticated but not encrypted, and members share one \
+             identity: keep --raft-bind on a private network, or set --raft-tls-cert, \
+             --raft-tls-key and --raft-tls-ca"
         );
     }
     raise_fd_limit();

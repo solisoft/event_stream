@@ -318,3 +318,43 @@ async fn over_tls_and_idle_is_not_closed() {
     .await
     .unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_linearizable_consume_is_negotiated_and_served() {
+    let env = boot(false, false).await;
+    create_topic(&env, "lin", 1).await;
+    let addr = env.handle.binary_addr.unwrap();
+    tokio::task::spawn_blocking(move || {
+        let mut client = Client::connect(addr, &Options::default()).unwrap();
+        assert!(client.supports_linearizable_reads());
+        let r = client
+            .produce("lin", None, vec![record(b"k", b"v")])
+            .unwrap();
+        let page = client
+            .consume_linearizable(&WireConsumeRequest {
+                topic: "lin".into(),
+                partition: 0,
+                offset: r[0].offset,
+                max_records: 10,
+                max_bytes: 1 << 20,
+            })
+            .unwrap();
+        assert_eq!(page.records[0].value, b"v");
+        // A plain consume is unchanged on the same connection.
+        assert_eq!(consume_all(&mut client, "lin").records.len(), 1);
+        // Unknown topic: a server error, not retryable, connection still good.
+        let err = client
+            .consume_linearizable(&WireConsumeRequest {
+                topic: "nope".into(),
+                partition: 0,
+                offset: 0,
+                max_records: 1,
+                max_bytes: 1,
+            })
+            .unwrap_err();
+        assert!(err.connection_usable() && !err.is_retryable(), "{err}");
+        client.ping().unwrap();
+    })
+    .await
+    .unwrap();
+}

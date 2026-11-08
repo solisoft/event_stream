@@ -8,16 +8,37 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::auth::{AclAction, ApiKey};
 use crate::broker::Broker;
 use crate::partition::AppendRecord;
 use crate::producers::{AdmitError, DedupeOutcome};
+use crate::raft::NodeId;
+use crate::raft_partition::{Leadership, NotLeader};
 use crate::storage::record::Record;
 use crate::topic::Topic;
 
 /// Most records accepted in one produce request.
 pub const MAX_RECORDS_PER_REQUEST: usize = 100_000;
+
+/// How long a linearizable read waits for its leader to confirm leadership
+/// and apply through the read index before it is refused as retryable. A
+/// healthy cluster needs one heartbeat round trip; only a leader cut off from
+/// its majority, or one just elected, gets near this.
+pub const LINEARIZABLE_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What a consume promises about freshness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReadConsistency {
+    /// Whatever this replica has applied — possibly behind the leader. The
+    /// default, and the only behavior before 0.3.
+    #[default]
+    Local,
+    /// Sees every write acknowledged before the read began. Served by the
+    /// partition's leader only, after a read-index round.
+    Linearizable,
+}
 
 /// A record as a client submitted it.
 #[derive(Debug, Clone)]
@@ -42,6 +63,11 @@ pub enum DataError {
     BadRequest(String),
     /// Retry after this many seconds.
     RateLimited(f64),
+    /// Not served now, but a retry may be: later, or at the broker the
+    /// message names (a partition led elsewhere, an election in progress, a
+    /// linearizable read sent to a follower, or one whose leader could not
+    /// confirm its leadership in time).
+    Unavailable(String),
     Internal(anyhow::Error),
 }
 
@@ -52,6 +78,7 @@ impl std::fmt::Display for DataError {
             Self::NotFound(m) => write!(f, "not found: {m}"),
             Self::BadRequest(m) => write!(f, "bad request: {m}"),
             Self::RateLimited(s) => write!(f, "rate limited: retry in {s:.1}s"),
+            Self::Unavailable(m) => write!(f, "unavailable: {m}"),
             Self::Internal(e) => write!(f, "internal error: {e}"),
         }
     }
@@ -67,17 +94,35 @@ fn record_bytes(key: Option<&[u8]>, value: &[u8]) -> u64 {
     key.map(|k| k.len() as u64).unwrap_or(0) + value.len() as u64
 }
 
+/// Where a produce came from, for leader routing.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Origin<'a> {
+    /// The caller's credential as it presented it, sent on with a produce
+    /// forwarded to a partition's leader so the leader authenticates the
+    /// caller itself. `None` when auth is disabled.
+    pub credential: Option<&'a str>,
+    /// A follower already forwarded this produce. It is written here or
+    /// refused with "not leader", never forwarded a second time.
+    pub forwarded: bool,
+}
+
 /// Write `records` to `topic_name` as `key`.
 ///
 /// With `producer_id`, every record must carry a sequence; the whole request
 /// is checked before anything is written, and the producer's lock is held
 /// until the offsets are recorded and journaled.
+///
+/// On a Raft broker, records for a partition this broker does not lead are
+/// forwarded to the leader (see [`crate::forward`]); the rest are written
+/// here. The leader checks, dedupes and charges what it is sent, so the
+/// idempotence and atomicity guarantees above hold per leader.
 pub async fn produce(
     broker: &Arc<Broker>,
     key: &ApiKey,
     topic_name: &str,
     records: Vec<IncomingRecord>,
     producer_id: Option<&str>,
+    origin: Origin<'_>,
 ) -> Result<Vec<Produced>, DataError> {
     if !key.can(AclAction::Write, topic_name) {
         return Err(DataError::Forbidden(format!(
@@ -101,7 +146,6 @@ pub async fn produce(
     // One limit for both protocols, enforced before anything is stored: a
     // record larger than a consumer can be sent is a record nobody can read.
     let max_record = broker.config.max_record_bytes as u64;
-    let mut request_bytes = 0u64;
     for (i, r) in records.iter().enumerate() {
         let n = record_bytes(r.key.as_deref(), &r.value);
         if n > max_record {
@@ -110,10 +154,6 @@ pub async fn produce(
                 i, n, max_record
             )));
         }
-        request_bytes += n;
-    }
-    if let Err(retry_after) = broker.keys.check_produce(&key.key_id, request_bytes) {
-        return Err(DataError::RateLimited(retry_after));
     }
     if producer_id.is_some() {
         for (idx, r) in records.iter().enumerate() {
@@ -141,6 +181,157 @@ pub async fn produce(
             .route(r.key.as_deref(), r.partition)
             .map_err(|e| DataError::BadRequest(e.to_string()))?;
         routed.push(p);
+    }
+
+    let mut leaders: BTreeMap<u32, Leadership> = BTreeMap::new();
+    for p in &routed {
+        if !leaders.contains_key(p) {
+            leaders.insert(*p, topic.partitions[*p as usize].leadership().await);
+        }
+    }
+    let remote: BTreeMap<u32, Option<NodeId>> = leaders
+        .into_iter()
+        .filter_map(|(p, l)| match l {
+            Leadership::Local => None,
+            Leadership::Remote(hint) => Some((p, hint)),
+        })
+        .collect();
+    if remote.is_empty() {
+        return write_local(broker, key, &topic, records, routed, producer_id).await;
+    }
+
+    // Some partition is led elsewhere. Every one of them must have a leader
+    // this broker can forward to, or nothing is written.
+    let forwarder = broker.forwarder.as_deref();
+    for (&p, &hint) in &remote {
+        let reachable = match (hint, forwarder) {
+            (Some(l), Some(f)) => !origin.forwarded && f.address(l).is_some(),
+            _ => false,
+        };
+        if !reachable {
+            return Err(not_leader(broker, topic_name, p, hint, origin.forwarded));
+        }
+    }
+    let forwarder = forwarder.expect("checked above");
+
+    let mut local: (Vec<usize>, Vec<IncomingRecord>, Vec<u32>) = Default::default();
+    let mut by_leader: BTreeMap<NodeId, (Vec<usize>, Vec<IncomingRecord>)> = BTreeMap::new();
+    for (i, (mut r, p)) in records.into_iter().zip(routed).enumerate() {
+        match remote.get(&p) {
+            None => {
+                local.0.push(i);
+                local.1.push(r);
+                local.2.push(p);
+            }
+            Some(hint) => {
+                // Pinned, so the leader routes it exactly as this broker did.
+                r.partition = Some(p);
+                let slot = by_leader.entry(hint.expect("checked above")).or_default();
+                slot.0.push(i);
+                slot.1.push(r);
+            }
+        }
+    }
+    let total = local.0.len() + by_leader.values().map(|v| v.0.len()).sum::<usize>();
+    tracing::debug!(
+        topic = topic_name,
+        local = local.0.len(),
+        leaders = by_leader.len(),
+        "produce: forwarding to partition leaders"
+    );
+
+    let (local_idx, local_records, local_routed) = local;
+    let write_here = async {
+        if local_records.is_empty() {
+            return Ok(Vec::new());
+        }
+        write_local(
+            broker,
+            key,
+            &topic,
+            local_records,
+            local_routed,
+            producer_id,
+        )
+        .await
+    };
+    let forwards = by_leader
+        .into_iter()
+        .map(|(leader, (idx, recs))| async move {
+            forwarder
+                .produce(leader, topic_name, origin.credential, recs, producer_id)
+                .await
+                .map(|produced| (idx, produced))
+        });
+    let (here, there) = tokio::join!(write_here, futures::future::join_all(forwards));
+
+    let mut results: Vec<Option<Produced>> = vec![None; total];
+    for (i, p) in local_idx.into_iter().zip(here?) {
+        results[i] = Some(p);
+    }
+    for part in there {
+        let (idx, produced) = part?;
+        for (i, p) in idx.into_iter().zip(produced) {
+            results[i] = Some(p);
+        }
+    }
+    Ok(results
+        .into_iter()
+        .map(|r| r.expect("every record answered"))
+        .collect())
+}
+
+/// The retryable refusal for a partition this broker cannot write or forward.
+fn not_leader(
+    broker: &Broker,
+    topic: &str,
+    partition: u32,
+    hint: Option<NodeId>,
+    forwarded: bool,
+) -> DataError {
+    let hint = match hint {
+        None => "no leader is known yet; an election may be in progress".to_string(),
+        Some(l) => match broker.forwarder.as_deref().and_then(|f| f.address(l)) {
+            Some(addr) => format!("node {l} at {addr}"),
+            None => format!("node {l}"),
+        },
+    };
+    let why = if forwarded {
+        "; this produce was already forwarded once and is not forwarded again"
+    } else {
+        ""
+    };
+    DataError::Unavailable(format!(
+        "not leader for '{topic}' partition {partition} (hint: {hint}){why}; retry"
+    ))
+}
+
+/// A write that failed because leadership moved between the check and the
+/// proposal is as retryable as one refused up front.
+fn write_error(e: anyhow::Error) -> DataError {
+    match e.downcast_ref::<NotLeader>() {
+        Some(n) => DataError::Unavailable(format!("{n}; retry")),
+        None => DataError::Internal(e),
+    }
+}
+
+/// Write `records`, already validated and routed to partitions this broker
+/// leads (or plain ones), charging the caller's produce quota for them.
+async fn write_local(
+    broker: &Arc<Broker>,
+    key: &ApiKey,
+    topic: &Arc<Topic>,
+    records: Vec<IncomingRecord>,
+    routed: Vec<u32>,
+    producer_id: Option<&str>,
+) -> Result<Vec<Produced>, DataError> {
+    let topic_name = topic.name.as_str();
+    let request_bytes: u64 = records
+        .iter()
+        .map(|r| record_bytes(r.key.as_deref(), &r.value))
+        .sum();
+    if let Err(retry_after) = broker.keys.check_produce(&key.key_id, request_bytes) {
+        return Err(DataError::RateLimited(retry_after));
     }
 
     let mut results: Vec<Option<Produced>> = vec![None; records.len()];
@@ -221,7 +412,9 @@ pub async fn produce(
             Ok::<_, anyhow::Error>((p, idxs, offsets))
         }
     });
-    let written = futures::future::try_join_all(writes).await?;
+    let written = futures::future::try_join_all(writes)
+        .await
+        .map_err(write_error)?;
     let mut records_appended = 0u64;
     let mut journal = Vec::new();
     for (p, idxs, offsets) in written {
@@ -271,6 +464,8 @@ pub struct Fetched {
 
 /// Read from `topic_name`/`partition` as `key`. Limits are clamped to the
 /// broker's; the consume quota is reserved before the read and settled after.
+/// A linearizable read first waits on the partition's read barrier.
+#[allow(clippy::too_many_arguments)]
 pub async fn consume(
     broker: &Arc<Broker>,
     key: &ApiKey,
@@ -279,6 +474,7 @@ pub async fn consume(
     offset: u64,
     max_records: usize,
     max_bytes: usize,
+    consistency: ReadConsistency,
 ) -> Result<Fetched, DataError> {
     if !key.can(AclAction::Read, topic_name) {
         return Err(DataError::Forbidden(format!(
@@ -293,6 +489,12 @@ pub async fn consume(
         .partitions
         .get(partition as usize)
         .ok_or_else(|| DataError::BadRequest(format!("partition {} out of range", partition)))?;
+    if consistency == ReadConsistency::Linearizable {
+        // Before the quota is reserved: a read refused here costs nothing.
+        part.read_barrier(LINEARIZABLE_READ_TIMEOUT)
+            .await
+            .map_err(|e| DataError::Unavailable(e.to_string()))?;
+    }
     let max_records = max_records.clamp(1, broker.config.max_fetch_records);
     let max_bytes = max_bytes.clamp(1, broker.config.max_fetch_bytes);
     // Reserve the quota before reading and read no more than was reserved;

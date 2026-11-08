@@ -55,6 +55,7 @@ X-Es-Key: esk_AbCdEf…</pre>
     <tr><td><code>401</code></td><td>No key, or a key the broker does not know.</td></tr>
     <tr><td><code>403</code></td><td>The key exists but has no grant for this topic, group or producer id.</td></tr>
     <tr><td><code>429</code></td><td>Over the key's byte-rate quota; <code>Retry-After</code> says how many seconds to wait.</td></tr>
+    <tr><td><code>503</code></td><td>A produce for a partition whose leader is unknown or unreachable. Retry after <code>Retry-After</code>.</td></tr>
   </tbody>
 </table>
 <aside class="note warn">
@@ -195,6 +196,17 @@ X-Es-Key: esk_AbCdEf…</pre>
   The response comes once the records are on disk (with the default <code>--flush-every-records 1</code>). One request
   is one write per partition, so batching records into a request is the main lever on throughput.
 </p>
+<p>
+  With <code>?encoding=base64</code>, keys and values are base64-encoded, so values that are not text can be produced
+  over HTTP.
+</p>
+<p>
+  In a cluster, any broker takes a produce: a follower forwards it to the partition's leader, with your key, and
+  returns the leader's offsets (see <a href="<%= docs_cluster_path() %>#leader-routing">Leader routing</a>). If the
+  leader is unknown or unreachable the answer is <code>503</code> with <code>Retry-After</code> and a message starting
+  "not leader" that names the leader when known. The <code>X-Es-Forwarded</code> header marks a request a follower has
+  already forwarded; it is never forwarded again, and grants nothing.
+</p>
 
 <h3>Idempotent producers</h3>
 <p>
@@ -238,6 +250,7 @@ X-Es-Key: esk_AbCdEf…</pre>
   <div><dt><code>max_records</code></dt><dd>Default 100, at most 10,000 (<code>--max-fetch-records</code>).</dd></div>
   <div><dt><code>max_bytes</code></dt><dd>Default 1&nbsp;MiB, at most 8&nbsp;MiB (<code>--max-fetch-bytes</code>).</dd></div>
   <div><dt><code>encoding</code></dt><dd><code>utf8</code> (default) or <code>base64</code>. Use base64 to read values that are not text, such as anything produced over the binary protocol.</dd></div>
+  <div><dt><code>consistency</code></dt><dd><code>local</code> (default): what this broker's copy holds, which in a cluster can lag the leader. <code>linearizable</code>: every write acknowledged before the request, from any broker. In a cluster it must reach the partition's leader and costs one round trip to a majority; see <a href="<%= docs_cluster_path() %>#linearizable-reads">Cluster</a>.</dd></div>
 </dl>
 <figure class="code">
   <figcaption><span>200 OK</span><span>json</span></figcaption>
@@ -253,6 +266,11 @@ X-Es-Key: esk_AbCdEf…</pre>
 <p>
   Pass <code>next_offset</code> as the next request's <code>offset</code>. Offsets can have gaps (compaction, retention),
   so never compute it yourself. Consuming through a group does not commit; commit explicitly.
+</p>
+<p>
+  A linearizable read that cannot be served now answers <code>503</code> with <code>Retry-After: 1</code>: a follower
+  answers that it is not the leader and names the leader's node id when it knows it, and a leader that cannot confirm
+  its leadership within 5 seconds says so. Retry, against the leader if one was named.
 </p>
 
 <h2>Consumer groups</h2>
@@ -338,6 +356,43 @@ X-Es-Key: esk_AbCdEf…</pre>
 </ul>
 <p class="small">All admin endpoints need <code>admin</code> on <code>*</code>.</p>
 
+<h3>Cluster membership</h3>
+<ul class="endpoints">
+  <li><span class="verb get">GET</span><code>/admin/raft/members</code><span class="desc">The brokers this one connects to, and each partition's voters and whether a change is pending.</span></li>
+  <li><span class="verb post">POST</span><code>/admin/raft/members</code><span class="desc">Add a broker, <code>{"id", "addr"}</code>, to every partition this broker leads.</span></li>
+  <li><span class="verb delete">DELETE</span><code>/admin/raft/members/:id</code><span class="desc">Remove a broker from every partition this broker leads.</span></li>
+</ul>
+<p>
+  Each partition is its own Raft group, and only its leader can change who votes in it. A request changes the
+  partitions this broker leads and reports each of the others as <code>not_leader</code>, with its leader's id; send
+  the same request to that broker. <code>addr</code> is the new broker's <code>--raft-bind</code>, an IP address and
+  port. The answer, once what this broker proposed has committed (or after 5 seconds):
+</p>
+<figure class="code">
+  <figcaption><span>POST /admin/raft/members</span></figcaption>
+<pre><span class="c-com">// request</span>
+{ <span class="c-key">"id"</span>: <span class="c-num">4</span>, <span class="c-key">"addr"</span>: <span class="c-str">"10.0.0.4:6000"</span> }
+
+<span class="c-com">// response</span>
+{ <span class="c-key">"node"</span>: <span class="c-num">1</span>, <span class="c-key">"change"</span>: <span class="c-str">"add"</span>, <span class="c-key">"member"</span>: <span class="c-num">4</span>, <span class="c-key">"complete"</span>: <span class="c-num">false</span>,
+  <span class="c-key">"partitions"</span>: [
+    { <span class="c-key">"topic"</span>: <span class="c-str">"orders"</span>, <span class="c-key">"partition"</span>: <span class="c-num">0</span>, <span class="c-key">"status"</span>: <span class="c-str">"committed"</span>, <span class="c-key">"index"</span>: <span class="c-num">812</span> },
+    { <span class="c-key">"topic"</span>: <span class="c-str">"orders"</span>, <span class="c-key">"partition"</span>: <span class="c-num">1</span>, <span class="c-key">"status"</span>: <span class="c-str">"not_leader"</span>, <span class="c-key">"leader"</span>: <span class="c-num">2</span> } ] }</pre>
+</figure>
+<dl class="defs">
+  <div><dt><code>committed</code></dt><dd>This broker proposed the change and a majority of the new configuration has it.</dd></div>
+  <div><dt><code>already</code></dt><dd>The change was already committed. Asking twice is safe.</dd></div>
+  <div><dt><code>pending</code></dt><dd>The change is in the partition's log but not committed yet.</dd></div>
+  <div><dt><code>not_leader</code></dt><dd>Another broker leads this partition; ask it.</dd></div>
+</dl>
+<p>
+  <code>complete</code> is true when every partition on this broker reports <code>committed</code> or
+  <code>already</code>. A request answers <strong>409</strong> while any partition still has an earlier change that has
+  not committed, so changes never overlap, and while another request is being applied on the same broker. It answers
+  <strong>400</strong> on a broker with no replicated partitions, and for node id 0 or an address that is not
+  <code>ip:port</code>. Admin.
+</p>
+
 <h2>Schema registry</h2>
 <ul class="endpoints">
   <li><span class="verb post">POST</span><code>/schemas</code><span class="desc">Register a schema version for a subject. Admin.</span></li>
@@ -373,7 +428,8 @@ X-Es-Key: esk_AbCdEf…</pre>
 </p>
 <ul>
   <li><strong>TLS</strong> is on whenever the broker has a certificate; connect with <code>ClientOptions { tls: Some(…), .. }</code>.</li>
-  <li><strong>Concurrency.</strong> Up to 32 requests per connection run at once; produces to one topic keep their order.</li>
+  <li><strong>Concurrency.</strong> Up to 32 requests per connection run at once; produces to one topic keep their order, including produces a follower forwards to the leader.</li>
+  <li><strong>Leader routing.</strong> A produce sent to a follower is forwarded to the leader over HTTP with the connection's key, and the leader's offsets come back in the usual response. A leader that cannot be reached gives an error frame starting "not leader"; retry.</li>
   <li><strong>Limits.</strong> Connections per address (<code>--binary-max-connections-per-ip</code>), an idle timeout (<code>--binary-idle-timeout</code>, 10 minutes), and a shared memory budget for request bytes. A client that stops reading responses is disconnected.</li>
   <li><strong>Authorization</strong> is checked against the topic at the start of a frame, before a compressed frame is inflated, and again after every key revocation.</li>
 </ul>
@@ -383,7 +439,7 @@ X-Es-Key: esk_AbCdEf…</pre>
   <figcaption><span>handshake</span><span>big-endian</span></figcaption>
 <pre><span class="c-com">client</span>
 magic        [u8; 4]   "ES01"
-features     u32       requested bits; 0x1 = gzip
+features     u32       requested bits; 0x1 = gzip, 0x2 = consume flags
 token_len    u32       up to 1024
 token        [u8]
 
@@ -395,7 +451,10 @@ msg_len      u32
 msg          [u8]</pre>
 </figure>
 <p>
-  With gzip negotiated, each frame's payload is gzip-compressed; the length, request id and opcode are not.
+  With gzip negotiated, each frame's payload is gzip-compressed; the length, request id and opcode are not. The
+  consume-flags bit (<code>0x2</code>) changes nothing on the connection: a server that accepts it honors the flags
+  byte of a consume. A server from before 0.3 does not accept it and would ignore that byte, so a client sends flags
+  only after seeing the bit in the server's reply.
 </p>
 
 <h3>Frames</h3>
@@ -431,8 +490,16 @@ topic        [u8]
 partition    u32
 offset       u64
 max_records  u32
-max_bytes    u32</pre>
+max_bytes    u32
+flags        u8        optional; absent = 0. 0x1 = linearizable</pre>
 </figure>
+<p>
+  A request without <code>flags</code> is the format of every earlier version and reads as <code>local</code>
+  consistency. An unknown flag bit is refused rather than ignored. A linearizable consume that cannot be served now
+  fails with an error message starting <code>unavailable:</code>, which is retryable, as over HTTP. The clients expose
+  it as <code>consume_linearizable</code> (and <code>es_client::Error::is_retryable</code>); they refuse it, sending
+  nothing, when the server did not accept the consume-flags bit.
+</p>
 <p>
   The response (<code>0x82</code>) is <code>next_offset: u64</code>, <code>high_watermark: u64</code>,
   <code>count: u32</code>, then per record <code>partition: u32</code>, <code>offset: u64</code>,

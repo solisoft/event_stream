@@ -5,6 +5,7 @@ pub mod compaction;
 pub mod config;
 pub mod coord;
 pub mod dataplane;
+pub mod forward;
 pub mod fsutil;
 pub mod groups;
 pub mod http;

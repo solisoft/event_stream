@@ -3,6 +3,45 @@
 What changed in each release of `es`, newest first. The same notes are on the docs site at
 `/docs/changelog`.
 
+## Unreleased (0.3)
+
+A cluster you can operate. See the roadmap for what remains in 0.3.
+
+### Upgrading: what can break
+
+- **The Raft handshake is now version 3**, where the dialing broker proves itself first. A 0.3
+  broker refuses 0.2 brokers unless it runs with `--raft-legacy-handshake`. Set the flag on
+  each upgraded broker until every member runs 0.3, then remove it. It goes away in 0.4. Do
+  not change membership in the middle of the upgrade.
+- **"Not leader" is now `503` with `Retry-After`**, instead of `400`.
+- **After a membership change, a broker's membership comes from each partition's log and
+  snapshot**, not from `--raft-peer`, which only gives the starting membership.
+
+### Added
+
+- **Leader routing.** A produce sent to a follower is forwarded once to the partition's leader,
+  on HTTP and on the binary protocol, and the leader's offsets come back. Give each peer's API
+  address with `--raft-peer-api id=https://host:port`. The leader checks the caller's own key
+  again, so keys must match on every broker.
+- **Membership changes without a restart.** `GET`, `POST` and `DELETE` on
+  `/admin/raft/members` add or remove one broker at a time (single-server changes), and the
+  Raft transport follows: an added broker is accepted, and a removed one is disconnected and
+  refused. A new broker starts with `--raft-join` and waits to be added. Send each change to
+  every broker, since each partition's leader applies it.
+- **Per-broker identity.** With `--raft-tls-cert`, `--raft-tls-key` and `--raft-tls-ca`, every
+  Raft connection is mutual TLS 1.3. Each certificate names its broker (`DNS:es-node-<id>`),
+  so one broker cannot act as another, and replication traffic is encrypted. Raft connections
+  send keepalives and close after 15 s of silence.
+- **Linearizable reads, as an opt-in.** `consistency=linearizable` on HTTP consumes, or a flag
+  on the binary consume, which is negotiated at the handshake so old clients are unaffected.
+  The leader confirms its leadership with a majority before serving the read. A follower
+  answers "not leader".
+
+### Fixed
+
+- Deleting a topic removes it from consumer-group subscriptions and rebalances the affected
+  groups.
+
 ## 0.2.1 — 2026-11-08
 
 A security release: it fixes every finding of a second audit, and is the first release to ship

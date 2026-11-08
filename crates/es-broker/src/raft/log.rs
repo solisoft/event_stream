@@ -299,6 +299,11 @@ pub struct PersistedSnapshot {
     pub last_term: Term,
     /// State-machine-specific bytes. Opaque to Raft.
     pub data: Vec<u8>,
+    /// The voters as of `last_index`. The config entries the snapshot covers
+    /// are compacted away, so without this a restart would fall back to the
+    /// membership on the command line. Absent in snapshots from 0.2.
+    #[serde(default)]
+    pub members: Option<super::membership::Membership>,
 }
 
 /// Everything a node needs to restart: hard state plus the log entries.

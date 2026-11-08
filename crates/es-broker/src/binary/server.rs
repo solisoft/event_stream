@@ -12,14 +12,15 @@ use tokio::time::{timeout_at, Instant};
 use tokio_util::sync::CancellationToken;
 
 use es_protocol::wire::{
-    decode_consume_request, decode_produce_request, encode_produce_response, HandshakeStatus,
-    Opcode, WireConsumeRequest, WireProduceResult, FEATURE_GZIP, WIRE_MAGIC,
+    decode_consume_request_with_flags, decode_produce_request, encode_produce_response,
+    HandshakeStatus, Opcode, WireConsumeRequest, WireProduceResult, CONSUME_FLAGS_KNOWN,
+    CONSUME_FLAG_LINEARIZABLE, FEATURE_CONSUME_FLAGS, FEATURE_GZIP, WIRE_MAGIC,
 };
 
 use crate::auth::{AclAction, ApiKey, AuthMode, ANONYMOUS_ADMIN};
 use crate::broker::Broker;
 use crate::config::Config;
-use crate::dataplane::{self, IncomingRecord, MAX_RECORDS_PER_REQUEST};
+use crate::dataplane::{self, IncomingRecord, Origin, ReadConsistency, MAX_RECORDS_PER_REQUEST};
 
 use super::codec::{self, IoStream};
 
@@ -339,7 +340,7 @@ async fn write_handshake<S: AsyncWrite + Unpin>(
 async fn handshake(
     broker: &Broker,
     stream: &mut Box<dyn IoStream>,
-) -> Result<Option<(Arc<ApiKey>, bool)>> {
+) -> Result<Option<(Arc<ApiKey>, Option<Arc<str>>, bool)>> {
     let (magic, client_features, token_bytes, token_too_long) = read_handshake(stream).await?;
     if magic != WIRE_MAGIC {
         write_handshake(stream, HandshakeStatus::BadMagic, 0, "bad magic").await?;
@@ -357,8 +358,10 @@ async fn handshake(
     }
     let token = String::from_utf8(token_bytes).unwrap_or_default();
 
-    let key: Arc<ApiKey> = if broker.config.auth_mode != AuthMode::Required {
-        ANONYMOUS_ADMIN.clone()
+    let (key, credential): (Arc<ApiKey>, Option<Arc<str>>) = if broker.config.auth_mode
+        != AuthMode::Required
+    {
+        (ANONYMOUS_ADMIN.clone(), None)
     } else {
         if token.is_empty() {
             write_handshake(
@@ -371,7 +374,9 @@ async fn handshake(
             return Ok(None);
         }
         match broker.keys.authenticate(&token) {
-            Some(k) => k,
+            // The token is kept: a produce forwarded to a partition's leader
+            // presents it there, and the leader authenticates the caller again.
+            Some(k) => (k, Some(Arc::from(token))),
             None => {
                 write_handshake(stream, HandshakeStatus::AuthFailed, 0, "invalid token").await?;
                 return Ok(None);
@@ -379,11 +384,12 @@ async fn handshake(
         }
     };
 
-    // We support only the gzip feature bit. The negotiated set is the
-    // intersection of what the client requested and what we know about.
-    let negotiated = client_features & FEATURE_GZIP;
+    // The negotiated set is the intersection of what the client requested
+    // and what we know about. Consume flags need nothing per connection: the
+    // bit only tells the client this server will honor them.
+    let negotiated = client_features & (FEATURE_GZIP | FEATURE_CONSUME_FLAGS);
     write_handshake(stream, HandshakeStatus::Ok, negotiated, "").await?;
-    Ok(Some((key, negotiated & FEATURE_GZIP != 0)))
+    Ok(Some((key, credential, negotiated & FEATURE_GZIP != 0)))
 }
 
 /// A frame on its way to the writer, with the memory reservation it is
@@ -466,12 +472,13 @@ async fn serve(
     deadline: Instant,
     pre_auth: PreAuthSlot,
 ) -> Result<()> {
-    let (mut key, gzip) = match timeout_at(deadline, handshake(&broker, &mut stream)).await {
-        Ok(Ok(Some(v))) => v,
-        Ok(Ok(None)) => return Ok(()),
-        Ok(Err(e)) => return Err(e),
-        Err(_) => return Ok(()), // handshake timed out; drop the connection
-    };
+    let (mut key, credential, gzip) =
+        match timeout_at(deadline, handshake(&broker, &mut stream)).await {
+            Ok(Ok(Some(v))) => v,
+            Ok(Ok(None)) => return Ok(()),
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Ok(()), // handshake timed out; drop the connection
+        };
     drop(pre_auth);
     let auth_required = broker.config.auth_mode == AuthMode::Required;
     let mut epoch = broker.keys.revocation_epoch();
@@ -603,6 +610,7 @@ async fn serve(
                     };
                     let broker = broker.clone();
                     let key = key.clone();
+                    let credential = credential.clone();
                     let out_tx = out_tx.clone();
                     let global = budgets.global.clone();
                     let global_kib = budgets.global_kib;
@@ -620,6 +628,7 @@ async fn serve(
                             opcode,
                             payload,
                             inflate_cap,
+                            credential,
                         };
                         let (op, body) =
                             process(&broker, &key, req, &mut mem, (&global, global_kib), &cancel)
@@ -724,6 +733,9 @@ struct Request {
     payload: Vec<u8>,
     /// Decompression cap when the payload is gzip.
     inflate_cap: Option<usize>,
+    /// The token the connection authenticated with, for a produce forwarded
+    /// to a partition's leader.
+    credential: Option<Arc<str>>,
 }
 
 /// Run one produce or consume. Returns the response opcode and the
@@ -742,6 +754,7 @@ async fn process(
         opcode,
         payload,
         inflate_cap,
+        credential,
     } = req;
     let payload = match inflate_cap {
         // Room to inflate into was reserved with the frame.
@@ -778,8 +791,22 @@ async fn process(
                     sequence: r.sequence,
                 })
                 .collect();
-            match dataplane::produce(broker, key, &req.topic, records, req.producer_id.as_deref())
-                .await
+            // Forwarded over HTTP when the leader is another broker; the
+            // per-topic chain holds the next produce until this one is
+            // answered, so a pipelined client keeps its order through the hop.
+            let origin = Origin {
+                credential: credential.as_deref(),
+                forwarded: false,
+            };
+            match dataplane::produce(
+                broker,
+                key,
+                &req.topic,
+                records,
+                req.producer_id.as_deref(),
+                origin,
+            )
+            .await
             {
                 Ok(produced) => {
                     let results: Vec<WireProduceResult> = produced
@@ -799,9 +826,17 @@ async fn process(
             }
         }
         Opcode::Consume => {
-            let req = match decode_consume_request(&payload) {
+            let (req, flags) = match decode_consume_request_with_flags(&payload) {
                 Ok(r) => r,
                 Err(e) => return err(format!("decode: {}", e)),
+            };
+            if flags & !CONSUME_FLAGS_KNOWN != 0 {
+                return err(format!("bad request: unknown consume flags {:#04x}", flags));
+            }
+            let consistency = if flags & CONSUME_FLAG_LINEARIZABLE != 0 {
+                ReadConsistency::Linearizable
+            } else {
+                ReadConsistency::Local
             };
             drop(payload);
             // A 30-byte request can fetch megabytes. Swap the request's
@@ -825,6 +860,7 @@ async fn process(
                 req.offset,
                 req.max_records as usize,
                 req.max_bytes as usize,
+                consistency,
             )
             .await
             {
@@ -952,6 +988,13 @@ mod tests {
 
         /// A connection served over an in-memory pipe, past the handshake.
         async fn connect(&self, gzip: bool, pipe: usize) -> DuplexStream {
+            let features = if gzip { FEATURE_GZIP } else { 0 };
+            self.connect_with_features(features, pipe).await.0
+        }
+
+        /// [`Self::connect`] asking for `features`; also returns the ones
+        /// the server agreed to.
+        async fn connect_with_features(&self, features: u32, pipe: usize) -> (DuplexStream, u32) {
             let (mut client, server) = tokio::io::duplex(pipe);
             let sources: Sources = Arc::new(DashMap::new());
             let key: IpAddr = Ipv4Addr::LOCALHOST.into();
@@ -975,13 +1018,14 @@ mod tests {
                 .await;
             });
             let mut hello = WIRE_MAGIC.to_vec();
-            hello.extend_from_slice(&(if gzip { FEATURE_GZIP } else { 0 }).to_be_bytes());
+            hello.extend_from_slice(&features.to_be_bytes());
             hello.extend_from_slice(&0u32.to_be_bytes());
             client.write_all(&hello).await.unwrap();
             let mut reply = [0u8; 13];
             client.read_exact(&mut reply).await.unwrap();
             assert_eq!(reply[4], HandshakeStatus::Ok as u8);
-            client
+            let agreed = u32::from_be_bytes(reply[5..9].try_into().unwrap());
+            (client, agreed)
         }
     }
 
@@ -1065,6 +1109,64 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(fx.global.available_permits(), one as usize);
+    }
+
+    /// Bonfire #732: consume flags are advertised when asked for, a request
+    /// in the format that predates them is still a plain read, the
+    /// linearizable flag is honored, and an unknown flag is refused rather
+    /// than ignored.
+    #[tokio::test]
+    async fn consume_flags_are_negotiated_and_old_requests_still_served() {
+        let fx = Fixture::new(64 * 1024);
+        let (mut c, agreed) = fx
+            .connect_with_features(FEATURE_CONSUME_FLAGS | (1 << 31), 1 << 20)
+            .await;
+        assert_eq!(
+            agreed, FEATURE_CONSUME_FLAGS,
+            "unknown bits are not agreed to"
+        );
+        let (_, plain) = fx.connect_with_features(0, 1 << 20).await;
+        assert_eq!(plain, 0, "nothing is advertised unasked");
+
+        send(&mut c, 1, Opcode::Produce, &produce_payload("t", 3), false).await;
+        assert_eq!(recv(&mut c, false).await.1, Opcode::ProduceOk);
+
+        // A consume as clients before flags sent it: no trailing byte.
+        let mut old = Vec::new();
+        old.extend_from_slice(&1u16.to_be_bytes());
+        old.extend_from_slice(b"t");
+        old.extend_from_slice(&0u32.to_be_bytes()); // partition
+        old.extend_from_slice(&0u64.to_be_bytes()); // offset
+        old.extend_from_slice(&10u32.to_be_bytes()); // max_records
+        old.extend_from_slice(&(1u32 << 20).to_be_bytes()); // max_bytes
+        let req = WireConsumeRequest {
+            topic: "t".into(),
+            partition: 0,
+            offset: 0,
+            max_records: 10,
+            max_bytes: 1 << 20,
+        };
+        let linearizable =
+            es_protocol::wire::encode_consume_request_with_flags(&req, CONSUME_FLAG_LINEARIZABLE)
+                .unwrap();
+        for (id, payload) in [(2, old), (3, linearizable)] {
+            send(&mut c, id, Opcode::Consume, &payload, false).await;
+            let (rid, op, body) = recv(&mut c, false).await;
+            assert_eq!(
+                (rid, op),
+                (id, Opcode::ConsumeOk),
+                "{}",
+                String::from_utf8_lossy(&body)
+            );
+            let resp = es_protocol::wire::decode_consume_response(&body).unwrap();
+            assert_eq!(resp.records.len(), 1);
+        }
+
+        let unknown = es_protocol::wire::encode_consume_request_with_flags(&req, 0x80).unwrap();
+        send(&mut c, 4, Opcode::Consume, &unknown, false).await;
+        let (_, op, body) = recv(&mut c, false).await;
+        assert_eq!(op, Opcode::Error);
+        assert!(String::from_utf8_lossy(&body).contains("unknown consume flags"));
     }
 
     /// A consume's response stays charged to the budget until it is written:

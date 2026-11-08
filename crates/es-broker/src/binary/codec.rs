@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use es_protocol::wire::{HandshakeStatus, Opcode, FEATURE_GZIP, WIRE_MAGIC};
+use es_protocol::wire::{HandshakeStatus, Opcode, FEATURE_CONSUME_FLAGS, FEATURE_GZIP, WIRE_MAGIC};
 
 /// Any byte stream the protocol can run over: plain TCP or TLS.
 pub trait IoStream: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -131,6 +131,18 @@ pub async fn connect(
     want_gzip: bool,
     tls: Option<&ClientTls>,
 ) -> Result<(Box<dyn IoStream>, bool)> {
+    let (stream, features) = connect_with_features(addr, token, want_gzip, tls).await?;
+    Ok((stream, features & FEATURE_GZIP != 0))
+}
+
+/// [`connect`], returning every feature bit the server agreed to: gzip if
+/// asked for, and consume flags whenever the server supports them.
+pub async fn connect_with_features(
+    addr: std::net::SocketAddr,
+    token: &str,
+    want_gzip: bool,
+    tls: Option<&ClientTls>,
+) -> Result<(Box<dyn IoStream>, u32)> {
     let fut = async {
         let sock = tokio::net::TcpStream::connect(addr).await?;
         sock.set_nodelay(true).ok();
@@ -143,8 +155,8 @@ pub async fn connect(
                 Box::new(connector.connect(name, sock).await?)
             }
         };
-        let gzip = handshake(&mut stream, token, want_gzip).await?;
-        Ok::<_, anyhow::Error>((stream, gzip))
+        let features = handshake(&mut stream, token, want_gzip).await?;
+        Ok::<_, anyhow::Error>((stream, features))
     };
     tokio::time::timeout(CLIENT_HANDSHAKE_TIMEOUT, fut)
         .await
@@ -155,8 +167,9 @@ async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
     sock: &mut S,
     token: &str,
     want_gzip: bool,
-) -> Result<bool> {
-    let requested: u32 = if want_gzip { FEATURE_GZIP } else { 0 };
+) -> Result<u32> {
+    // Consume flags cost nothing unused, so they are always asked for.
+    let requested: u32 = FEATURE_CONSUME_FLAGS | if want_gzip { FEATURE_GZIP } else { 0 };
     let token_bytes = token.as_bytes();
     let mut hello = Vec::with_capacity(12 + token_bytes.len());
     hello.extend_from_slice(&WIRE_MAGIC);
@@ -186,7 +199,7 @@ async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
         let msg = String::from_utf8_lossy(&msg);
         return Err(anyhow!("handshake failed: {:?} ({})", status, msg));
     }
-    Ok(want_gzip && (features & FEATURE_GZIP) != 0)
+    Ok(features & requested)
 }
 
 #[cfg(test)]
