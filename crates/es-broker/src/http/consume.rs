@@ -10,7 +10,7 @@ use es_protocol::ConsumeResponse;
 
 use crate::auth::AclAction;
 use crate::broker::Broker;
-use crate::dataplane::{self, Fetched};
+use crate::dataplane::{self, Fetched, ReadConsistency};
 use crate::partition::records_to_dtos;
 
 use super::auth_ext::AuthedKey;
@@ -29,6 +29,11 @@ pub struct ConsumeQuery {
     /// without them being replaced.
     #[serde(default)]
     pub encoding: Option<String>,
+    /// `linearizable` to see every write acknowledged before the request,
+    /// at the cost of a round trip to a majority (leader only). Default:
+    /// whatever this broker's replica has applied.
+    #[serde(default)]
+    pub consistency: Option<String>,
 }
 
 fn default_max_records() -> usize {
@@ -44,6 +49,17 @@ fn wants_base64(encoding: Option<&str>) -> AppResult<bool> {
         Some("base64") => Ok(true),
         Some(other) => Err(AppError::bad_request(format!(
             "unknown encoding '{}' (use 'utf8' or 'base64')",
+            other
+        ))),
+    }
+}
+
+fn read_consistency(consistency: Option<&str>) -> AppResult<ReadConsistency> {
+    match consistency {
+        None | Some("local") => Ok(ReadConsistency::Local),
+        Some("linearizable") => Ok(ReadConsistency::Linearizable),
+        Some(other) => Err(AppError::bad_request(format!(
+            "unknown consistency '{}' (use 'local' or 'linearizable')",
             other
         ))),
     }
@@ -65,6 +81,7 @@ pub async fn consume(
     Query(q): Query<ConsumeQuery>,
 ) -> AppResult<Json<ConsumeResponse>> {
     let base64 = wants_base64(q.encoding.as_deref())?;
+    let consistency = read_consistency(q.consistency.as_deref())?;
     let f = dataplane::consume(
         &broker,
         &key,
@@ -73,6 +90,7 @@ pub async fn consume(
         q.offset,
         q.max_records,
         q.max_bytes,
+        consistency,
     )
     .await?;
     Ok(respond(f, q.partition, base64))
@@ -88,6 +106,9 @@ pub struct GroupConsumeQuery {
     pub max_bytes: usize,
     #[serde(default)]
     pub encoding: Option<String>,
+    /// See [`ConsumeQuery::consistency`].
+    #[serde(default)]
+    pub consistency: Option<String>,
 }
 
 pub async fn group_consume(
@@ -97,6 +118,7 @@ pub async fn group_consume(
     Query(q): Query<GroupConsumeQuery>,
 ) -> AppResult<Json<ConsumeResponse>> {
     let base64 = wants_base64(q.encoding.as_deref())?;
+    let consistency = read_consistency(q.consistency.as_deref())?;
     if !key.can(AclAction::Read, &q.topic) {
         return Err(AppError::forbidden(format!(
             "key '{}' does not have read access to topic '{}'",
@@ -124,6 +146,7 @@ pub async fn group_consume(
         committed,
         q.max_records,
         q.max_bytes,
+        consistency,
     )
     .await?;
     Ok(respond(f, q.partition, base64))

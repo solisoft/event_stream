@@ -20,6 +20,17 @@
 //! partition up to offset E, synced". A follower too far behind for the
 //! leader's Raft log is caught up by streaming it the records it is missing
 //! from the leader's partition ([`SnapshotTransfer`]).
+//!
+//! # Reads
+//!
+//! A plain read serves whatever this replica has applied, which can be behind
+//! the leader, or — on a leader cut off from its majority — behind a newer
+//! leader. [`RaftPartition::read_barrier`] makes the read that follows it
+//! linearizable with the read-index protocol (dissertation §6.4): the leader
+//! fixes its commit index as the read index, confirms with a heartbeat round
+//! that a majority still follows it, and waits until the partition has
+//! applied through that index. No clock is involved, so no bound on clock
+//! drift is assumed — which is what a lease read would need.
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
@@ -30,7 +41,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use rand::RngCore;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -40,7 +51,7 @@ use crate::raft::{
     spawn_node_with_options,
     transport::{RaftHub, Transport},
     JsonStore, LogIndex, NodeHandle, NodeId, NodeOptions, Outbound, ProposeReply, RaftStore,
-    SnapshotSender, SnapshotTransfer, Timing,
+    ReadIndexReply, SnapshotSender, SnapshotTransfer, Timing,
 };
 use tokio::sync::Mutex as TokioMutex;
 
@@ -175,6 +186,46 @@ fn decode_command(bytes: &[u8]) -> Result<Command> {
 /// cluster commits in the time one round trip takes.
 const COMMIT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Why a linearizable read could not be served. Every case is retryable:
+/// leadership moves, and a leader that timed out may succeed a moment later.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadBarrierError {
+    /// This replica is not the partition's leader (or stopped being it
+    /// before its leadership was confirmed). Retry against `leader_hint`.
+    NotLeader { leader_hint: Option<NodeId> },
+    /// Leadership was not confirmed by a majority, or the read index not
+    /// applied, within the bound.
+    TimedOut(Duration),
+    /// The Raft node or the apply loop has stopped.
+    Stopped(String),
+}
+
+impl std::fmt::Display for ReadBarrierError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotLeader {
+                leader_hint: Some(id),
+            } => write!(
+                f,
+                "not leader for this partition; linearizable reads go to the leader (node {id})"
+            ),
+            Self::NotLeader { leader_hint: None } => write!(
+                f,
+                "not leader for this partition and no leader is known; retry shortly"
+            ),
+            Self::TimedOut(d) => write!(
+                f,
+                "linearizable read timed out after {:?}: the leader could not confirm its \
+                 leadership with a majority",
+                d
+            ),
+            Self::Stopped(m) => write!(f, "linearizable read failed: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for ReadBarrierError {}
+
 #[derive(Debug)]
 pub struct AppendResult {
     pub offset: u64,
@@ -204,6 +255,8 @@ pub struct RaftPartition {
     outbound_rx: Mutex<Option<mpsc::UnboundedReceiver<Outbound>>>,
     /// Set by `connect_transport`.
     transport: Mutex<Option<Transport>>,
+    /// Index of the last entry the apply loop has written to the partition.
+    applied: watch::Receiver<LogIndex>,
 }
 
 #[derive(Debug, Clone)]
@@ -374,10 +427,12 @@ impl RaftPartition {
             .take_committed()
             .ok_or_else(|| anyhow!("raft node committed receiver already taken"))?;
 
+        let (applied_tx, applied_rx) = watch::channel(raft.applied_at_start());
         let apply = ApplyLoop {
             partition: partition.clone(),
             waiters: waiters.clone(),
             snapshot_after_applies: config.snapshot_after_applies,
+            applied: applied_tx,
         };
         let raft_for_apply = raft.snapshot_sender();
         let cancel_for_apply = cancel.clone();
@@ -400,6 +455,7 @@ impl RaftPartition {
             node_join: Mutex::new(node_join),
             outbound_rx: Mutex::new(outbound_rx),
             transport: Mutex::new(None),
+            applied: applied_rx,
         }))
     }
 
@@ -547,6 +603,41 @@ impl RaftPartition {
         }
     }
 
+    /// Wait until a read of this partition is linearizable: it will see every
+    /// write acknowledged before this call began, from any leader.
+    ///
+    /// Leader only. A follower refuses with `NotLeader` rather than asking the
+    /// leader for a read index: that would need a new Raft message, which a
+    /// broker of an earlier version drops along with its connection, and the
+    /// follower would still wait to apply what the leader already has — the
+    /// client is better served reading from the leader directly.
+    pub async fn read_barrier(&self, timeout: Duration) -> Result<(), ReadBarrierError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let reply = match tokio::time::timeout_at(deadline, self.raft.read_index()).await {
+            Err(_) => return Err(ReadBarrierError::TimedOut(timeout)),
+            Ok(Err(e)) => return Err(ReadBarrierError::Stopped(e.to_string())),
+            Ok(Ok(r)) => r,
+        };
+        let target = match reply {
+            ReadIndexReply::Ready { apply_through } => apply_through,
+            ReadIndexReply::NotLeader { leader_hint } => {
+                return Err(ReadBarrierError::NotLeader { leader_hint })
+            }
+        };
+        let mut applied = self.applied.clone();
+        let waited = tokio::time::timeout_at(deadline, async {
+            applied.wait_for(|a| *a >= target).await.map(|_| ())
+        })
+        .await;
+        match waited {
+            Err(_) => Err(ReadBarrierError::TimedOut(timeout)),
+            Ok(Err(_)) => Err(ReadBarrierError::Stopped(
+                "the apply loop has stopped".to_string(),
+            )),
+            Ok(Ok(())) => Ok(()),
+        }
+    }
+
     pub async fn shutdown(&self) {
         self.cancel.cancel();
         self.raft.cancel.cancel();
@@ -571,6 +662,8 @@ struct ApplyLoop {
     partition: Arc<Partition>,
     waiters: Waiters,
     snapshot_after_applies: u32,
+    /// Advanced after each entry is in the partition; read barriers wait on it.
+    applied: watch::Sender<LogIndex>,
 }
 
 impl ApplyLoop {
@@ -601,6 +694,7 @@ impl ApplyLoop {
                 );
                 break;
             }
+            self.applied.send_replace(index);
             applies_since_snapshot += 1;
             if self.snapshot_after_applies > 0
                 && applies_since_snapshot >= self.snapshot_after_applies
@@ -856,6 +950,7 @@ mod tests {
             partition: p.clone(),
             waiters: Arc::new(Mutex::new(HashMap::new())),
             snapshot_after_applies: 0,
+            applied: watch::channel(0).0,
         };
         let recs = [
             AppendRecord::new(None, b"a".to_vec()),

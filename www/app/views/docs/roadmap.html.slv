@@ -14,14 +14,15 @@
     failing with a hint, so clients can talk to any broker.</li>
   <li><strong>Safe membership changes.</strong> Add or remove one broker at a time without a restart, and the transport
     follows the current membership, so a removed broker can no longer connect.</li>
-  <li><strong>Linearizable reads, as an opt-in.</strong> Read-index or lease reads, for consumers that must not see a
-    stale replica.</li>
+  <li><strong>Linearizable reads, as an opt-in.</strong> Read-index reads on the partition's leader
+    (<code>consistency=linearizable</code>, and a flag on the binary consume), for consumers that must not see a stale
+    replica. Done on the 0.3 branch; reads served by followers are not part of it.</li>
   <li><strong>Per-broker identity.</strong> mTLS with the broker id in the certificate, so one broker cannot act as
     another. Today brokers share one secret, which keeps outsiders out but lets any broker that holds it act as any
     member. With it: an idle timeout on Raft connections, and a handshake where the dialing broker proves itself
     first.</li>
   <li><strong>Topic deletion and consumer groups.</strong> A deleted topic is removed from the groups subscribed to
-    it.</li>
+    it, and they rebalance. Done on the 0.3 branch.</li>
 </ul>
 
 <h2 id="v0-4">0.4: record format v2</h2>

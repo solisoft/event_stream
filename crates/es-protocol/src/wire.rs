@@ -26,6 +26,20 @@ pub const WIRE_MAGIC: [u8; 4] = *b"ES01";
 /// so the server can frame-parse without paying the decompress.
 pub const FEATURE_GZIP: u32 = 1 << 0;
 
+/// Feature bit: the server understands consume flags
+/// ([`CONSUME_FLAG_LINEARIZABLE`]). A client must see it in the server's
+/// handshake reply before sending a flagged consume: a server without it
+/// ignores the trailing flags byte and would serve a plain read.
+pub const FEATURE_CONSUME_FLAGS: u32 = 1 << 1;
+
+/// Consume flag: a linearizable read (see the docs' cluster page). Carried
+/// in an optional `flags: u8` after `max_bytes`; a request without it is a
+/// plain read, byte for byte the format of earlier versions.
+pub const CONSUME_FLAG_LINEARIZABLE: u8 = 1 << 0;
+/// Every consume flag this version knows. A server refuses a request with
+/// any other bit set, rather than serve it without what the bit asked for.
+pub const CONSUME_FLAGS_KNOWN: u8 = CONSUME_FLAG_LINEARIZABLE;
+
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandshakeStatus {
@@ -426,24 +440,47 @@ pub fn decode_produce_response(bytes: &[u8]) -> io::Result<Vec<WireProduceResult
 }
 
 pub fn encode_consume_request(req: &WireConsumeRequest) -> io::Result<Vec<u8>> {
+    encode_consume_request_with_flags(req, 0)
+}
+
+/// A consume request with `flags` (`CONSUME_FLAG_*`). With no flag set the
+/// trailing byte is left out, so a plain request is what every earlier
+/// version sent and understands.
+pub fn encode_consume_request_with_flags(
+    req: &WireConsumeRequest,
+    flags: u8,
+) -> io::Result<Vec<u8>> {
     let mut b = WireBuf::new();
     b.put_str(&req.topic)?;
     b.put_u32(req.partition);
     b.put_u64(req.offset);
     b.put_u32(req.max_records);
     b.put_u32(req.max_bytes);
+    if flags != 0 {
+        b.put_u8(flags);
+    }
     Ok(b.bytes)
 }
 
+/// Decode a consume request, ignoring any flags. See
+/// [`decode_consume_request_with_flags`].
 pub fn decode_consume_request(bytes: &[u8]) -> io::Result<WireConsumeRequest> {
+    decode_consume_request_with_flags(bytes).map(|(req, _)| req)
+}
+
+/// Decode a consume request and its flags byte, zero when absent (a client
+/// that predates flags).
+pub fn decode_consume_request_with_flags(bytes: &[u8]) -> io::Result<(WireConsumeRequest, u8)> {
     let mut r = WireReader::new(bytes);
-    Ok(WireConsumeRequest {
+    let req = WireConsumeRequest {
         topic: r.get_str()?,
         partition: r.get_u32()?,
         offset: r.get_u64()?,
         max_records: r.get_u32()?,
         max_bytes: r.get_u32()?,
-    })
+    };
+    let flags = if r.remaining() > 0 { r.get_u8()? } else { 0 };
+    Ok((req, flags))
 }
 
 pub fn encode_consume_response(resp: &WireConsumeResponse) -> io::Result<Vec<u8>> {
@@ -521,6 +558,57 @@ mod tests {
         assert_eq!(back.records[1].key, None);
         assert_eq!(back.records[1].partition, None);
         assert_eq!(back.records[1].sequence, None);
+    }
+
+    /// The consume request as every client before consume flags encoded it,
+    /// written out by hand so a change to the encoder cannot hide a change
+    /// to the format.
+    fn old_format_consume(topic: &str, partition: u32, offset: u64) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+        v.extend_from_slice(topic.as_bytes());
+        v.extend_from_slice(&partition.to_be_bytes());
+        v.extend_from_slice(&offset.to_be_bytes());
+        v.extend_from_slice(&100u32.to_be_bytes());
+        v.extend_from_slice(&65536u32.to_be_bytes());
+        v
+    }
+
+    #[test]
+    fn an_old_format_consume_request_still_decodes() {
+        let old = old_format_consume("orders", 3, 42);
+        let (req, flags) = decode_consume_request_with_flags(&old).unwrap();
+        assert_eq!(flags, 0, "no flags byte: a plain read");
+        assert_eq!(req.topic, "orders");
+        assert_eq!((req.partition, req.offset), (3, 42));
+        assert_eq!((req.max_records, req.max_bytes), (100, 65536));
+        // And a plain request encodes to exactly that format.
+        let req = WireConsumeRequest {
+            topic: "orders".into(),
+            partition: 3,
+            offset: 42,
+            max_records: 100,
+            max_bytes: 65536,
+        };
+        assert_eq!(encode_consume_request(&req).unwrap(), old);
+    }
+
+    #[test]
+    fn consume_flags_roundtrip_as_a_trailing_byte() {
+        let req = WireConsumeRequest {
+            topic: "t".into(),
+            partition: 1,
+            offset: 2,
+            max_records: 3,
+            max_bytes: 4,
+        };
+        let bytes = encode_consume_request_with_flags(&req, CONSUME_FLAG_LINEARIZABLE).unwrap();
+        assert_eq!(bytes.len(), encode_consume_request(&req).unwrap().len() + 1);
+        let (back, flags) = decode_consume_request_with_flags(&bytes).unwrap();
+        assert_eq!(flags, CONSUME_FLAG_LINEARIZABLE);
+        assert_eq!((back.partition, back.offset), (1, 2));
+        // The flag-blind decoder still reads the request itself.
+        assert_eq!(decode_consume_request(&bytes).unwrap().max_bytes, 4);
     }
 
     #[test]

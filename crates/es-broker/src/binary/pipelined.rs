@@ -22,9 +22,10 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use es_protocol::wire::{
-    decode_consume_response, decode_produce_response, encode_consume_request,
+    decode_consume_response, decode_produce_response, encode_consume_request_with_flags,
     encode_produce_request, Opcode, WireConsumeRequest, WireConsumeResponse, WireProduceRecord,
-    WireProduceRequest, WireProduceResult,
+    WireProduceRequest, WireProduceResult, CONSUME_FLAG_LINEARIZABLE, FEATURE_CONSUME_FLAGS,
+    FEATURE_GZIP,
 };
 
 use super::client::ClientOptions;
@@ -43,6 +44,8 @@ struct Inner {
     /// otherwise wait forever for a response nobody is left to deliver.
     closed: AtomicBool,
     gzip: bool,
+    /// Whether the server understands consume flags.
+    consume_flags: bool,
     cancel: CancellationToken,
     reader: Mutex<Option<JoinHandle<()>>>,
 }
@@ -55,7 +58,8 @@ impl PipelinedClient {
     }
 
     pub async fn connect_with(addr: SocketAddr, token: &str, opts: ClientOptions) -> Result<Self> {
-        let (stream, gzip) = codec::connect(addr, token, opts.gzip, opts.tls.as_ref()).await?;
+        let (stream, features) =
+            codec::connect_with_features(addr, token, opts.gzip, opts.tls.as_ref()).await?;
         let (read_half, write_half) = tokio::io::split(stream);
         let cancel = CancellationToken::new();
         let inner = Arc::new(Inner {
@@ -63,7 +67,8 @@ impl PipelinedClient {
             pending: DashMap::new(),
             next_id: AtomicU32::new(1),
             closed: AtomicBool::new(false),
-            gzip,
+            gzip: features & FEATURE_GZIP != 0,
+            consume_flags: features & FEATURE_CONSUME_FLAGS != 0,
             cancel: cancel.clone(),
             reader: Mutex::new(None),
         });
@@ -156,6 +161,44 @@ impl PipelinedClient {
         max_records: u32,
         max_bytes: u32,
     ) -> Result<WireConsumeResponse> {
+        self.consume_with_flags(topic, partition, offset, max_records, max_bytes, 0)
+            .await
+    }
+
+    /// See [`super::client::BinaryClient::consume_linearizable`].
+    pub async fn consume_linearizable(
+        &self,
+        topic: &str,
+        partition: u32,
+        offset: u64,
+        max_records: u32,
+        max_bytes: u32,
+    ) -> Result<WireConsumeResponse> {
+        if !self.inner.consume_flags {
+            return Err(anyhow!(
+                "the broker does not support linearizable reads (no consume flags at handshake)"
+            ));
+        }
+        self.consume_with_flags(
+            topic,
+            partition,
+            offset,
+            max_records,
+            max_bytes,
+            CONSUME_FLAG_LINEARIZABLE,
+        )
+        .await
+    }
+
+    async fn consume_with_flags(
+        &self,
+        topic: &str,
+        partition: u32,
+        offset: u64,
+        max_records: u32,
+        max_bytes: u32,
+        flags: u8,
+    ) -> Result<WireConsumeResponse> {
         let req = WireConsumeRequest {
             topic: topic.to_string(),
             partition,
@@ -163,7 +206,7 @@ impl PipelinedClient {
             max_records,
             max_bytes,
         };
-        let payload = encode_consume_request(&req)?;
+        let payload = encode_consume_request_with_flags(&req, flags)?;
         let (opcode, body) = self.round_trip(Opcode::Consume, payload).await?;
         match opcode {
             Opcode::ConsumeOk => Ok(decode_consume_response(&body)?),
@@ -276,6 +319,7 @@ mod tests {
             next_id: AtomicU32::new(1),
             closed: AtomicBool::new(false),
             gzip: false,
+            consume_flags: true,
             cancel: CancellationToken::new(),
             reader: Mutex::new(None),
         });

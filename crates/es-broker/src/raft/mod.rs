@@ -8,8 +8,10 @@
 //! * `secret` — the cluster's shared secret: long enough, never printed.
 //!
 //! Not implemented: joint-consensus membership changes (config entries are
-//! applied, but there is no safe reconfiguration protocol on top of them) and
-//! linearizable reads (reads are served from whatever the replica has applied).
+//! applied, but there is no safe reconfiguration protocol on top of them).
+//! Reads are served from whatever the replica has applied unless the caller
+//! asks for a linearizable one, which goes through the leader's read index
+//! ([`NodeHandle::read_index`]).
 //! Nothing outside tests proposes a config entry: the membership is the
 //! configured one, and removing a member means restarting the others without
 //! it — which is also what takes away its access to their raft ports.
@@ -27,7 +29,7 @@ pub use log::{
 pub use messages::{LogEntry, LogIndex, Message, NodeId, Term};
 pub use node::{
     spawn_node, spawn_node_with_options, spawn_node_with_store, NodeHandle, NodeOptions, Outbound,
-    ProposeReply, SnapshotSender, SnapshotTransfer, Timing,
+    ProposeReply, ReadIndexReply, SnapshotSender, SnapshotTransfer, Timing,
 };
 pub use secret::SharedSecret;
 pub use state::{Action, RaftState, Role};

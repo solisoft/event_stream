@@ -10,7 +10,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::partition::{AppendRecord, Durability, Partition};
 use crate::raft::{RaftHub, Timing};
-use crate::raft_partition::{RaftPartition, RaftPartitionConfig, RaftTransportConfig};
+use crate::raft_partition::{
+    RaftPartition, RaftPartitionConfig, RaftTransportConfig, ReadBarrierError,
+};
 use crate::storage::record::Record;
 use crate::storage::segment::Segment;
 use es_protocol::RecordDto;
@@ -274,6 +276,16 @@ impl PartitionHandle {
         match self {
             Self::Plain(_) => Ok(()),
             Self::Raft(p) => p.attach_to_hub(hub, group),
+        }
+    }
+
+    /// Make the next read of this partition linearizable (see
+    /// [`RaftPartition::read_barrier`]). A plain partition has one copy, and
+    /// a write is in it before it is acknowledged, so every read already is.
+    pub async fn read_barrier(&self, timeout: Duration) -> Result<(), ReadBarrierError> {
+        match self {
+            Self::Plain(_) => Ok(()),
+            Self::Raft(p) => p.read_barrier(timeout).await,
         }
     }
 

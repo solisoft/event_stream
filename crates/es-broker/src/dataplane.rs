@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::auth::{AclAction, ApiKey};
 use crate::broker::Broker;
@@ -18,6 +19,24 @@ use crate::topic::Topic;
 
 /// Most records accepted in one produce request.
 pub const MAX_RECORDS_PER_REQUEST: usize = 100_000;
+
+/// How long a linearizable read waits for its leader to confirm leadership
+/// and apply through the read index before it is refused as retryable. A
+/// healthy cluster needs one heartbeat round trip; only a leader cut off from
+/// its majority, or one just elected, gets near this.
+pub const LINEARIZABLE_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What a consume promises about freshness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReadConsistency {
+    /// Whatever this replica has applied — possibly behind the leader. The
+    /// default, and the only behavior before 0.3.
+    #[default]
+    Local,
+    /// Sees every write acknowledged before the read began. Served by the
+    /// partition's leader only, after a read-index round.
+    Linearizable,
+}
 
 /// A record as a client submitted it.
 #[derive(Debug, Clone)]
@@ -42,6 +61,10 @@ pub enum DataError {
     BadRequest(String),
     /// Retry after this many seconds.
     RateLimited(f64),
+    /// Not served now, but a retry may be — later, or at another broker the
+    /// message names (a linearizable read sent to a follower, or one whose
+    /// leader could not confirm its leadership in time).
+    Unavailable(String),
     Internal(anyhow::Error),
 }
 
@@ -52,6 +75,7 @@ impl std::fmt::Display for DataError {
             Self::NotFound(m) => write!(f, "not found: {m}"),
             Self::BadRequest(m) => write!(f, "bad request: {m}"),
             Self::RateLimited(s) => write!(f, "rate limited: retry in {s:.1}s"),
+            Self::Unavailable(m) => write!(f, "unavailable: {m}"),
             Self::Internal(e) => write!(f, "internal error: {e}"),
         }
     }
@@ -271,6 +295,8 @@ pub struct Fetched {
 
 /// Read from `topic_name`/`partition` as `key`. Limits are clamped to the
 /// broker's; the consume quota is reserved before the read and settled after.
+/// A linearizable read first waits on the partition's read barrier.
+#[allow(clippy::too_many_arguments)]
 pub async fn consume(
     broker: &Arc<Broker>,
     key: &ApiKey,
@@ -279,6 +305,7 @@ pub async fn consume(
     offset: u64,
     max_records: usize,
     max_bytes: usize,
+    consistency: ReadConsistency,
 ) -> Result<Fetched, DataError> {
     if !key.can(AclAction::Read, topic_name) {
         return Err(DataError::Forbidden(format!(
@@ -293,6 +320,12 @@ pub async fn consume(
         .partitions
         .get(partition as usize)
         .ok_or_else(|| DataError::BadRequest(format!("partition {} out of range", partition)))?;
+    if consistency == ReadConsistency::Linearizable {
+        // Before the quota is reserved: a read refused here costs nothing.
+        part.read_barrier(LINEARIZABLE_READ_TIMEOUT)
+            .await
+            .map_err(|e| DataError::Unavailable(e.to_string()))?;
+    }
     let max_records = max_records.clamp(1, broker.config.max_fetch_records);
     let max_bytes = max_bytes.clamp(1, broker.config.max_fetch_bytes);
     // Reserve the quota before reading and read no more than was reserved;

@@ -2200,3 +2200,172 @@ async fn group_whose_only_topic_is_deleted_gets_an_empty_assignment() -> Result<
     handle.shutdown().await?;
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Linearizable reads (Bonfire #732)
+// ---------------------------------------------------------------------------
+
+/// A single-node Raft broker with the binary listener: every partition goes
+/// through Raft, so a linearizable read runs the real read-index path.
+async fn boot_raft_single(tmp: &TempDir) -> Result<es_broker::BrokerHandle> {
+    let mut cfg = Config::new(tmp.path().to_path_buf(), ephemeral_bind(), 1 << 20);
+    cfg.bind_binary = Some("127.0.0.1:0".parse().unwrap());
+    cfg.raft_node_id = Some(1);
+    cfg.raft_bind = Some("127.0.0.1:0".parse().unwrap());
+    spawn(cfg).await
+}
+
+async fn consume_with(
+    client: &Client,
+    base: &str,
+    topic: &str,
+    offset: u64,
+    consistency: Option<&str>,
+) -> Result<reqwest::Response> {
+    let mut url = format!(
+        "{}/topics/{}/consume?partition=0&offset={}&max_records=100",
+        base, topic, offset
+    );
+    if let Some(c) = consistency {
+        url.push_str(&format!("&consistency={c}"));
+    }
+    Ok(client.get(url).send().await?)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn linearizable_consume_sees_a_just_acknowledged_write() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let handle = boot_raft_single(&tmp).await?;
+    let http = Client::new();
+    let base = handle.base_url();
+    create_topic(&http, &base, "lin", 1).await?;
+
+    // The partition's Raft group elects itself; poll until a produce lands.
+    let give_up = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let r = http
+            .post(format!("{}/topics/lin/produce", base))
+            .json(&ProduceRequest {
+                records: vec![ProduceRecord {
+                    key: None,
+                    value: "first".into(),
+                    partition: Some(0),
+                    sequence: None,
+                }],
+                producer_id: None,
+            })
+            .send()
+            .await?;
+        if r.status().is_success() {
+            break;
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < give_up,
+            "no leader: {}",
+            r.status()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // HTTP: every write acknowledged before the read is in it.
+    for i in 0..5 {
+        let v = format!("v{i}");
+        produce(
+            &http,
+            &base,
+            "lin",
+            vec![ProduceRecord {
+                key: None,
+                value: v.clone(),
+                partition: Some(0),
+                sequence: None,
+            }],
+        )
+        .await?;
+        let resp: ConsumeResponse = consume_with(&http, &base, "lin", 0, Some("linearizable"))
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(resp.records.len(), i + 2);
+        assert_eq!(resp.records.last().unwrap().value, v);
+    }
+
+    // The default is unchanged, and `local` names it.
+    let default: ConsumeResponse = consume_with(&http, &base, "lin", 0, None)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let local: ConsumeResponse = consume_with(&http, &base, "lin", 0, Some("local"))
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(default.records.len(), 6);
+    assert_eq!(local.records.len(), 6);
+    let bad = consume_with(&http, &base, "lin", 0, Some("strong")).await?;
+    assert_eq!(bad.status().as_u16(), 400);
+
+    // Binary, both clients: the flag is negotiated and honored.
+    let bin_addr = handle.binary_addr.unwrap();
+    let mut client = BinaryClient::connect(bin_addr, "").await?;
+    let produced = client
+        .produce(
+            "lin",
+            None,
+            vec![WireProduceRecord {
+                key: None,
+                value: b"bin".to_vec(),
+                partition: Some(0),
+                sequence: None,
+            }],
+        )
+        .await?;
+    let resp = client
+        .consume_linearizable("lin", 0, produced[0].offset, 10, 1 << 20)
+        .await?;
+    assert_eq!(resp.records[0].value, b"bin");
+    let plain = client.consume("lin", 0, 0, 100, 1 << 20).await?;
+    assert_eq!(plain.records.len(), 7);
+
+    let pipelined = es_broker::binary::PipelinedClient::connect(bin_addr, "").await?;
+    let resp = pipelined
+        .consume_linearizable("lin", 0, produced[0].offset, 10, 1 << 20)
+        .await?;
+    assert_eq!(resp.records[0].value, b"bin");
+    pipelined.shutdown().await;
+
+    handle.shutdown().await?;
+    Ok(())
+}
+
+/// Without Raft a partition has one copy, written before it is acknowledged:
+/// a linearizable read is a plain one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn linearizable_consume_on_a_standalone_broker_is_a_plain_read() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let (base, handle) = boot(&tmp, 1 << 20).await?;
+    let http = Client::new();
+    create_topic(&http, &base, "solo", 1).await?;
+    produce(
+        &http,
+        &base,
+        "solo",
+        vec![ProduceRecord {
+            key: None,
+            value: "x".into(),
+            partition: Some(0),
+            sequence: None,
+        }],
+    )
+    .await?;
+    let resp: ConsumeResponse = consume_with(&http, &base, "solo", 0, Some("linearizable"))
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(resp.records.len(), 1);
+    handle.shutdown().await?;
+    Ok(())
+}
