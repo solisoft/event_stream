@@ -18,7 +18,8 @@
 <h2>Start a three-node cluster</h2>
 <p>
   Start each broker with its own id, the address its peers reach it on, every other member, and the same secret.
-  The membership is exactly the brokers you list; there is no discovery.
+  The membership is exactly the brokers you list; there is no discovery. To change it later, see
+  <a href="#adding-and-removing-brokers">Adding and removing brokers</a>.
 </p>
 <figure class="code">
   <figcaption><span>node 1</span></figcaption>
@@ -189,6 +190,65 @@ openssl x509 -req -in node1.csr -CA ca.pem -CAkey ca.key -days 365 -extfile node
   <li>If writing fails, the node stops instead of answering, so it can never vote twice in a term or confirm entries it does not have.</li>
 </ul>
 
+<h2 id="adding-and-removing-brokers">Adding and removing brokers</h2>
+<p>
+  The membership can change while the cluster runs, one broker at a time, through
+  <a href="<%= docs_api_path() %>">/admin/raft/members</a>. Each change is a single-server step: it adds or removes one
+  voter, takes effect in a partition as soon as it is in that partition's log, and the next change waits until it has
+  committed. Any majority before the step and any majority after it share a broker, so the cluster can never elect two
+  leaders while it changes. The transport follows: an added broker is dialed and accepted, a removed one is
+  disconnected and refused, with no restart.
+</p>
+<p>
+  Each partition has its own leader, and only that leader can change it. A request changes the partitions the
+  broker it is sent to leads, and lists the others with their leader. So send each change to every broker, and check
+  that every partition reports <code>committed</code> or <code>already</code>.
+</p>
+
+<h3>Add a broker</h3>
+<ol class="steps">
+  <li><p><strong>Start it as a joiner.</strong> Give it its id, its Raft address, the current members with
+    <code>--raft-peer</code>, the cluster's secret or a certificate naming it, and <code>--raft-join</code>. It replicates
+    whatever it is sent but never campaigns until it is a member.</p></li>
+  <li><p><strong>Create every topic on it</strong>, with the same names and partition counts.</p></li>
+  <li><p><strong>Add it on every broker.</strong> Each adds it to the partitions it leads; the leader then streams it
+    the records it is missing.</p></li>
+  <li><p><strong>Check.</strong> <code>GET /admin/raft/members</code> on the new broker lists it among the voters of
+    every partition. Add <code>--raft-peer 4=…</code> to the other brokers' configuration for their next restart.</p></li>
+</ol>
+<figure class="code">
+  <figcaption><span>node 4, then each member</span></figcaption>
+<pre>es-broker --data-dir /var/lib/es --bind 10.0.0.4:9000 --auth required \
+  --raft-node-id 4 --raft-bind 10.0.0.4:6000 --raft-join \
+  --raft-peer 1=10.0.0.1:6000 --raft-peer 2=10.0.0.2:6000 --raft-peer 3=10.0.0.3:6000
+
+<span class="c-key">for</span> b <span class="c-key">in</span> 10.0.0.1 10.0.0.2 10.0.0.3; <span class="c-key">do</span>
+  curl -s -X POST -H <span class="c-str">"authorization: Bearer $ADMIN_KEY"</span> \
+    -H <span class="c-str">"content-type: application/json"</span> $b:9000/admin/raft/members \
+    -d <span class="c-str">'{"id": 4, "addr": "10.0.0.4:6000"}'</span>
+<span class="c-key">done</span></pre>
+</figure>
+
+<h3>Remove a broker</h3>
+<ol class="steps">
+  <li><p><strong>Remove it on every broker, itself included.</strong> <code>DELETE /admin/raft/members/3</code>. Where it
+    leads, it manages its own removal, without counting itself, and steps down once the removal commits; the others then
+    elect a leader among themselves.</p></li>
+  <li><p><strong>Stop it</strong> once every partition reports the removal. The others have already disconnected it and
+    refuse its connections.</p></li>
+  <li><p><strong>Drop its <code>--raft-peer</code></strong> from the others' configuration.</p></li>
+</ol>
+<aside class="note">
+  <p>One change at a time</p>
+  <p>A request is refused with 409 while any partition on that broker has a change that has not committed. Finish one
+    change on every broker before starting the next, and do not create topics in between: a new topic starts from the
+    membership its broker sees at that moment. To replace a broker, add the new one first, then remove the old one.</p>
+</aside>
+<p class="small">
+  A restarted broker takes its membership from each partition's log and snapshot, not from <code>--raft-peer</code>;
+  the flags matter for topics with no recorded change, and for brokers started fresh.
+</p>
+
 <h2>Checking a cluster</h2>
 <figure class="code">
   <figcaption><span>shell</span></figcaption>
@@ -203,7 +263,7 @@ openssl x509 -req -in node1.csr -CA ca.pem -CAkey ca.key -days 365 -extfile node
 <h2>Limitations</h2>
 <ul>
   <li><strong>No leader forwarding.</strong> Clients must send produces to the leader.</li>
-  <li><strong>Static membership.</strong> Adding or removing a broker means restarting every broker with the new peer list.</li>
+  <li><strong>Membership changes go to each leader.</strong> A change is applied by the leader of each partition, so it is sent to every broker. One broker at a time; there is no joint consensus.</li>
   <li><strong>No linearizable reads.</strong> A follower serves what it has applied.</li>
   <li><strong>No pre-vote.</strong> A rejoining broker cannot win an election against a healthy leader, but its higher term can make the leader step down once.</li>
   <li><strong>Topics are created per broker.</strong> Create each topic, with the same partition count, on every member.</li>

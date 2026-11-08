@@ -75,6 +75,15 @@
 //! Without a secret or TLS (allowed only on a loopback bind) the same exchange
 //! runs with an empty key: no authentication, but the same framing.
 //!
+//! # Membership
+//!
+//! Whom the hub dials and accepts follows the groups' configurations, not the
+//! command line: the union, over every registered group, of its latest and its
+//! committed configuration. A broker added at runtime is dialed at the address
+//! its config entry carries; one removed from every group is disconnected and
+//! refused once the removal has committed. Until a group reports its
+//! configuration, `--raft-peer` stands. See `Mesh`.
+//!
 //! # Inbound limits
 //!
 //! With authentication configured, a connection whose source address is not
@@ -114,6 +123,7 @@ use tokio_util::sync::CancellationToken;
 use super::messages::{Message, NodeId};
 use super::node::Outbound;
 use super::secret::SharedSecret;
+use super::state::MembershipView;
 use super::tls::RaftTls;
 
 /// The handshake this build speaks: version 3, dialer proves first.
@@ -700,6 +710,7 @@ pub struct RaftHub {
     cancel: CancellationToken,
     peer_senders: PeerSenders,
     groups: Groups,
+    mesh: Arc<Mesh>,
 }
 
 impl std::fmt::Debug for RaftHub {
@@ -815,18 +826,23 @@ impl RaftHub {
 
         // --- listener: accept inbound peer connections ---
         let inbound = Inbound::new(groups.clone(), cancel.clone(), auth.clone(), allowed_ips);
-        tokio::spawn(inbound.accept_loop(listener));
+        tokio::spawn(inbound.clone().accept_loop(listener));
 
-        // --- one dialer task per peer ---
-        for (peer_id, peer_addr) in peers {
-            let (peer_tx, peer_rx) = mpsc::channel::<Arc<Vec<u8>>>(PEER_QUEUE);
-            peer_senders.insert(peer_id, peer_tx);
-            let cancel = cancel.clone();
-            let auth = auth.clone();
-            tokio::spawn(async move {
-                dial_loop(peer_id, peer_addr, peer_rx, reconnect_backoff, cancel, auth).await;
-            });
-        }
+        // --- one dialer task per peer: the configured ones until a group
+        // reports its own configuration ---
+        let mesh = Arc::new(Mesh {
+            me: node_id,
+            auth,
+            inbound: inbound.clone(),
+            peer_senders: peer_senders.clone(),
+            cancel: cancel.clone(),
+            backoff: reconnect_backoff,
+            configured: peers,
+            authenticated,
+            state: Mutex::new(MeshState::default()),
+            next_registration: AtomicU64::new(0),
+        });
+        mesh.reconcile(&mut mesh.state.lock().unwrap());
 
         Ok(Arc::new(Self {
             node_id,
@@ -834,6 +850,7 @@ impl RaftHub {
             cancel,
             peer_senders,
             groups,
+            mesh,
         }))
     }
 
@@ -876,6 +893,11 @@ impl RaftHub {
         let senders = self.peer_senders.clone();
         let groups = self.groups.clone();
         let node_id = self.node_id;
+        let mesh = self.mesh.clone();
+        // Keyed by registration, not by name: a dispatcher outliving its
+        // group must not take away the view of the group registered next
+        // under the same name.
+        let registration = mesh.next_registration.fetch_add(1, Ordering::Relaxed);
         let join = tokio::spawn(async move {
             let enqueue = |peer: NodeId, payload: Arc<Vec<u8>>| {
                 if let Some(s) = senders.get(&peer) {
@@ -900,6 +922,7 @@ impl RaftHub {
                                     enqueue(p, payload.clone());
                                 }
                             }
+                            Outbound::Membership(view) => mesh.set_view(registration, Some(view)),
                         }
                     }
                 }
@@ -908,6 +931,8 @@ impl RaftHub {
             // *our* registration: a topic deleted and recreated under the same
             // name has a new one, and removing by name took that away too.
             groups.remove_if(&group, |_, v| v.same_channel(&inbound_tx));
+            // Nor does its configuration keep anyone connected any more.
+            mesh.set_view(registration, None);
             tracing::debug!(node = node_id, group = %group, "raft group dispatcher exited");
         });
         Ok(join)
@@ -922,8 +947,167 @@ impl RaftHub {
         self.groups.len()
     }
 
+    /// The members this hub dials and accepts, this node excluded, with the
+    /// Raft address of each when known.
+    pub fn members(&self) -> BTreeMap<NodeId, Option<SocketAddr>> {
+        let st = self.mesh.state.lock().unwrap();
+        if st.applied {
+            st.target.clone()
+        } else {
+            self.mesh.target(&st)
+        }
+    }
+
+    /// Whether this node is a voter in any registered group's latest
+    /// configuration; `None` while no group has reported one.
+    pub fn is_voter(&self) -> Option<bool> {
+        let st = self.mesh.state.lock().unwrap();
+        if st.views.is_empty() {
+            return None;
+        }
+        Some(st.views.values().any(|v| v.latest.contains(self.node_id)))
+    }
+
     pub fn shutdown(&self) {
         self.cancel.cancel();
+    }
+}
+
+/// Who the hub talks to: the union of every registered group's
+/// configuration, latest and committed, or the configured peers while no
+/// group has reported one.
+///
+/// The transport follows the membership rather than the command line, so a
+/// member added at runtime is dialed and accepted, and a removed one is
+/// disconnected and refused, without a restart. A node stays connected while
+/// any group still counts it — in its latest configuration, or in the
+/// committed one while a change that removes it is pending: the entry that
+/// removes a leader has to reach the others from that leader.
+struct Mesh {
+    me: NodeId,
+    auth: Arc<HubAuth>,
+    inbound: Arc<Inbound>,
+    peer_senders: PeerSenders,
+    cancel: CancellationToken,
+    backoff: Duration,
+    /// `--raft-peer`: the membership until a group says otherwise, and the
+    /// address of a member a configuration names without one.
+    configured: BTreeMap<NodeId, SocketAddr>,
+    /// Whether to filter inbound connections by source address.
+    authenticated: bool,
+    state: Mutex<MeshState>,
+    next_registration: AtomicU64,
+}
+
+#[derive(Default)]
+struct MeshState {
+    views: HashMap<u64, MembershipView>,
+    /// The members dialed and accepted now, this node excluded.
+    target: BTreeMap<NodeId, Option<SocketAddr>>,
+    dialers: HashMap<NodeId, (SocketAddr, CancellationToken)>,
+    /// `target` has been applied at least once.
+    applied: bool,
+}
+
+impl Mesh {
+    fn set_view(&self, registration: u64, view: Option<MembershipView>) {
+        let mut st = self.state.lock().unwrap();
+        match view {
+            Some(v) => st.views.insert(registration, v),
+            None => st.views.remove(&registration),
+        };
+        self.reconcile(&mut st);
+    }
+
+    fn target(&self, st: &MeshState) -> BTreeMap<NodeId, Option<SocketAddr>> {
+        if st.views.is_empty() {
+            return self
+                .configured
+                .iter()
+                .map(|(id, a)| (*id, Some(*a)))
+                .collect();
+        }
+        let mut out: BTreeMap<NodeId, Option<SocketAddr>> = BTreeMap::new();
+        for view in st.views.values() {
+            for config in [&view.latest, &view.committed] {
+                for (id, addr) in &config.voters {
+                    if *id == self.me {
+                        continue;
+                    }
+                    let known = addr
+                        .parse::<SocketAddr>()
+                        .ok()
+                        .or_else(|| self.configured.get(id).copied());
+                    let slot = out.entry(*id).or_insert(None);
+                    if slot.is_none() {
+                        *slot = known;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Make the connections match the membership: dial and accept whoever
+    /// joined, disconnect and refuse whoever left.
+    fn reconcile(&self, st: &mut MeshState) {
+        let target = self.target(st);
+        if st.applied && target == st.target {
+            return;
+        }
+        *self.auth.peers.write().unwrap() = target.keys().copied().collect();
+        if self.authenticated {
+            let known: BTreeMap<NodeId, SocketAddr> = target
+                .iter()
+                .filter_map(|(id, a)| a.map(|a| (*id, a)))
+                .collect();
+            *self.inbound.allowed_ips.write().unwrap() = peer_source_filter(&known);
+        }
+        for id in st.target.keys() {
+            if !target.contains_key(id) {
+                tracing::info!(peer = id, "raft: no longer a member; disconnected");
+                self.inbound.disconnect(*id);
+            }
+        }
+        let stale: Vec<NodeId> = st
+            .dialers
+            .iter()
+            .filter(|(id, (addr, _))| target.get(*id) != Some(&Some(*addr)))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in stale {
+            if let Some((_, token)) = st.dialers.remove(&id) {
+                token.cancel();
+            }
+            self.peer_senders.remove(&id);
+        }
+        for (id, addr) in &target {
+            let Some(addr) = addr else {
+                tracing::warn!(
+                    peer = id,
+                    "raft: member has no known address; it cannot be dialed until one is \
+                     configured with --raft-peer"
+                );
+                continue;
+            };
+            if st.dialers.contains_key(id) {
+                continue;
+            }
+            if st.applied {
+                tracing::info!(peer = id, %addr, "raft: new member; dialing");
+            }
+            let (tx, rx) = mpsc::channel::<Arc<Vec<u8>>>(PEER_QUEUE);
+            self.peer_senders.insert(*id, tx);
+            let token = self.cancel.child_token();
+            st.dialers.insert(*id, (*addr, token.clone()));
+            let auth = self.auth.clone();
+            let (id, addr, backoff) = (*id, *addr, self.backoff);
+            tokio::spawn(async move {
+                dial_loop(id, addr, rx, backoff, token, auth).await;
+            });
+        }
+        st.target = target;
+        st.applied = true;
     }
 }
 
@@ -1113,8 +1297,9 @@ struct Inbound {
     groups: Groups,
     cancel: CancellationToken,
     auth: Arc<HubAuth>,
-    /// Source addresses accepted at all; `None` accepts any.
-    allowed_ips: Option<HashSet<IpAddr>>,
+    /// Source addresses accepted at all; `None` accepts any. Follows the
+    /// membership.
+    allowed_ips: RwLock<Option<HashSet<IpAddr>>>,
     handshakes: Arc<Semaphore>,
     handshakes_per_ip: Mutex<HashMap<IpAddr, usize>>,
     /// The live inbound connection of each authenticated peer: its id and the
@@ -1154,7 +1339,7 @@ impl Inbound {
             groups,
             cancel,
             auth,
-            allowed_ips,
+            allowed_ips: RwLock::new(allowed_ips),
             handshakes: Arc::new(Semaphore::new(MAX_HANDSHAKES)),
             handshakes_per_ip: Mutex::new(HashMap::new()),
             established: Mutex::new(HashMap::new()),
@@ -1194,7 +1379,7 @@ impl Inbound {
     /// take its slot if so. Dropping the socket is the refusal.
     fn admit(self: &Arc<Self>, ip: IpAddr) -> Option<HandshakeSlot> {
         let ip = ip.to_canonical();
-        if let Some(allowed) = &self.allowed_ips {
+        if let Some(allowed) = &*self.allowed_ips.read().unwrap() {
             if !allowed.contains(&ip) {
                 tracing::warn!(%ip, "raft: connection from an address that is no configured peer's; closed");
                 return None;
@@ -1238,6 +1423,14 @@ impl Inbound {
             old.cancel();
         }
         (id, token)
+    }
+
+    /// Close `peer`'s inbound connection, if it has one: it left the
+    /// membership.
+    fn disconnect(&self, peer: NodeId) {
+        if let Some((_, token)) = self.established.lock().unwrap().remove(&peer) {
+            token.cancel();
+        }
     }
 
     fn release(&self, peer: NodeId, id: u64) {
@@ -2234,5 +2427,146 @@ mod identity_tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("cannot speak TLS"), "{err}");
+    }
+}
+
+/// Bonfire #731: the transport follows the membership.
+#[cfg(test)]
+mod membership_tests {
+    use super::tests::{registry, sample_msg, SECRET};
+    use super::*;
+    use crate::raft::membership::Membership;
+
+    fn view(latest: &[(NodeId, &str)], committed: &[(NodeId, &str)]) -> MembershipView {
+        let m = |ids: &[(NodeId, &str)]| Membership {
+            voters: ids.iter().map(|(id, a)| (*id, a.to_string())).collect(),
+        };
+        MembershipView {
+            latest: m(latest),
+            committed: m(committed),
+        }
+    }
+
+    async fn handshake(hub: &RaftHub, as_id: NodeId) -> std::io::Result<(TcpStream, Session)> {
+        let mut c = TcpStream::connect(hub.local_addr()).await?;
+        let s = dialer_handshake(&mut c, as_id, 1, SECRET).await?;
+        Ok((c, s))
+    }
+
+    async fn wait_until(mut f: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            if f() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn a_removed_peer_is_disconnected_and_refused_and_an_added_one_accepted() {
+        let (_groups, _rxs) = registry(&[]);
+        let unused: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let hub = RaftHub::bind(
+            1,
+            "127.0.0.1:0".parse().unwrap(),
+            BTreeMap::from([(7, unused)]),
+            Duration::from_millis(20),
+            Some(SharedSecret::new(SECRET).unwrap()),
+        )
+        .await
+        .unwrap();
+        let (in_tx, mut in_rx) = mpsc::unbounded_channel();
+        let (out_tx, out_rx) = mpsc::unbounded_channel();
+        hub.register(DEFAULT_GROUP, in_tx, out_rx).unwrap();
+
+        let (_first, _) = handshake(&hub, 7).await.expect("7 is a configured peer");
+        assert!(handshake(&hub, 8).await.is_err(), "8 is nobody yet");
+
+        // Node 8 added; 7's removal appended but not committed: both count.
+        out_tx
+            .send(Outbound::Membership(view(
+                &[(1, ""), (8, "127.0.0.1:9")],
+                &[(1, ""), (7, ""), (8, "127.0.0.1:9")],
+            )))
+            .unwrap();
+        assert!(
+            wait_until(|| hub.members().contains_key(&8)).await,
+            "{:?}",
+            hub.members()
+        );
+        // A redial replaces 7's first connection: keep the live one.
+        let (mut seven, _) = handshake(&hub, 7)
+            .await
+            .expect("a member whose removal has not committed is still accepted");
+
+        // The removal commits: 7 is cut off and refused.
+        out_tx
+            .send(Outbound::Membership(view(
+                &[(1, ""), (8, "127.0.0.1:9")],
+                &[(1, ""), (8, "127.0.0.1:9")],
+            )))
+            .unwrap();
+        assert!(wait_until(|| !hub.members().contains_key(&7)).await);
+        let mut buf = [0u8; 64];
+        let closed = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match seven.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+            }
+        })
+        .await;
+        assert!(closed.is_ok(), "the removed member's connection is closed");
+        assert!(handshake(&hub, 7).await.is_err(), "and it cannot come back");
+
+        // The added member is accepted, and its traffic flows.
+        let (mut eight, mut s) = handshake(&hub, 8)
+            .await
+            .expect("an added member is accepted");
+        eight
+            .write_all(&s.frame(DEFAULT_GROUP, &sample_msg(8)))
+            .await
+            .unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(1), in_rx.recv())
+            .await
+            .expect("frames from the added member are routed");
+        assert_eq!(got.unwrap().sender(), 8);
+        assert_eq!(
+            hub.members(),
+            BTreeMap::from([(8, Some("127.0.0.1:9".parse().unwrap()))])
+        );
+        assert_eq!(hub.is_voter(), Some(true));
+        hub.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_group_that_goes_away_no_longer_holds_its_members() {
+        let hub = RaftHub::bind(
+            1,
+            "127.0.0.1:0".parse().unwrap(),
+            BTreeMap::new(),
+            Duration::from_millis(20),
+            None,
+        )
+        .await
+        .unwrap();
+        let (in_tx, _in_rx) = mpsc::unbounded_channel();
+        let (out_tx, out_rx) = mpsc::unbounded_channel();
+        let dispatcher = hub.register("t/0", in_tx, out_rx).unwrap();
+        out_tx
+            .send(Outbound::Membership(view(
+                &[(1, ""), (5, "127.0.0.1:9")],
+                &[(1, ""), (5, "127.0.0.1:9")],
+            )))
+            .unwrap();
+        assert!(wait_until(|| hub.members().contains_key(&5)).await);
+        drop(out_tx);
+        dispatcher.await.unwrap();
+        assert!(hub.members().is_empty(), "{:?}", hub.members());
+        assert_eq!(hub.is_voter(), None);
+        hub.shutdown();
     }
 }

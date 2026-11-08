@@ -29,6 +29,7 @@ async fn single_node_append_roundtrip() -> Result<()> {
             raft_store_path: raft_path.clone(),
             timing: test_timing(),
             snapshot_after_applies: 0, // disabled for this test
+            joining: false,
         },
     )?;
 
@@ -85,6 +86,7 @@ async fn raft_partition_state_survives_restart() -> Result<()> {
                 raft_store_path: raft_path.clone(),
                 timing: test_timing(),
                 snapshot_after_applies: 0,
+                joining: false,
             },
         )?;
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -110,6 +112,7 @@ async fn raft_partition_state_survives_restart() -> Result<()> {
                 raft_store_path: raft_path,
                 timing: test_timing(),
                 snapshot_after_applies: 0,
+                joining: false,
             },
         )?;
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -148,6 +151,7 @@ async fn auto_snapshot_keeps_raft_log_bounded() -> Result<()> {
             raft_store_path: raft_path.clone(),
             timing: test_timing(),
             snapshot_after_applies: 50, // small so we see multiple snapshots
+            joining: false,
         },
     )?;
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -193,6 +197,7 @@ async fn auto_snapshot_keeps_raft_log_bounded() -> Result<()> {
             raft_store_path: raft_path,
             timing: test_timing(),
             snapshot_after_applies: 50,
+            joining: false,
         },
     )?;
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -227,6 +232,7 @@ async fn partition_handle_raft_roundtrip() -> Result<()> {
                 heartbeat: Duration::from_millis(20),
             },
             snapshot_after_applies: 0,
+            joining: false,
             bind: None,
             peer_addrs: BTreeMap::new(),
             shared_secret: None,
@@ -279,6 +285,7 @@ async fn partition_handle_raft_survives_restart() -> Result<()> {
             heartbeat: Duration::from_millis(20),
         },
         snapshot_after_applies: 0,
+        joining: false,
         bind: None,
         peer_addrs: BTreeMap::new(),
         shared_secret: None,
@@ -339,6 +346,7 @@ async fn two_node_tcp_replication() -> Result<()> {
         raft_store_path: tmp1.path().join("raft.json"),
         timing,
         snapshot_after_applies: 0,
+        joining: false,
     };
     let cfg2 = RaftPartitionConfig {
         node_id: 2,
@@ -346,6 +354,7 @@ async fn two_node_tcp_replication() -> Result<()> {
         raft_store_path: tmp2.path().join("raft.json"),
         timing,
         snapshot_after_applies: 0,
+        joining: false,
     };
 
     let rp1 = RaftPartition::open(tmp1.path().join("p0"), 0, 1 << 20, 1, cfg1)?;

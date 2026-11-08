@@ -7,15 +7,19 @@
 //! * `transport` — one authenticated connection per peer, many groups over it.
 //! * `secret` — the cluster's shared secret: long enough, never printed.
 //! * `tls` — per-broker identity: mTLS certificates that name the node id.
+//! * `membership` — single-server configuration changes and their log entries.
 //!
-//! Not implemented: joint-consensus membership changes (config entries are
-//! applied, but there is no safe reconfiguration protocol on top of them) and
-//! linearizable reads (reads are served from whatever the replica has applied).
-//! Nothing outside tests proposes a config entry: the membership is the
-//! configured one, and removing a member means restarting the others without
-//! it — which is also what takes away its access to their raft ports.
+//! Membership changes are single-server (one voter added or removed at a
+//! time, in effect when appended), proposed through `/admin/raft/members`, and
+//! the transport follows them: an added broker is dialed and accepted, a
+//! removed one disconnected and refused, without a restart. Joint consensus
+//! (several voters at once) is not implemented.
+//!
+//! Not implemented: linearizable reads (reads are served from whatever the
+//! replica has applied).
 
 pub mod log;
+pub mod membership;
 pub mod messages;
 pub mod node;
 pub mod secret;
@@ -26,6 +30,7 @@ pub mod transport;
 pub use log::{
     FileStore, JsonStore, Log, MemStore, PersistOp, PersistedRaft, PersistedSnapshot, RaftStore,
 };
+pub use membership::{MemberChange, Membership};
 pub use messages::{LogEntry, LogIndex, Message, NodeId, Term};
 pub use node::{
     spawn_node, spawn_node_with_options, spawn_node_with_store, NodeHandle, NodeOptions, Outbound,

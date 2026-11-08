@@ -35,12 +35,12 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::partition::{now_ms, AppendRecord, Durability, Partition};
-use crate::raft::state::{is_config_entry, RaftState};
+use crate::raft::state::{is_config_entry, ChangeRefused, RaftState};
 use crate::raft::{
     spawn_node_with_options,
     transport::{RaftHub, Transport},
-    JsonStore, LogIndex, NodeHandle, NodeId, NodeOptions, Outbound, ProposeReply, RaftStore,
-    SnapshotSender, SnapshotTransfer, Timing,
+    JsonStore, LogIndex, MemberChange, NodeHandle, NodeId, NodeOptions, Outbound, ProposeReply,
+    RaftStore, SnapshotSender, SnapshotTransfer, Timing,
 };
 use tokio::sync::Mutex as TokioMutex;
 
@@ -213,6 +213,8 @@ pub struct RaftPartitionConfig {
     pub raft_store_path: PathBuf,
     pub timing: Timing,
     pub snapshot_after_applies: u32,
+    /// See [`crate::raft::NodeOptions::joining`].
+    pub joining: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -232,6 +234,7 @@ impl RaftPartitionConfig {
             raft_store_path,
             timing: Timing::default(),
             snapshot_after_applies: 1024,
+            joining: false,
         }
     }
 }
@@ -356,6 +359,7 @@ impl RaftPartition {
             transfer: Some(Arc::new(PartitionTransfer {
                 partition: partition.clone(),
             })),
+            joining: config.joining,
         };
         let mut raft = spawn_node_with_options(
             config.node_id,
@@ -437,6 +441,15 @@ impl RaftPartition {
         .await?;
         *self.transport.lock().unwrap() = Some(transport);
         Ok(())
+    }
+
+    /// Propose a single-server membership change for this partition's
+    /// group. See [`NodeHandle::change_membership`].
+    pub async fn change_membership(
+        &self,
+        change: MemberChange,
+    ) -> Result<std::result::Result<LogIndex, ChangeRefused>> {
+        self.raft.change_membership(change).await
     }
 
     /// The Raft state machine behind this partition, for reporting only.

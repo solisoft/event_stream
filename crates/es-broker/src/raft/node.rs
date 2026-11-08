@@ -20,8 +20,9 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::log::{PersistOp, PersistedSnapshot, RaftStore};
+use super::membership::MemberChange;
 use super::messages::{InstallSnapshot, LogEntry, LogIndex, Message, NodeId, PROBE_OFFSET};
-use super::state::{Action, ProposeOutcome, RaftState, Role};
+use super::state::{Action, ChangeRefused, MembershipView, ProposeOutcome, RaftState, Role};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Timing {
@@ -44,6 +45,9 @@ impl Default for Timing {
 pub enum Outbound {
     SendTo(NodeId, Message),
     Broadcast(Message),
+    /// The group's configuration, for the transport to follow. Sent once at
+    /// start and again whenever it changes.
+    Membership(MembershipView),
 }
 
 /// Reply to a propose request.
@@ -79,11 +83,19 @@ pub struct NodeOptions {
     /// Chunked state transfer for lagging followers. Without one, a snapshot
     /// is sent as its stored bytes in a single message.
     pub transfer: Option<Arc<dyn SnapshotTransfer>>,
+    /// Start outside the configuration, waiting to be added: see
+    /// [`RaftState::set_joining`].
+    pub joining: bool,
 }
 
 struct ProposeReq {
     payload: Vec<u8>,
     ack: oneshot::Sender<ProposeReply>,
+}
+
+struct MemberReq {
+    change: MemberChange,
+    ack: oneshot::Sender<Result<LogIndex, ChangeRefused>>,
 }
 
 struct SnapshotReq {
@@ -130,6 +142,7 @@ pub struct NodeHandle {
     pub cancel: CancellationToken,
     pub join: Option<JoinHandle<()>>,
     propose_tx: mpsc::UnboundedSender<ProposeReq>,
+    member_tx: mpsc::UnboundedSender<MemberReq>,
     snapshot_tx: mpsc::UnboundedSender<SnapshotReq>,
     pub store: Arc<dyn RaftStore>,
     /// When each peer was last heard from, in monotonic time.
@@ -222,6 +235,22 @@ impl NodeHandle {
         }
     }
 
+    /// Propose a single-server membership change. Resolves once the entry is
+    /// appended to the leader's log durably — when the new configuration
+    /// takes effect — with the entry's index; whether it then commits is
+    /// for the caller to watch.
+    pub async fn change_membership(
+        &self,
+        change: MemberChange,
+    ) -> Result<Result<LogIndex, ChangeRefused>> {
+        let (tx, rx) = oneshot::channel();
+        self.member_tx
+            .send(MemberReq { change, ack: tx })
+            .map_err(|_| anyhow::anyhow!("node loop exited"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("membership ack dropped"))
+    }
+
     /// Propose a new log entry. Resolves once the entry has been appended to
     /// the leader's log *durably* (NOT yet when committed). Callers monitor
     /// commitment via the `committed` receiver.
@@ -254,15 +283,23 @@ pub fn spawn_node_with_options(
 ) -> Result<NodeHandle> {
     let mut initial = RaftState::new(me, peers.clone());
     initial.noop_on_elect = options.noop_on_elect;
+    if options.joining {
+        initial.set_joining();
+    }
     let snap = store.load()?;
     let snapshot = store.load_snapshot()?;
     initial.restore(snap, snapshot.as_ref())?;
+    let initial_view = initial.membership_view();
     let state = Arc::new(Mutex::new(initial));
 
     let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel::<Message>();
     let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<Outbound>();
+    // The transport learns the configuration before any message: it decides
+    // whom this group may hear from and talk to.
+    let _ = outbound_tx.send(Outbound::Membership(initial_view));
     let (committed_tx, committed_rx) = mpsc::unbounded_channel::<LogEntry>();
     let (propose_tx, mut propose_rx) = mpsc::unbounded_channel::<ProposeReq>();
+    let (member_tx, mut member_rx) = mpsc::unbounded_channel::<MemberReq>();
     let (snapshot_tx, mut snapshot_rx) = mpsc::unbounded_channel::<SnapshotReq>();
     let cancel = CancellationToken::new();
     let failed = Arc::new(AtomicBool::new(false));
@@ -324,6 +361,23 @@ pub fn spawn_node_with_options(
                         let _ = req.ack.send(reply);
                     }
 
+                    req = member_rx.recv() => {
+                        let Some(req) = req else { return Ok(()); };
+                        let (reply, actions) = {
+                            let mut s = d.state.lock().await;
+                            match s.propose_member_change(&req.change) {
+                                Ok((index, mut actions)) => {
+                                    actions.extend(s.on_heartbeat_tick());
+                                    (Ok(index), actions)
+                                }
+                                Err(refused) => (Err(refused), Vec::new()),
+                            }
+                        };
+                        // Durable before the caller hears it took effect.
+                        d.apply_and_persist(actions).await?;
+                        let _ = req.ack.send(reply);
+                    }
+
                     req = snapshot_rx.recv() => {
                         let Some(req) = req else { return Ok(()); };
                         // Outer error: the store failed (fatal). Inner: the
@@ -369,6 +423,7 @@ pub fn spawn_node_with_options(
         cancel,
         join: Some(join),
         propose_tx,
+        member_tx,
         snapshot_tx,
         store: store_for_handle,
         last_contact,
@@ -476,7 +531,7 @@ impl Driver {
             ));
             return Ok(());
         }
-        let pending_snapshot = PersistedSnapshot {
+        let mut pending_snapshot = PersistedSnapshot {
             last_index: is.last_index,
             last_term: is.last_term,
             data: if self.transfer.is_some() {
@@ -490,12 +545,17 @@ impl Driver {
             } else {
                 is.data.clone()
             },
+            members: None,
         };
         let done = is.done;
         let (actions, installed) = {
             let mut s = self.state.lock().await;
             let before = s.log.base_index;
             let actions = s.on_message_with_progress(Message::InstallSnapshot(is), progress);
+            // Whatever voters the state machine settled on for the snapshot
+            // point — the leader's, or our own log's — is what a restart
+            // must come back with.
+            pending_snapshot.members = Some(s.base_config.clone());
             (actions, done && s.log.base_index > before)
         };
         if installed {
@@ -564,6 +624,9 @@ impl Driver {
                     let _ = self.committed.send(entry);
                 }
                 Action::SendSnapshot(peer) => self.send_snapshot(peer).await,
+                Action::Membership(view) => {
+                    let _ = self.outbound.send(Outbound::Membership(view));
+                }
             }
         }
         Ok(())
@@ -603,6 +666,7 @@ impl Driver {
                 leader_id: me,
                 last_index: snap.last_index,
                 last_term: snap.last_term,
+                members: snap.members.clone(),
                 offset: 0,
                 done: true,
                 data: snap.data,
@@ -615,6 +679,7 @@ impl Driver {
                 offset: PROBE_OFFSET,
                 done: false,
                 data: Vec::new(),
+                members: None,
             },
             (Some(t), Some(from)) => {
                 let t = t.clone();
@@ -642,6 +707,7 @@ impl Driver {
                     offset: from,
                     done,
                     data,
+                    members: snap.members.clone(),
                 }
             }
         };
@@ -685,6 +751,7 @@ pub async fn pump_outbound(
                             let _ = s.send(msg);
                         }
                     }
+                    Outbound::Membership(_) => {}
                     Outbound::Broadcast(msg) => {
                         for (other_id, s) in inbound_for.iter() {
                             if *other_id == *id {
@@ -744,6 +811,7 @@ mod tests {
         let options = NodeOptions {
             noop_on_elect: false,
             transfer: Some(rec.clone()),
+            joining: false,
         };
         let h = spawn_node_with_options(2, vec![1, 3], timing, store, options).unwrap();
         (h, rec)
@@ -758,14 +826,18 @@ mod tests {
             offset: 0,
             done: false,
             data: marker.to_vec(),
+            members: None,
         })
     }
 
     async fn next_outbound(h: &mut NodeHandle) -> Option<Outbound> {
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline {
-            if let Some(o) = h.try_recv_outbound() {
-                return Some(o);
+            match h.try_recv_outbound() {
+                // The transport's business, not the protocol under test.
+                Some(Outbound::Membership(_)) => continue,
+                Some(o) => return Some(o),
+                None => {}
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }

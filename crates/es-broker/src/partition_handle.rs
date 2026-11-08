@@ -22,6 +22,9 @@ pub struct RaftConfig {
     pub raft_store_dir: PathBuf,
     pub timing: Timing,
     pub snapshot_after_applies: u32,
+    /// Start outside the group's configuration, waiting to be added
+    /// (`--raft-join`).
+    pub joining: bool,
     pub bind: Option<SocketAddr>,
     pub peer_addrs: BTreeMap<crate::raft::NodeId, SocketAddr>,
     /// Pre-shared secret peers must present in the raft handshake.
@@ -36,6 +39,7 @@ impl Default for RaftConfig {
             raft_store_dir: PathBuf::from("."),
             timing: Timing::default(),
             snapshot_after_applies: 1024,
+            joining: false,
             bind: None,
             peer_addrs: BTreeMap::new(),
             shared_secret: None,
@@ -254,6 +258,7 @@ impl PartitionHandle {
                     raft_store_path: cfg.raft_store_dir.join(id.to_string()),
                     timing: cfg.timing,
                     snapshot_after_applies: cfg.snapshot_after_applies,
+                    joining: cfg.joining,
                 };
                 RaftPartition::open(dir, id, segment_bytes, flush_every_records, raft_cfg)
                     .map(Self::Raft)

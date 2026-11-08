@@ -104,16 +104,22 @@ pub async fn raft_status(
     }
 
     let node_id = broker.config.raft_node_id;
-    let mut members: Vec<u32> = broker.config.raft_peer_addrs.keys().copied().collect();
-    if let Some(me) = node_id {
+    // The live membership once the groups have reported it: after a change
+    // the command line is out of date.
+    let (mut members, voter): (Vec<u32>, bool) = match broker.raft_hub() {
+        Some(hub) => (
+            hub.members().keys().copied().collect(),
+            hub.is_voter().unwrap_or(!broker.config.raft_join),
+        ),
+        None => (
+            broker.config.raft_peer_addrs.keys().copied().collect(),
+            true,
+        ),
+    };
+    if let (Some(me), true) = (node_id, voter) {
         members.push(me);
     }
     members.sort_unstable();
-
-    // A majority of the configured group, not of whatever is currently reachable.
-    // Counting reachable nodes would make a partition of one report a quorum of
-    // one, which is the failure this endpoint exists to expose.
-    let majority = members.len() / 2 + 1;
 
     let mut partitions = Vec::new();
     let mut names: Vec<String> = broker.list_topics();
@@ -134,6 +140,11 @@ pub async fn raft_status(
 
             let state = raft.raft_state().lock().await;
             let me = state.me;
+            // A majority of the group's configuration, not of whatever is
+            // currently reachable. Counting reachable nodes would make a
+            // partition of one report a quorum of one, which is the failure
+            // this endpoint exists to expose.
+            let majority = state.config.len() / 2 + 1;
             let mut caught_up: Vec<u32> = state
                 .match_index
                 .iter()
@@ -143,7 +154,9 @@ pub async fn raft_status(
             // This node holds its own log up to its own commit index by
             // definition, so it counts — a leader that forgot to count itself
             // would report a three-member cluster as short by one.
-            caught_up.push(me);
+            if state.config.contains(me) {
+                caught_up.push(me);
+            }
             caught_up.sort_unstable();
             caught_up.dedup();
 

@@ -170,6 +170,13 @@ struct Args {
     /// once every member runs 0.3. Deprecated: removed in 0.4.
     #[arg(long)]
     raft_legacy_handshake: bool,
+
+    /// Join a running cluster: start outside its membership, with --raft-peer
+    /// naming the current members, and wait to be added with
+    /// `POST /admin/raft/members` on the leaders. Without it a new broker counts
+    /// itself a voter from the start, and campaigns.
+    #[arg(long)]
+    raft_join: bool,
 }
 
 /// A secret as clap received it. Kept opaque until it is checked, so neither
@@ -329,6 +336,7 @@ async fn main() -> Result<()> {
     config.raft_tls_key = args.raft_tls_key;
     config.raft_tls_ca = args.raft_tls_ca;
     config.raft_legacy_handshake = args.raft_legacy_handshake;
+    config.raft_join = args.raft_join;
     for (id, addr) in args.raft_peers {
         if let Some(prev) = config.raft_peer_addrs.insert(id, addr) {
             anyhow::bail!(

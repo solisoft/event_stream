@@ -109,8 +109,9 @@ registry, tiered storage, and a security and performance audit (see below).
 The [roadmap](https://es.solisoft.net/docs/roadmap) plans each of these, release by release:
 
 - **0.3**: leader routing (today a produce sent to a Raft follower fails with a leader hint and
-  the client retries), safe membership changes and opt-in linearizable reads. (Per-broker
-  identity in Raft, the other 0.3 item, is in: see `--raft-tls-*` above.)
+  the client retries) and opt-in linearizable reads. (Per-broker identity in Raft and safe
+  membership changes, the other 0.3 items, are in: see `--raft-tls-*` above and
+  `/admin/raft/members`.)
 - **0.4**: record format v2, with record headers, compression on disk and `sendfile(2)` consume.
 - **0.5**: object-store tiering.
 - **0.6**: transactions across partitions.

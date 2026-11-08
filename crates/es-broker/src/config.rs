@@ -91,6 +91,12 @@ pub struct Config {
     /// for a rolling upgrade from 0.2.1; deprecated, removed in 0.4.
     pub raft_legacy_handshake: bool,
 
+    /// Join an existing cluster: start outside every group's configuration
+    /// and wait for a leader to add this broker (`POST /admin/raft/members`),
+    /// instead of counting itself a voter from the start. Ignored once a
+    /// group's log or snapshot records its membership.
+    pub raft_join: bool,
+
     /// Cold-storage directory for tiered storage. When set, sealed segments are
     /// offloaded here instead of being deleted by retention.
     pub cold_storage_dir: Option<PathBuf>,
@@ -129,9 +135,9 @@ impl Config {
                 let any_tls = self.raft_tls_cert.is_some()
                     || self.raft_tls_key.is_some()
                     || self.raft_tls_ca.is_some();
-                if any_tls || self.raft_legacy_handshake {
+                if any_tls || self.raft_legacy_handshake || self.raft_join {
                     anyhow::bail!(
-                        "--raft-tls-* or --raft-legacy-handshake was given without \
+                        "--raft-tls-*, --raft-legacy-handshake or --raft-join was given without \
                          --raft-node-id: they configure a Raft port this broker does not open"
                     );
                 }
@@ -200,6 +206,13 @@ impl Config {
             }
         }
 
+        if self.raft_join && self.raft_peer_addrs.is_empty() {
+            anyhow::bail!(
+                "--raft-join was given without --raft-peer: a joining broker waits for the current \
+                 members to add it, and needs to know who they are"
+            );
+        }
+
         let members = self.raft_peer_addrs.len() + 1;
         if members.is_multiple_of(2) {
             tracing::warn!(
@@ -258,6 +271,7 @@ impl Config {
             raft_tls_key: None,
             raft_tls_ca: None,
             raft_legacy_handshake: false,
+            raft_join: false,
             cold_storage_dir: None,
         }
     }
@@ -301,5 +315,16 @@ mod tests {
         let mut c = Config::new("/tmp".into(), "127.0.0.1:9000".parse().unwrap(), 1024);
         c.raft_legacy_handshake = true;
         assert!(c.validate_raft().is_err());
+    }
+
+    #[test]
+    fn joining_needs_members_to_be_added_by() {
+        let mut c = member();
+        c.raft_join = true;
+        let err = c.validate_raft().unwrap_err().to_string();
+        assert!(err.contains("--raft-join"), "{err}");
+        c.raft_peer_addrs
+            .insert(2, "127.0.0.1:6001".parse().unwrap());
+        c.validate_raft().unwrap();
     }
 }
