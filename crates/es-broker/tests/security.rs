@@ -183,8 +183,10 @@ async fn a_key_without_grants_cannot_join_or_take_over_a_group() -> Result<()> {
     let b = bearer(&env.key(&[(AclActionDto::Read, "t")], None).await?);
     let nobody = bearer(&env.key(&[(AclActionDto::Read, "other")], None).await?);
 
+    // The group is named under the keys' shared prefix: a key may only claim
+    // group names within its own namespace.
     let join = |c: &Client, topics: Vec<String>, member: &str| {
-        c.post(format!("{}/groups/g/join", env.base))
+        c.post(format!("{}/groups/t.g/join", env.base))
             .json(&JoinGroupRequest {
                 member_id: Some(member.into()),
                 topics,
@@ -211,7 +213,7 @@ async fn a_key_without_grants_cannot_join_or_take_over_a_group() -> Result<()> {
     );
     // Nor commit the group's offsets.
     let r = b
-        .post(format!("{}/groups/g/commit", env.base))
+        .post(format!("{}/groups/t.g/commit", env.base))
         .json(&CommitRequest {
             topic: "t".into(),
             partition: 0,
@@ -258,7 +260,9 @@ async fn a_producer_id_belongs_to_one_key() -> Result<()> {
                     sequence: Some(seq),
                     ..record("v")
                 }],
-                producer_id: Some("shared".into()),
+                // Under the keys' shared prefix: an id outside a key's
+                // namespace cannot be claimed at all.
+                producer_id: Some("t.shared".into()),
             })
             .send()
     };

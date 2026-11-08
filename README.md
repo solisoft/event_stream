@@ -79,9 +79,14 @@ registry, tiered storage, and a security and performance audit (see below).
   this machine (DNS-rebinding guard). No CORS headers unless `--cors-origin` lists origins.
 - **TLS covers both listeners.** `--tls-cert`/`--tls-key` apply to HTTP and the binary
   protocol; giving only one of them is an error.
-- **Tenants are isolated.** ACL prefixes match at name boundaries (`orders` covers
-  `orders.eu`, not `ordersecret`); consumer groups and idempotent producer ids belong to the
-  key that first used them; `/metrics` needs a key and shows only what it can read.
+- **Tenants are isolated.** ACL prefixes match at `.` boundaries only (`orders` covers
+  `orders.eu`, not `ordersecret`, `orders-archive` or `orders_old`; spell `orders-` to mean
+  every name starting with it). Schema subjects `<topic>-value` / `<topic>-key` are
+  authorized against `<topic>`. Consumer groups and idempotent producer ids belong to the
+  key that first used them, and a key may only claim names under its own ACL prefixes
+  (`orders.billing-service`, not `billing-service`); a group or id you may not use is
+  refused the same way whether or not it exists. `/metrics` needs a key and shows only
+  what it can read.
 - **Limits.** Records up to 8 MiB on both protocols, consume responses up to 8 MiB /
   10,000 records, produce and consume byte-rate quotas per key.
 - **Raft peers authenticate each other** (HMAC challenge-response, MAC on every frame).

@@ -6,7 +6,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::auth::AclAction;
+use crate::auth::{AclAction, ApiKey};
 use crate::broker::Broker;
 use crate::schema::SchemaEntry;
 
@@ -65,10 +65,25 @@ pub async fn register(
 }
 
 // Subjects follow the `<topic>-value` / `<topic>-key` convention, so the
-// same ACL that grants reading a topic grants reading its schemas: a prefix
-// `orders` covers `orders-value` at the `-` boundary. Every key used to be
-// able to read every tenant's schemas. A schema the caller may not read is
-// reported as not found, so ids do not reveal what exists.
+// same ACL that grants reading a topic grants reading its schemas. That used
+// to fall out of `-` being an ACL boundary; now that only `.` is one, the
+// suffix is stripped here, explicitly. Every key used to be able to read
+// every tenant's schemas. A schema the caller may not read is reported as not
+// found, so ids do not reveal what exists.
+
+/// The name a subject's ACL is checked against: its topic for
+/// `<topic>-value` / `<topic>-key`, the subject itself otherwise.
+fn subject_acl_name(subject: &str) -> &str {
+    subject
+        .strip_suffix("-value")
+        .or_else(|| subject.strip_suffix("-key"))
+        .filter(|t| !t.is_empty())
+        .unwrap_or(subject)
+}
+
+fn can_read_subject(key: &ApiKey, subject: &str) -> bool {
+    key.can(AclAction::Read, subject_acl_name(subject))
+}
 
 pub async fn get(
     State(broker): State<Arc<Broker>>,
@@ -78,7 +93,7 @@ pub async fn get(
     let entry = broker
         .schemas
         .get(id)
-        .filter(|e| key.can(AclAction::Read, &e.subject))
+        .filter(|e| can_read_subject(&key, &e.subject))
         .ok_or_else(|| AppError::not_found(format!("schema {} not found", id)))?;
     Ok(Json(SchemaResponse::from(entry.as_ref())))
 }
@@ -91,7 +106,7 @@ pub async fn list(
         .schemas
         .list()
         .iter()
-        .filter(|e| key.can(AclAction::Read, &e.subject))
+        .filter(|e| can_read_subject(&key, &e.subject))
         .map(|e| SchemaResponse::from(e.as_ref()))
         .collect();
     Json(schemas)
@@ -105,7 +120,41 @@ pub async fn latest_version(
     let entry = broker
         .schemas
         .latest_version(&subject)
-        .filter(|_| key.can(AclAction::Read, &subject))
+        .filter(|_| can_read_subject(&key, &subject))
         .ok_or_else(|| AppError::not_found(format!("no schema for subject '{}'", subject)))?;
     Ok(Json(SchemaResponse::from(entry.as_ref())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::AclRule;
+
+    fn reader(prefix: &str) -> ApiKey {
+        ApiKey {
+            key_id: "k".into(),
+            name: "k".into(),
+            acls: vec![AclRule {
+                action: AclAction::Read,
+                topic_prefix: prefix.into(),
+            }],
+            produce_bytes_per_sec: None,
+            consume_bytes_per_sec: None,
+            created_at_ms: 0,
+            disabled: false,
+        }
+    }
+
+    #[test]
+    fn subjects_authorize_against_their_topic() {
+        let k = reader("orders");
+        assert!(can_read_subject(&k, "orders-value"));
+        assert!(can_read_subject(&k, "orders-key"));
+        assert!(can_read_subject(&k, "orders.eu-value"));
+        assert!(can_read_subject(&k, "orders"));
+        // Another tenant's topic that begins with the same word.
+        assert!(!can_read_subject(&k, "orders-archive-value"));
+        assert!(!can_read_subject(&k, "orderssecret-value"));
+        assert!(!can_read_subject(&k, "-value"));
+    }
 }
