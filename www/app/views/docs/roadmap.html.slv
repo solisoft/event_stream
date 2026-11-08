@@ -1,0 +1,76 @@
+<h1>Roadmap</h1>
+<p class="lede">
+  What comes next, release by release. Each release prepares the one after it, so the order matters more than the
+  dates, which are not fixed. What already shipped is in the <a href="<%= docs_changelog_path() %>">changelog</a>.
+</p>
+
+<h2 id="v0-3">0.3: a cluster you can operate</h2>
+<p>
+  Today a three-broker cluster replicates every partition, but a client has to find the leader itself and the
+  membership is fixed at startup.
+</p>
+<ul>
+  <li><strong>Leader routing.</strong> A produce sent to a follower is forwarded to the partition's leader instead of
+    failing with a hint, so clients can talk to any broker.</li>
+  <li><strong>Safe membership changes.</strong> Add or remove one broker at a time without a restart, and the transport
+    follows the current membership, so a removed broker can no longer connect.</li>
+  <li><strong>Linearizable reads, as an opt-in.</strong> Read-index or lease reads, for consumers that must not see a
+    stale replica.</li>
+  <li><strong>Per-broker identity.</strong> mTLS with the broker id in the certificate, so one broker cannot act as
+    another. Today brokers share one secret, which keeps outsiders out but lets any broker that holds it act as any
+    member. With it: an idle timeout on Raft connections, and a handshake where the dialing broker proves itself
+    first.</li>
+  <li><strong>Topic deletion and consumer groups.</strong> A deleted topic is removed from the groups subscribed to
+    it.</li>
+</ul>
+
+<h2 id="v0-4">0.4: record format v2</h2>
+<p>
+  A record holds a key, a value and a timestamp, and segments store records as they arrived. Version 2 changes the
+  format once, for everything that needs it.
+</p>
+<ul>
+  <li><strong>Record headers</strong>, and attributes that mark a record as data or as a control record. Transactions
+    write their commit and abort markers as control records.</li>
+  <li><strong>Compression on disk</strong>, per batch. Gzip is only available on the binary protocol today.</li>
+  <li><strong>Zero-copy consume.</strong> Once the batch on disk is the batch on the wire, the broker can send it from
+    the page cache with <code>sendfile(2)</code>.</li>
+  <li><strong>No migration step.</strong> Existing segments stay readable, and new segments are written in the new
+    format.</li>
+</ul>
+
+<h2 id="v0-5">0.5: object-store tiering</h2>
+<p>
+  Retention can already move old segments to a cold tier, but the only backend is a local directory, and nothing reads
+  them back.
+</p>
+<ul>
+  <li><strong>An S3-compatible backend</strong> for the cold tier.</li>
+  <li><strong>Reads that fall through to the cold tier</strong>, so a consumer can read offsets that left the local
+    disk.</li>
+</ul>
+
+<h2 id="v0-6">0.6: transactions across partitions</h2>
+<p>
+  Idempotent producers already make retries safe within a partition. Transactions make a set of writes across
+  partitions, and the consumer offsets that led to them, visible all at once or not at all. This is the largest step,
+  and it depends on 0.3 and 0.4.
+</p>
+<ul>
+  <li><strong>Producer epochs and fencing.</strong> A producer that restarts gets a new epoch, and its old instance is
+    shut out, so two copies of one producer cannot both write.</li>
+  <li><strong>A transaction coordinator.</strong> It keeps each transaction's state in a replicated internal topic, so
+    a transaction survives the loss of a broker.</li>
+  <li><strong>Commit and abort markers</strong>, written into every partition the transaction touched, as control
+    records.</li>
+  <li><strong><code>read_committed</code> consumers.</strong> They stop at the last stable offset and skip the records
+    of aborted transactions, using an index of those transactions.</li>
+  <li><strong>Offsets inside a transaction</strong>, for exactly-once consume-transform-produce: read from one topic,
+    write to another, and commit the read offset in the same transaction.</li>
+</ul>
+
+<h2 id="not-planned">Not planned</h2>
+<p>
+  <code>es</code> stays one binary you can read in an afternoon. A ZooKeeper-style external coordinator, Kafka wire
+  compatibility and a Windows build are out of scope.
+</p>

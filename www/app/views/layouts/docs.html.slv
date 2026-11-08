@@ -14,7 +14,8 @@
        ["storage", "How storage works", docs_storage_path()],
        ["cluster", "Clustering with Raft", docs_cluster_path()],
        ["tools", "Backup and restore", docs_tools_path()],
-       ["changelog", "Changelog", docs_changelog_path()]
+       ["changelog", "Changelog", docs_changelog_path()],
+       ["roadmap", "Roadmap", docs_roadmap_path()]
      ]) %>
 
   <div class="wrap docs">
@@ -36,6 +37,7 @@
           <a href="<%= docs_tools_path() %>" <% if section == "tools" %>aria-current="page"<% end %>>Backup and restore</a>
           <h2>Releases</h2>
           <a href="<%= docs_changelog_path() %>" <% if section == "changelog" %>aria-current="page"<% end %>>Changelog</a>
+          <a href="<%= docs_roadmap_path() %>" <% if section == "roadmap" %>aria-current="page"<% end %>>Roadmap</a>
         </div>
       </details>
     </nav>

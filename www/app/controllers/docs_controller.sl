@@ -61,6 +61,13 @@ class DocsController < Controller
         render("docs/changelog", { "layout": "docs" })
     end
 
+    # GET /docs/roadmap
+    def roadmap
+        @section = "roadmap"
+        @title = "Roadmap — es"
+        render("docs/roadmap", { "layout": "docs" })
+    end
+
     # GET /docs/tools
     def tools
         @section = "tools"

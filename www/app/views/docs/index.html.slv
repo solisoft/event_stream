@@ -30,8 +30,8 @@
   </tbody>
 </table>
 
-<h2>What it does not do</h2>
-<p>These Kafka features are deliberately left out:</p>
+<h2>What it does not do yet</h2>
+<p>These Kafka features are missing today. Each one is planned on the <a href="<%= docs_roadmap_path() %>">roadmap</a>:</p>
 <ul>
   <li><strong>Transactions across partitions.</strong> They need a coordinator, epochs and fencing.</li>
   <li><strong>Linearizable reads.</strong> A replica serves what it has applied; delivery is at least once.</li>

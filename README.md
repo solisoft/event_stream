@@ -99,13 +99,16 @@ registry, tiered storage, and a security and performance audit (see below).
   accepts connections only from the peers' addresses. Replication traffic is not
   encrypted: keep `--raft-bind` on a private network.
 
-## What's not here
+## What's not here yet
 
-In rough order of cost:
+The [roadmap](https://es.solisoft.net/docs/roadmap) plans each of these, release by release:
 
-- **Leader routing** — a produce sent to a Raft follower fails with a leader hint; the client retries.
-- **Safe membership changes and linearizable reads** in Raft.
-- **`sendfile(2)` consume** — zero-copy from page cache to socket. Awkward in the current wire format.
+- **0.3**: leader routing (today a produce sent to a Raft follower fails with a leader hint and
+  the client retries), safe membership changes, opt-in linearizable reads, and per-broker
+  identity in Raft.
+- **0.4**: record format v2, with record headers, compression on disk and `sendfile(2)` consume.
+- **0.5**: object-store tiering.
+- **0.6**: transactions across partitions.
 
 See `.claude/plans/i-want-a-basic-rippling-glade.md` for the full build log, including the bench surprises (fsync was the original ceiling worth ~100×; pipelining didn't help on loopback with a single partition).
 
