@@ -49,12 +49,15 @@ pub enum Error {
     /// The server answered the request with an error (unknown topic, a
     /// sequence gap, a missing grant…). The connection is still good.
     Server(String),
+    /// The request could not be encoded (a topic or key longer than its
+    /// length field allows). Nothing was sent: the connection is still good.
+    Invalid(String),
 }
 
 impl Error {
     /// Whether the connection can carry another request after this error.
     pub fn connection_usable(&self) -> bool {
-        matches!(self, Error::Server(_))
+        matches!(self, Error::Server(_) | Error::Invalid(_))
     }
 }
 
@@ -75,6 +78,7 @@ impl std::fmt::Display for Error {
                 write!(f, "handshake refused ({status:?}): {message}")
             }
             Error::Server(m) => write!(f, "{m}"),
+            Error::Invalid(m) => write!(f, "invalid request: {m}"),
         }
     }
 }
@@ -327,7 +331,8 @@ impl Client {
             topic: topic.to_string(),
             producer_id: producer_id.map(str::to_string),
             records,
-        });
+        })
+        .map_err(|e| Error::Invalid(e.to_string()))?;
         match self.round_trip(Opcode::Produce, &payload)? {
             (Opcode::ProduceOk, body) => {
                 decode_produce_response(&body).map_err(|e| Error::Protocol(e.to_string()))
@@ -339,7 +344,7 @@ impl Client {
     /// Read from `request.partition` of `request.topic`, starting at
     /// `request.offset`.
     pub fn consume(&mut self, request: &WireConsumeRequest) -> Result<WireConsumeResponse> {
-        let payload = encode_consume_request(request);
+        let payload = encode_consume_request(request).map_err(|e| Error::Invalid(e.to_string()))?;
         match self.round_trip(Opcode::Consume, &payload)? {
             (Opcode::ConsumeOk, body) => {
                 decode_consume_response(&body).map_err(|e| Error::Protocol(e.to_string()))
@@ -522,5 +527,6 @@ mod tests {
         assert!(Error::Server("x".into()).connection_usable());
         assert!(!Error::Protocol("x".into()).connection_usable());
         assert!(!Error::Io(io::Error::other("x")).connection_usable());
+        assert!(Error::Invalid("x".into()).connection_usable());
     }
 }
