@@ -255,6 +255,32 @@ impl RaftState {
         self.peers.contains(&id)
     }
 
+    /// Whether `term` is one a real peer could send: not absurdly far ahead
+    /// of ours, and not the value that would pin every node forever.
+    fn term_is_plausible(&self, term: Term) -> bool {
+        term <= self.current_term.saturating_add(MAX_TERM_JUMP) && term != Term::MAX
+    }
+
+    /// Whether `leader` claiming leadership of `term` contradicts what this
+    /// node already knows about `term`. A term has at most one leader: if it
+    /// is us, or one we already follow, any other claimant is lying.
+    fn conflicts_with_known_leader(&self, leader: NodeId, term: Term) -> bool {
+        term == self.current_term
+            && (self.role == Role::Leader || self.leader_hint.is_some_and(|h| h != leader))
+    }
+
+    /// Whether an AppendEntries or InstallSnapshot from `leader` for `term`
+    /// would be acted on — checked by the driver **before** it applies
+    /// snapshot data to the state machine or counts the message as a sign of
+    /// a live leader. Pure: the same checks [`Self::on_message`] makes, without
+    /// the side effects.
+    pub fn accepts_from_leader(&self, leader: NodeId, term: Term) -> bool {
+        self.is_member(leader)
+            && self.term_is_plausible(term)
+            && term >= self.current_term
+            && !self.conflicts_with_known_leader(leader, term)
+    }
+
     // ---------- timer-driven events ----------
 
     pub fn on_election_timeout(&mut self) -> Vec<Action> {
@@ -305,13 +331,24 @@ impl RaftState {
             return Vec::new();
         }
         let msg_term = msg.term();
-        if msg_term > self.current_term.saturating_add(MAX_TERM_JUMP) || msg_term == Term::MAX {
+        if !self.term_is_plausible(msg_term) {
             tracing::warn!(
                 me = self.me,
                 sender,
                 msg_term,
                 current_term = self.current_term,
                 "raft: ignoring message with an implausible term"
+            );
+            return Vec::new();
+        }
+        if matches!(msg, Message::AppendEntries(_) | Message::InstallSnapshot(_))
+            && self.conflicts_with_known_leader(sender, msg_term)
+        {
+            tracing::warn!(
+                me = self.me,
+                sender,
+                msg_term,
+                "raft: ignoring a second leader's message for the current term"
             );
             return Vec::new();
         }
@@ -976,6 +1013,79 @@ mod tests {
         }));
         assert!(a.is_empty());
         assert_eq!(s.current_term, 0, "a forged u64::MAX term must not stick");
+    }
+
+    fn heartbeat(term: Term, leader: NodeId) -> Message {
+        Message::AppendEntries(AppendEntries {
+            term,
+            leader_id: leader,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![],
+            leader_commit: 0,
+        })
+    }
+
+    fn snapshot_done(term: Term, leader: NodeId, last_index: LogIndex) -> Message {
+        Message::InstallSnapshot(InstallSnapshot {
+            term,
+            leader_id: leader,
+            last_index,
+            last_term: term,
+            offset: 0,
+            done: true,
+            data: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn accepts_from_leader_applies_every_guard() {
+        let mut f = n(2, &[1, 3]);
+        f.on_message(heartbeat(4, 1));
+        assert_eq!((f.current_term, f.leader_hint), (4, Some(1)));
+        assert!(f.accepts_from_leader(1, 4), "the known leader");
+        assert!(
+            f.accepts_from_leader(3, 5),
+            "a newer term may have a new leader"
+        );
+        assert!(
+            !f.accepts_from_leader(3, 4),
+            "a second leader for the same term"
+        );
+        assert!(!f.accepts_from_leader(9, 5), "a non-member");
+        assert!(!f.accepts_from_leader(1, 3), "a stale term");
+        assert!(!f.accepts_from_leader(1, Term::MAX), "the pinning term");
+        assert!(
+            !f.accepts_from_leader(1, 4 + MAX_TERM_JUMP + 1),
+            "an absurd jump"
+        );
+
+        let l = leader_of_three();
+        assert!(
+            !l.accepts_from_leader(2, l.current_term),
+            "a leader has no other leader in its own term"
+        );
+    }
+
+    #[test]
+    fn a_second_leaders_snapshot_is_not_installed() {
+        let mut f = n(2, &[1, 3]);
+        f.on_message(heartbeat(4, 1));
+        let a = f.on_message(snapshot_done(4, 3, 50));
+        assert!(a.is_empty(), "{a:?}");
+        assert_eq!(f.log.base_index, 0);
+        assert_eq!(f.commit_index, 0);
+        assert_eq!(f.leader_hint, Some(1));
+
+        let mut l = leader_of_three();
+        let term = l.current_term;
+        assert!(l.on_message(snapshot_done(term, 2, 50)).is_empty());
+        assert_eq!(
+            l.role,
+            Role::Leader,
+            "a forged same-term leader must not depose us"
+        );
+        assert_eq!(l.log.base_index, 0);
     }
 
     #[test]

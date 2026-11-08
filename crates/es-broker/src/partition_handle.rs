@@ -25,7 +25,7 @@ pub struct RaftConfig {
     pub bind: Option<SocketAddr>,
     pub peer_addrs: BTreeMap<crate::raft::NodeId, SocketAddr>,
     /// Pre-shared secret peers must present in the raft handshake.
-    pub shared_secret: Option<String>,
+    pub shared_secret: Option<crate::raft::SharedSecret>,
 }
 
 impl Default for RaftConfig {

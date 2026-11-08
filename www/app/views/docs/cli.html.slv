@@ -178,7 +178,8 @@ es tiered list --topic orders --partition 0     <span class="c-com"># base offse
   <div><dt><code>--raft-node-id</code></dt><dd>This broker's id in the cluster. Setting it replicates every topic.</dd></div>
   <div><dt><code>--raft-bind</code></dt><dd>Address for traffic from the other members.</dd></div>
   <div><dt><code>--raft-peer</code></dt><dd><code>&lt;id&gt;=&lt;host:port&gt;</code>, once per other member.</dd></div>
-  <div><dt><code>--raft-shared-secret</code>, <code>ES_RAFT_SHARED_SECRET</code></dt><dd>Secret the members prove to each other. Required unless the Raft address is loopback.</dd></div>
+  <div><dt><code>--raft-shared-secret</code>, <code>ES_RAFT_SHARED_SECRET</code></dt><dd>Secret the members prove to each other, at least 32 bytes (<code>openssl rand -hex 32</code>). Required unless the Raft address is loopback. Prefer the environment variable: on the command line it shows in <code>ps</code>.</dd></div>
+  <div><dt><code>--raft-shared-secret-file</code>, <code>ES_RAFT_SHARED_SECRET_FILE</code></dt><dd>Read the secret from a file instead; it must be readable by its owner only (mode 600).</dd></div>
 </dl>
 <p class="small">
   Logs go to stderr; set <code>RUST_LOG=info</code> (the default) or <code>debug</code>. The broker shuts down
