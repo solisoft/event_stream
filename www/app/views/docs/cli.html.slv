@@ -177,11 +177,16 @@ es tiered list --topic orders --partition 0     <span class="c-com"># base offse
 <dl class="defs">
   <div><dt><code>--raft-node-id</code></dt><dd>This broker's id in the cluster. Setting it replicates every topic.</dd></div>
   <div><dt><code>--raft-bind</code></dt><dd>Address for traffic from the other members.</dd></div>
-  <div><dt><code>--raft-peer</code></dt><dd><code>&lt;id&gt;=&lt;host:port&gt;</code>, once per other member.</dd></div>
+  <div><dt><code>--raft-peer</code></dt><dd><code>&lt;id&gt;=&lt;host:port&gt;</code>, once per other member. The starting membership: once a partition has recorded a change, its log and snapshot take precedence.</dd></div>
+  <div><dt><code>--raft-join</code></dt><dd>Join a running cluster: start outside its membership, with <code>--raft-peer</code> naming the current members, and wait to be added with <code>POST /admin/raft/members</code>. Without it a new broker counts itself a voter and campaigns. See <a href="<%= docs_cluster_path() %>#adding-and-removing-brokers">Adding and removing brokers</a>.</dd></div>
   <div><dt><code>--raft-peer-api</code></dt><dd><code>&lt;id&gt;=&lt;http(s)://host:port&gt;</code>, a member's HTTP API, once per other member. A follower forwards a produce there when that member leads the partition, with the caller's own key. Must be <code>https</code> when this broker has <code>--tls-cert</code>. Without it, a produce for that member's partitions fails with a retryable "not leader".</dd></div>
   <div><dt><code>--raft-peer-api-ca</code></dt><dd>PEM file of the certificate authorities trusted for <code>https</code> peer APIs. Default: the public web roots.</dd></div>
-  <div><dt><code>--raft-shared-secret</code>, <code>ES_RAFT_SHARED_SECRET</code></dt><dd>Secret the members prove to each other, at least 32 bytes (<code>openssl rand -hex 32</code>). Required unless the Raft address is loopback. Prefer the environment variable: on the command line it shows in <code>ps</code>.</dd></div>
+  <div><dt><code>--raft-shared-secret</code>, <code>ES_RAFT_SHARED_SECRET</code></dt><dd>Secret the members prove to each other, at least 32 bytes (<code>openssl rand -hex 32</code>). Required unless the Raft address is loopback or mTLS is configured. Prefer the environment variable: on the command line it shows in <code>ps</code>.</dd></div>
   <div><dt><code>--raft-shared-secret-file</code>, <code>ES_RAFT_SHARED_SECRET_FILE</code></dt><dd>Read the secret from a file instead; it must be readable by its owner only (mode 600).</dd></div>
+  <div><dt><code>--raft-tls-cert</code></dt><dd>This broker's Raft certificate (PEM, leaf first). It must name the broker as subjectAltName <code>DNS:es-node-&lt;id&gt;</code> and allow both serverAuth and clientAuth. With the next two flags, every Raft connection is mutual TLS: encrypted, and one broker cannot act as another. It can be combined with the shared secret.</dd></div>
+  <div><dt><code>--raft-tls-key</code></dt><dd>The private key of <code>--raft-tls-cert</code> (PEM).</dd></div>
+  <div><dt><code>--raft-tls-ca</code></dt><dd>The CA certificate that signs every member's Raft certificate (PEM). The three <code>--raft-tls-*</code> flags go together.</dd></div>
+  <div><dt><code>--raft-legacy-handshake</code></dt><dd>Accept the 0.2 Raft handshake, and use it to reach brokers still running 0.2. Only while upgrading a cluster from 0.2.1 one broker at a time; remove it once every member runs 0.3. Cannot be combined with mTLS. Deprecated, removed in 0.4.</dd></div>
 </dl>
 <p class="small">
   Logs go to stderr; set <code>RUST_LOG=info</code> (the default) or <code>debug</code>. The broker shuts down

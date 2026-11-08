@@ -38,6 +38,7 @@ async fn open_node(id: u32, addrs: &[SocketAddr], dir: &TempDir) -> Result<Arc<R
             raft_store_path: dir.path().join("raft").join("0"),
             timing,
             snapshot_after_applies: 20,
+            joining: false,
         },
     )?;
     let peer_addrs: BTreeMap<u32, SocketAddr> =

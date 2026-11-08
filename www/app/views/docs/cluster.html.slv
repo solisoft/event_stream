@@ -18,7 +18,8 @@
 <h2>Start a three-node cluster</h2>
 <p>
   Start each broker with its own id, the address its peers reach it on, every other member, and the same secret.
-  The membership is exactly the brokers you list; there is no discovery. <code>--raft-peer-api</code> gives each
+  The starting membership is the brokers you list; there is no discovery. To change it later, see
+  <a href="#adding-and-removing-brokers">Adding and removing brokers</a>. <code>--raft-peer-api</code> gives each
   member's client-facing address, so a follower can forward produces to it. The examples assume the brokers serve TLS
   (<code>--tls-cert</code>, <code>--tls-key</code>); without it, use <code>http://</code>.
 </p>
@@ -54,7 +55,7 @@ es-broker --data-dir /var/lib/es --bind 10.0.0.1:9000 --auth required \
 </aside>
 <p>
   The broker refuses a configuration that cannot work: a node id of 0, a peer listed twice or sharing an address, a node
-  listing itself, or a Raft port reachable from the network without a shared secret.
+  listing itself, or a Raft port reachable from the network without a shared secret or mTLS.
 </p>
 
 <h3>A single node</h3>
@@ -153,9 +154,11 @@ es-broker --data-dir /var/lib/es --bind 10.0.0.1:9000 --auth required \
 <h2>Transport and security</h2>
 <p>
   Brokers authenticate each other with the shared secret, without sending it: each side proves it knows the secret
-  against a random challenge from the other, so a recorded handshake cannot be replayed. The dialing broker checks it
-  reached the node it meant to; the listening broker checks the dialer is a configured member, and closes connections
-  from any address that is not a peer's before they reach the handshake.
+  against a random challenge from the other, so a recorded handshake cannot be replayed. The dialing broker proves
+  itself first, and the listening broker answers with its own proof only once the dialer's has checked out, so a
+  connection that has proved nothing learns nothing derived from the secret. The dialing broker checks it reached the
+  node it meant to; the listening broker checks the dialer is a current member, and closes connections from any address
+  that is not a peer's before they reach the handshake.
 </p>
 <p>
   The secret must be at least 32 bytes; the broker refuses to start with a shorter one. Generate it with
@@ -169,19 +172,68 @@ es-broker --data-dir /var/lib/es --bind 10.0.0.1:9000 --auth required \
   ignored.
 </p>
 <p>
-  There is one secret for the whole cluster, so it separates members from outsiders, not members from each other. The
-  id a broker announces in the handshake is not proved by anything only that broker holds: a broker with the secret
-  can connect as any member and vote, acknowledge or replicate in its name. Treat every holder of the secret as
-  trusted with the whole cluster. Per-member keys are not implemented.
+  A connection with nothing to carry sends a keepalive every 5 seconds, in both directions. A broker that hears nothing
+  on a connection for 15 seconds closes it, and the dialing side redials. A peer that vanished without closing its
+  connections, after a power cut or a dropped route, is noticed within that time instead of hours later.
 </p>
+
+<h3>Per-broker identity with mTLS</h3>
+<p>
+  There is one secret for the whole cluster, so on its own it separates members from outsiders, not members from each
+  other: a broker with the secret can connect as any member and vote, acknowledge or replicate in its name. To tell
+  members apart, give every broker its own certificate, signed by a CA the members share:
+</p>
+<figure class="code">
+  <figcaption><span>node 1</span></figcaption>
+<pre>es-broker --data-dir /var/lib/es --bind 10.0.0.1:9000 --auth required \
+  --raft-node-id 1 --raft-bind 10.0.0.1:6000 \
+  --raft-peer 2=10.0.0.2:6000 --raft-peer 3=10.0.0.3:6000 \
+  --raft-tls-cert /etc/es/raft/node1.pem \
+  --raft-tls-key /etc/es/raft/node1.key \
+  --raft-tls-ca /etc/es/raft/ca.pem</pre>
+</figure>
+<ul>
+  <li><strong>The certificate names the broker.</strong> Node 7's certificate carries the subjectAltName
+    <code>DNS:es-node-7</code>, and its extended key usage allows both <code>serverAuth</code> and
+    <code>clientAuth</code>, because every broker both listens and dials. A broker refuses to start with a certificate
+    that does not name its own <code>--raft-node-id</code>.</li>
+  <li><strong>The listener takes the dialer's id from its certificate.</strong> A dialer must present a certificate the
+    CA signed, naming exactly one current member; if the id it announces in the handshake is not that one, the
+    connection is refused. Holding node 2's certificate does not let a broker speak as node 3.</li>
+  <li><strong>The dialer checks the listener's certificate</strong> names the node it meant to reach, and refuses a
+    certificate for any other node.</li>
+  <li><strong>Traffic is encrypted.</strong> Every connection is TLS 1.3.</li>
+</ul>
+<p>
+  With mTLS the shared secret is optional, even on a routable address; set both and the secret's handshake runs inside
+  TLS. Enable mTLS on every member at the same restart: a broker with it and a broker without it cannot connect.
+</p>
+<figure class="code">
+  <figcaption><span>a certificate for node 1, with openssl</span></figcaption>
+<pre>openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -keyout node1.key -subj <span class="c-str">'/CN=es-node-1'</span> -out node1.csr
+printf <span class="c-str">'subjectAltName=DNS:es-node-1\nextendedKeyUsage=serverAuth,clientAuth\n'</span> &gt; node1.ext
+openssl x509 -req -in node1.csr -CA ca.pem -CAkey ca.key -days 365 -extfile node1.ext -out node1.pem</pre>
+</figure>
 <aside class="note warn">
-  <p>Replication traffic is not encrypted</p>
-  <p>It is authenticated and tamper-proof, but readable on the wire. Keep <code>--raft-bind</code> on a private network.</p>
+  <p>Without mTLS, replication traffic is not encrypted</p>
+  <p>It is authenticated and tamper-proof, but readable on the wire. Keep <code>--raft-bind</code> on a private network,
+    or configure <code>--raft-tls-*</code>.</p>
 </aside>
+
+<h3>Upgrading from 0.2</h3>
+<p>
+  0.3 brokers speak version 3 of the handshake (<code>RAF3</code>), in which the dialer proves itself first. A 0.2
+  broker speaks version 2 (<code>RAF2</code>), in which the listener did, and a 0.3 broker refuses it by default. To
+  upgrade one broker at a time, start each upgraded broker with <code>--raft-legacy-handshake</code>: it then accepts
+  version 2 from the brokers still on 0.2, and when a 0.2 broker closes its version-3 hello unanswered, it retries in
+  version 2. Once every member runs 0.3, restart each without the flag. The flag is deprecated and goes away in 0.4; it
+  cannot be combined with mTLS, which 0.2 does not speak. Do not change the membership during the upgrade.
+</p>
 <p class="small">
-  Without a secret the same handshake runs with no authentication, and the broker only allows that on a loopback
-  address. Brokers from before this transport (handshake <code>RAFT</code> rather than <code>RAF2</code>) cannot join;
-  upgrade every member together. Raft state from older versions is converted on first start.
+  Without a secret or mTLS the same handshake runs with no authentication, and the broker only allows that on a
+  loopback address. Brokers from before 0.2 (handshake <code>RAFT</code>) cannot join; upgrade them to 0.2 first. Raft
+  state from older versions is converted on first start.
 </p>
 
 <h2>Durability of Raft state</h2>
@@ -191,6 +243,65 @@ es-broker --data-dir /var/lib/es --bind 10.0.0.1:9000 --auth required \
   <li>Nothing that depends on a change is sent before the change is on disk.</li>
   <li>If writing fails, the node stops instead of answering, so it can never vote twice in a term or confirm entries it does not have.</li>
 </ul>
+
+<h2 id="adding-and-removing-brokers">Adding and removing brokers</h2>
+<p>
+  The membership can change while the cluster runs, one broker at a time, through
+  <a href="<%= docs_api_path() %>">/admin/raft/members</a>. Each change is a single-server step: it adds or removes one
+  voter, takes effect in a partition as soon as it is in that partition's log, and the next change waits until it has
+  committed. Any majority before the step and any majority after it share a broker, so the cluster can never elect two
+  leaders while it changes. The transport follows: an added broker is dialed and accepted, a removed one is
+  disconnected and refused, with no restart.
+</p>
+<p>
+  Each partition has its own leader, and only that leader can change it. A request changes the partitions the
+  broker it is sent to leads, and lists the others with their leader. So send each change to every broker, and check
+  that every partition reports <code>committed</code> or <code>already</code>.
+</p>
+
+<h3>Add a broker</h3>
+<ol class="steps">
+  <li><p><strong>Start it as a joiner.</strong> Give it its id, its Raft address, the current members with
+    <code>--raft-peer</code>, the cluster's secret or a certificate naming it, and <code>--raft-join</code>. It replicates
+    whatever it is sent but never campaigns until it is a member.</p></li>
+  <li><p><strong>Create every topic on it</strong>, with the same names and partition counts.</p></li>
+  <li><p><strong>Add it on every broker.</strong> Each adds it to the partitions it leads; the leader then streams it
+    the records it is missing.</p></li>
+  <li><p><strong>Check.</strong> <code>GET /admin/raft/members</code> on the new broker lists it among the voters of
+    every partition. Add <code>--raft-peer 4=…</code> to the other brokers' configuration for their next restart.</p></li>
+</ol>
+<figure class="code">
+  <figcaption><span>node 4, then each member</span></figcaption>
+<pre>es-broker --data-dir /var/lib/es --bind 10.0.0.4:9000 --auth required \
+  --raft-node-id 4 --raft-bind 10.0.0.4:6000 --raft-join \
+  --raft-peer 1=10.0.0.1:6000 --raft-peer 2=10.0.0.2:6000 --raft-peer 3=10.0.0.3:6000
+
+<span class="c-key">for</span> b <span class="c-key">in</span> 10.0.0.1 10.0.0.2 10.0.0.3; <span class="c-key">do</span>
+  curl -s -X POST -H <span class="c-str">"authorization: Bearer $ADMIN_KEY"</span> \
+    -H <span class="c-str">"content-type: application/json"</span> $b:9000/admin/raft/members \
+    -d <span class="c-str">'{"id": 4, "addr": "10.0.0.4:6000"}'</span>
+<span class="c-key">done</span></pre>
+</figure>
+
+<h3>Remove a broker</h3>
+<ol class="steps">
+  <li><p><strong>Remove it on every broker, itself included.</strong> <code>DELETE /admin/raft/members/3</code>. Where it
+    leads, it manages its own removal, without counting itself, and steps down once the removal commits; the others then
+    elect a leader among themselves.</p></li>
+  <li><p><strong>Stop it</strong> once every partition reports the removal. The others have already disconnected it and
+    refuse its connections.</p></li>
+  <li><p><strong>Drop its <code>--raft-peer</code></strong> from the others' configuration.</p></li>
+</ol>
+<aside class="note">
+  <p>One change at a time</p>
+  <p>A request is refused with 409 while any partition on that broker has a change that has not committed. Finish one
+    change on every broker before starting the next, and do not create topics in between: a new topic starts from the
+    membership its broker sees at that moment. To replace a broker, add the new one first, then remove the old one.</p>
+</aside>
+<p class="small">
+  A restarted broker takes its membership from each partition's log and snapshot, not from <code>--raft-peer</code>;
+  the flags matter for topics with no recorded change, and for brokers started fresh.
+</p>
 
 <h2>Checking a cluster</h2>
 <figure class="code">
@@ -209,7 +320,10 @@ es-broker --data-dir /var/lib/es --bind 10.0.0.1:9000 --auth required \
     they are sent to.</li>
   <li><strong>Idempotent-producer state is per broker.</strong> It lives on the leader that accepted the writes; after
     a leadership change, the new leader does not know the producer's earlier sequences.</li>
-  <li><strong>Static membership.</strong> Adding or removing a broker means restarting every broker with the new peer list.</li>
+  <li><strong>Membership changes go to each leader.</strong> A change is applied by the leader of each partition, so it is sent to every broker. One broker at a time; there is no joint consensus.</li>
+  <li><strong>A broker added at runtime has no API address.</strong> Followers learn peer API addresses from
+    <code>--raft-peer-api</code> only, so produces for partitions an added broker leads are not forwarded to it until the
+    others restart with its address.</li>
   <li><strong>Linearizable reads go to the leader.</strong> Followers serve default reads only.</li>
   <li><strong>No pre-vote.</strong> A rejoining broker cannot win an election against a healthy leader, but its higher term can make the leader step down once.</li>
   <li><strong>Topics are created per broker.</strong> Create each topic, with the same partition count, on every member.</li>

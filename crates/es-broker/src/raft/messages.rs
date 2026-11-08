@@ -12,6 +12,8 @@
 
 use std::io;
 
+use super::membership::Membership;
+
 pub const TAG_REQUEST_VOTE: u8 = 0x01;
 pub const TAG_REQUEST_VOTE_RESP: u8 = 0x02;
 pub const TAG_APPEND_ENTRIES: u8 = 0x03;
@@ -89,6 +91,11 @@ pub struct InstallSnapshot {
     pub offset: u64,
     pub done: bool,
     pub data: Vec<u8>,
+    /// The group's voters as of `last_index`: the configuration a follower
+    /// must adopt with the snapshot, because the config entries it covers are
+    /// no longer in the leader's log. Trails the message on the wire, so a 0.2
+    /// node ignores it and a 0.2 leader simply sends none.
+    pub members: Option<Membership>,
 }
 
 /// `InstallSnapshot::offset` of a probe.
@@ -212,6 +219,9 @@ impl Message {
                 buf.push(if m.done { 1 } else { 0 });
                 buf.extend_from_slice(&(m.data.len() as u32).to_be_bytes());
                 buf.extend_from_slice(&m.data);
+                if let Some(members) = &m.members {
+                    members.encode(&mut buf);
+                }
             }
             Self::InstallSnapshotResp(m) => {
                 buf.push(TAG_INSTALL_SNAPSHOT_RESP);
@@ -291,6 +301,13 @@ impl Message {
                 let done = r.u8()? != 0;
                 let data_len = r.u32()? as usize;
                 let data = r.bytes(data_len)?;
+                let members = if r.remaining() > 0 {
+                    Some(Membership::decode(&r.bytes[r.pos..]).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "bad snapshot membership")
+                    })?)
+                } else {
+                    None
+                };
                 Ok(Self::InstallSnapshot(InstallSnapshot {
                     term,
                     leader_id,
@@ -299,6 +316,7 @@ impl Message {
                     offset,
                     done,
                     data,
+                    members,
                 }))
             }
             TAG_INSTALL_SNAPSHOT_RESP => Ok(Self::InstallSnapshotResp(InstallSnapshotResp {
@@ -472,5 +490,40 @@ mod tests {
             // A truncated trailing field is still an error, not a zero.
             assert!(Message::decode(&new[..new.len() - 3]).is_err());
         }
+    }
+
+    fn snapshot(members: Option<Membership>) -> Message {
+        Message::InstallSnapshot(InstallSnapshot {
+            term: 3,
+            leader_id: 1,
+            last_index: 40,
+            last_term: 2,
+            offset: 0,
+            done: true,
+            data: b"end".to_vec(),
+            members,
+        })
+    }
+
+    #[test]
+    fn install_snapshot_carries_its_membership() {
+        let mut m = Membership::new([1, 2]);
+        m.voters.insert(4, "10.0.0.4:6000".into());
+        match Message::decode(&snapshot(Some(m.clone())).encode()).unwrap() {
+            Message::InstallSnapshot(is) => {
+                assert_eq!(is.members, Some(m));
+                assert_eq!(is.data, b"end");
+            }
+            _ => panic!("wrong variant"),
+        }
+        // From a 0.2 leader: nothing trails the data.
+        match Message::decode(&snapshot(None).encode()).unwrap() {
+            Message::InstallSnapshot(is) => assert_eq!(is.members, None),
+            _ => panic!("wrong variant"),
+        }
+        // A trailing membership that does not parse is refused, not ignored.
+        let mut bad = snapshot(None).encode();
+        bad.extend_from_slice(&[0, 0, 0, 9]);
+        assert!(Message::decode(&bad).is_err());
     }
 }

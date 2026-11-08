@@ -4,11 +4,13 @@
 //! proofs and session key (see `transport`). Two properties matter and this
 //! type enforces both:
 //!
-//! * **Length.** The listener answers any dialer with an HMAC of the secret
-//!   over values the dialer can see, before the dialer has proved anything. A
-//!   short or human-chosen secret can then be guessed offline from one
-//!   recorded reply. At [`MIN_SECRET_BYTES`] random bytes there is nothing to
-//!   guess, so shorter values are refused rather than warned about.
+//! * **Length.** A dialer proves itself first, to whatever answers at its
+//!   peer's address: anyone who can impersonate that address gets an HMAC of
+//!   the secret over values they chose (and with `--raft-legacy-handshake`, a
+//!   listener still answers any dialer that way). A short or human-chosen
+//!   secret can then be guessed offline from one recorded proof. At
+//!   [`MIN_SECRET_BYTES`] random bytes there is nothing to guess, so shorter
+//!   values are refused rather than warned about.
 //! * **Not printed.** `Debug` is redacted, so the secret does not end up in a
 //!   log line that dumps a config struct.
 

@@ -90,14 +90,19 @@ registry, tiered storage, and a security and performance audit (see below).
   what it can read.
 - **Limits.** Records up to 8 MiB on both protocols, consume responses up to 8 MiB /
   10,000 records, produce and consume byte-rate quotas per key.
-- **Raft peers share one secret** (HMAC challenge-response, MAC on every frame). It keeps
-  outsiders out: without the secret nothing can join the cluster or forge, alter or replay
-  a frame. It does not tell members apart: any node holding the secret can claim to be any
-  other member, and vote or acknowledge in its name. The secret must be at least 32 bytes
-  (`openssl rand -hex 32`); pass it through `ES_RAFT_SHARED_SECRET` or
-  `--raft-shared-secret-file` (mode 600) rather than on the command line. The raft port
-  accepts connections only from the peers' addresses. Replication traffic is not
-  encrypted: keep `--raft-bind` on a private network.
+- **Raft peers share one secret, and can each have their own certificate.** The secret
+  (HMAC challenge-response, the dialer proving itself first, a MAC on every frame) keeps
+  outsiders out: without it nothing can join the cluster or forge, alter or replay a frame.
+  On its own it does not tell members apart: any node holding it can claim to be any other
+  member. With `--raft-tls-cert`, `--raft-tls-key` and `--raft-tls-ca`, every Raft
+  connection is mutual TLS 1.3: each broker's certificate names it (`DNS:es-node-<id>`),
+  the listener takes the peer's id from the certificate, and frames are encrypted. The
+  secret must be at least 32 bytes (`openssl rand -hex 32`); pass it through
+  `ES_RAFT_SHARED_SECRET` or `--raft-shared-secret-file` (mode 600) rather than on the
+  command line. The raft port accepts connections only from the peers' addresses, and closes
+  one that has been silent for 15 seconds (keepalives every 5). Without mTLS, replication
+  traffic is not encrypted: keep `--raft-bind` on a private network. Upgrading from 0.2.1
+  one broker at a time needs `--raft-legacy-handshake` until every member runs 0.3.
 - **Produce to any broker.** A Raft follower forwards a produce, over HTTP or the binary
   protocol, to the partition's leader at its `--raft-peer-api` address, once, and returns the
   leader's offsets. The leader re-checks the caller's own key (so keys must match across
@@ -109,8 +114,10 @@ registry, tiered storage, and a security and performance audit (see below).
 
 The [roadmap](https://es.solisoft.net/docs/roadmap) plans each of these, release by release:
 
-- **0.3**: safe membership changes, opt-in linearizable reads, and per-broker identity in
-  Raft.
+- **0.3**, still open: replicated idempotent-producer state, forwarding topic, group and admin
+  calls, linearizable reads served by followers, and API addresses for brokers added at runtime.
+  (Leader routing, linearizable reads on the leader, per-broker identity and safe membership
+  changes are in: see above, `consistency=linearizable` and `/admin/raft/members`.)
 - **0.4**: record format v2, with record headers, compression on disk and `sendfile(2)` consume.
 - **0.5**: object-store tiering.
 - **0.6**: transactions across partitions.

@@ -6,21 +6,28 @@
 
 <h2 id="v0-3">0.3: a cluster you can operate</h2>
 <p>
-  Today a three-broker cluster replicates every partition, and a produce can go to any broker, but the membership is
-  fixed at startup.
+  Most of 0.3 is done: a produce can go to any broker, membership changes without a restart, brokers can have their
+  own identity, and consumers can ask for linearizable reads. What remains closes the gaps those features left.
 </p>
 <ul>
   <li><strong>Leader routing</strong> (done). A produce sent to a follower is forwarded to the partition's leader, as
     the original caller, so clients can talk to any broker.</li>
-  <li><strong>Safe membership changes.</strong> Add or remove one broker at a time without a restart, and the transport
-    follows the current membership, so a removed broker can no longer connect.</li>
-  <li><strong>Linearizable reads, as an opt-in.</strong> Read-index reads on the partition's leader
+  <li><strong>Safe membership changes</strong> (done). Add or remove one broker at a time without a restart, through
+    <code>/admin/raft/members</code>, and the transport follows the current membership, so a removed broker can no
+    longer connect.</li>
+  <li><strong>Linearizable reads, as an opt-in</strong> (done). Read-index reads on the partition's leader
     (<code>consistency=linearizable</code>, and a flag on the binary consume), for consumers that must not see a stale
-    replica. Done on the 0.3 branch; reads served by followers are not part of it.</li>
-  <li><strong>Per-broker identity.</strong> mTLS with the broker id in the certificate, so one broker cannot act as
-    another. Today brokers share one secret, which keeps outsiders out but lets any broker that holds it act as any
-    member. With it: an idle timeout on Raft connections, and a handshake where the dialing broker proves itself
-    first.</li>
+    replica.</li>
+  <li><strong>Per-broker identity</strong> (done). Optional mTLS with the broker id in the certificate, so one broker
+    cannot act as another (<a href="<%= docs_cluster_path() %>">Clustering with Raft</a>), keepalives and an idle
+    timeout on Raft connections, and a handshake where the dialing broker proves itself first. The 0.2 handshake is
+    accepted behind <code>--raft-legacy-handshake</code> for rolling upgrades, and removed in 0.4.</li>
+  <li><strong>Replicated idempotent-producer state.</strong> Producer sequences travel through Raft, so a retry is
+    still recognised after the leader changes.</li>
+  <li><strong>Forward topic, group and admin calls</strong>, so any broker serves any request, not only produces.</li>
+  <li><strong>Linearizable reads served by followers</strong>, and concurrent reads sharing one heartbeat round.</li>
+  <li><strong>API addresses for brokers added at runtime</strong>, so produces reach a leader that joined after the
+    others started.</li>
   <li><strong>Topic deletion and consumer groups.</strong> A deleted topic is removed from the groups subscribed to
     it, and they rebalance. Done on the 0.3 branch.</li>
 </ul>

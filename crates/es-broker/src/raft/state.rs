@@ -1,15 +1,21 @@
 //! Raft state machine: election, log replication, commit advancement,
-//! snapshots.
+//! snapshots, single-server membership changes.
 //!
 //! Pure (no I/O). The driver in `node.rs` calls one of `on_*` per event and
 //! executes the returned [`Action`]s. Every change to persistent state
 //! (`current_term`, `voted_for`, the log) is recorded as a [`PersistOp`]; the
 //! driver drains them with [`RaftState::take_persist_ops`] and makes them
 //! durable **before** sending any message the actions contain.
+//!
+//! The group's configuration is derived, never stored on its own: the one at
+//! the log's base (from the snapshot, or the command line), with every config
+//! entry in the log applied on top. See [`super::membership`] for the rules.
 
 use std::collections::{BTreeMap, HashSet};
 
 use super::log::{Log, PersistOp, PersistedRaft, PersistedSnapshot};
+use super::membership::{decode_config_change, encode_member_change, MemberChange, Membership};
+pub use super::membership::{encode_config_change, is_config_entry};
 use super::messages::{
     AppendEntries, AppendEntriesResp, InstallSnapshot, InstallSnapshotResp, LogEntry, LogIndex,
     Message, NodeId, RequestVote, RequestVoteResp, Term,
@@ -35,6 +41,16 @@ pub enum Role {
     Leader,
 }
 
+/// A group's configuration as the transport needs it: the latest one, in
+/// effect since its entry was appended, and the last committed one. Until the
+/// latest commits, members of either may still be talking to us — a removed
+/// leader is still replicating the entry that removes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MembershipView {
+    pub latest: Membership,
+    pub committed: Membership,
+}
+
 #[derive(Debug, Clone)]
 pub enum Action {
     SendTo(NodeId, Message),
@@ -44,11 +60,47 @@ pub enum Action {
     Apply(LogEntry),
     /// Leader needs to send (the next chunk of) a snapshot to this peer.
     SendSnapshot(NodeId),
+    /// The group's configuration changed: the transport follows it.
+    Membership(MembershipView),
+}
+
+/// Why a membership change was not proposed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChangeRefused {
+    NotLeader(Option<NodeId>),
+    /// The previous change, at this index, has not committed yet.
+    InProgress(LogIndex),
+    /// This leader has not yet committed an entry of its own term; a change
+    /// proposed now could overlap one its predecessor left uncommitted.
+    LeaderNotReady,
+    /// The change is already in effect: the node is (or is not) a voter.
+    AlreadyInEffect,
+    /// Removing the last voter would leave a group nobody can lead.
+    LastVoter,
+}
+
+impl std::fmt::Display for ChangeRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotLeader(Some(l)) => write!(f, "not the leader; node {l} is"),
+            Self::NotLeader(None) => write!(f, "not the leader, and no leader is known"),
+            Self::InProgress(i) => {
+                write!(f, "a membership change (entry {i}) has not committed yet")
+            }
+            Self::LeaderNotReady => {
+                write!(f, "the leader has not committed an entry of its term yet")
+            }
+            Self::AlreadyInEffect => write!(f, "the change is already in effect"),
+            Self::LastVoter => write!(f, "removing the last voter would leave no one to lead"),
+        }
+    }
 }
 
 #[derive(Debug)]
 pub struct RaftState {
     pub me: NodeId,
+    /// The other voters of the latest configuration: whom a leader replicates
+    /// to and counts. Derived from `config`; never set directly.
     pub peers: Vec<NodeId>,
     pub role: Role,
     pub current_term: Term,
@@ -80,62 +132,26 @@ pub struct RaftState {
     /// Leader-only: the highest read round each peer has acknowledged in the
     /// current term. Cleared on every change of role.
     read_acks: BTreeMap<NodeId, u64>,
+    /// The configuration at the log's base: what the snapshot recorded, or
+    /// what this node was started with.
+    pub base_config: Membership,
+    /// The latest configuration: in effect since its entry was appended.
+    pub config: Membership,
+    /// The configuration as of `commit_index`.
+    pub committed_config: Membership,
+    /// Index of the entry that set `config` (the base index when none did).
+    pub config_index: LogIndex,
+    /// What `config` was last derived from, so it is rederived only when the
+    /// log or commit index moved past a config entry.
+    config_marks: (LogIndex, LogIndex, Term, LogIndex),
 
     votes_received: HashSet<NodeId>,
     pending: Vec<PersistOp>,
 }
 
-const CONFIG_MAGIC: [u8; 4] = [0xEE, 0xEE, 0xEE, 0xEE];
-
-pub fn encode_config_change(add: Vec<NodeId>, remove: Vec<NodeId>) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&CONFIG_MAGIC);
-    out.extend_from_slice(&(add.len() as u32).to_be_bytes());
-    for id in &add {
-        out.extend_from_slice(&id.to_be_bytes());
-    }
-    out.extend_from_slice(&(remove.len() as u32).to_be_bytes());
-    for id in &remove {
-        out.extend_from_slice(&id.to_be_bytes());
-    }
-    out
-}
-
-fn decode_config_change(payload: &[u8]) -> Option<(Vec<NodeId>, Vec<NodeId>)> {
-    if payload.len() < 8 || payload[..4] != CONFIG_MAGIC {
-        return None;
-    }
-    // Bounds-checked reader over the payload. `take_u32` uses `.get(..)` so a
-    // truncated or lying length field yields `None` instead of panicking, and
-    // capacities are bounded by the bytes actually remaining so a huge declared
-    // count can't drive a giant allocation.
-    fn take_u32(payload: &[u8], pos: &mut usize) -> Option<u32> {
-        let end = pos.checked_add(4)?;
-        let slice = payload.get(*pos..end)?;
-        *pos = end;
-        Some(u32::from_be_bytes(slice.try_into().ok()?))
-    }
-    fn take_ids(payload: &[u8], pos: &mut usize) -> Option<Vec<NodeId>> {
-        let len = take_u32(payload, pos)? as usize;
-        let remaining_ids = payload.len().saturating_sub(*pos) / 4;
-        let mut out = Vec::with_capacity(len.min(remaining_ids));
-        for _ in 0..len {
-            out.push(take_u32(payload, pos)?);
-        }
-        Some(out)
-    }
-    let mut pos = 4usize;
-    let add = take_ids(payload, &mut pos)?;
-    let remove = take_ids(payload, &mut pos)?;
-    Some((add, remove))
-}
-
-pub fn is_config_entry(payload: &[u8]) -> bool {
-    payload.len() >= 4 && payload[..4] == CONFIG_MAGIC
-}
-
 impl RaftState {
     pub fn new(me: NodeId, peers: Vec<NodeId>) -> Self {
+        let config = Membership::new(peers.iter().copied().chain([me]));
         Self {
             me,
             peers,
@@ -152,9 +168,144 @@ impl RaftState {
             noop_on_elect: false,
             read_seq: 0,
             read_acks: BTreeMap::new(),
+            base_config: config.clone(),
+            committed_config: config.clone(),
+            config,
+            config_index: 0,
+            config_marks: (0, 0, 0, 0),
             votes_received: HashSet::new(),
             pending: Vec::new(),
         }
+    }
+
+    /// Start as a non-voter: a broker joining an existing cluster, waiting
+    /// for a leader to add it. It replicates whatever it is sent but never
+    /// campaigns, so it cannot disrupt the cluster with elections it can only
+    /// lose. Call before [`Self::restore`]: a log that already holds the
+    /// change adding this node makes it a voter again.
+    pub fn set_joining(&mut self) {
+        self.base_config.voters.remove(&self.me);
+        self.reload_config();
+    }
+
+    /// Rederive the configuration from scratch, discarding what it was.
+    fn reload_config(&mut self) {
+        self.config_marks = (LogIndex::MAX, 0, 0, 0);
+        self.config = Membership::default();
+        let _ = self.refresh_config();
+    }
+
+    /// Where the config entries are: the base index, the last config entry
+    /// (index and term — a truncated and rewritten entry has another term),
+    /// and the last one at or below the commit index.
+    fn current_marks(&self) -> (LogIndex, LogIndex, Term, LogIndex) {
+        let mut latest = None;
+        let mut committed = None;
+        for e in self.log.entries.iter().rev() {
+            if !is_config_entry(&e.payload) {
+                continue;
+            }
+            if latest.is_none() {
+                latest = Some((e.index, e.term));
+            }
+            if e.index <= self.commit_index {
+                committed = Some(e.index);
+                break;
+            }
+        }
+        let (li, lt) = latest.unwrap_or((0, 0));
+        (self.log.base_index, li, lt, committed.unwrap_or(0))
+    }
+
+    /// The configuration in effect at `index`, and the index of the entry
+    /// that set it.
+    pub fn config_through(&self, index: LogIndex) -> (Membership, LogIndex) {
+        let mut config = self.base_config.clone();
+        let mut at = self.log.base_index;
+        for e in &self.log.entries {
+            if e.index > index {
+                break;
+            }
+            if let Some(change) = decode_config_change(&e.payload) {
+                config.apply(&change);
+                at = e.index;
+            }
+        }
+        (config, at)
+    }
+
+    /// Bring `config` and `committed_config` up to date with the log, and
+    /// say so when either changed.
+    fn refresh_config(&mut self) -> Option<Action> {
+        let marks = self.current_marks();
+        if marks == self.config_marks {
+            return None;
+        }
+        self.config_marks = marks;
+        let (latest, latest_index) = self.config_through(LogIndex::MAX);
+        let (committed, _) = self.config_through(self.commit_index);
+        self.config_index = latest_index;
+        if latest == self.config && committed == self.committed_config {
+            return None;
+        }
+        let was: Vec<NodeId> = self.config.ids().collect();
+        self.config = latest;
+        self.committed_config = committed;
+        self.peers = self.config.ids().filter(|id| *id != self.me).collect();
+        if self.role == Role::Leader {
+            let next = self.log.last_index() + 1;
+            for p in &self.peers {
+                if !was.contains(p) {
+                    self.next_index.insert(*p, next);
+                    self.match_index.insert(*p, 0);
+                }
+            }
+            let peers = self.peers.clone();
+            self.next_index.retain(|p, _| peers.contains(p));
+            self.match_index.retain(|p, _| peers.contains(p));
+            self.snapshot_cursor.retain(|p, _| peers.contains(p));
+        }
+        tracing::info!(
+            me = self.me,
+            voters = ?self.config.ids().collect::<Vec<_>>(),
+            committed = ?self.committed_config.ids().collect::<Vec<_>>(),
+            "raft: configuration changed"
+        );
+        Some(Action::Membership(self.membership_view()))
+    }
+
+    pub fn membership_view(&self) -> MembershipView {
+        MembershipView {
+            latest: self.config.clone(),
+            committed: self.committed_config.clone(),
+        }
+    }
+
+    /// Whether a membership change is appended but not yet committed.
+    pub fn has_uncommitted_change(&self) -> bool {
+        self.config_index > self.commit_index
+    }
+
+    /// What follows any event that may have moved the log or the commit
+    /// index: the transport learns of a new configuration, and a leader the
+    /// latest one leaves out steps down once that is committed.
+    fn after_change(&mut self) -> Vec<Action> {
+        let mut out: Vec<Action> = self.refresh_config().into_iter().collect();
+        if self.role == Role::Leader
+            && !self.config.contains(self.me)
+            && self.commit_index >= self.config_index
+        {
+            // One last round, so the others learn the change committed and
+            // stop counting this node before it goes quiet (§4.2.2).
+            out.extend(self.on_heartbeat_tick());
+            tracing::info!(me = self.me, "raft: removed from the group; stepping down");
+            self.role = Role::Follower;
+            self.leader_hint = None;
+            self.match_index.clear();
+            self.next_index.clear();
+            self.snapshot_cursor.clear();
+        }
+        out
     }
 
     /// Restore from persisted state + an optional state-machine snapshot.
@@ -193,6 +344,11 @@ impl RaftState {
             if snap.last_index > self.last_applied {
                 self.last_applied = snap.last_index;
             }
+            // The voters as of the snapshot; a 0.2 snapshot recorded none, and
+            // the configuration this node was started with stands.
+            if let Some(members) = &snap.members {
+                self.base_config = members.clone();
+            }
         }
         if let Some(first) = self.log.entries.first() {
             if first.index != self.log.base_index + 1 {
@@ -203,6 +359,7 @@ impl RaftState {
                 );
             }
         }
+        self.reload_config();
         Ok(())
     }
 
@@ -230,12 +387,17 @@ impl RaftState {
             .log
             .term_at(through)
             .ok_or_else(|| anyhow::anyhow!("entry {through} not in log"))?;
+        // The config entries up to `through` are about to leave the log; the
+        // snapshot carries what they amounted to.
+        let (members, _) = self.config_through(through);
         self.log.compact_through(through, term);
+        self.base_config = members.clone();
         self.pending.push(PersistOp::CompactThrough(through));
         Ok(PersistedSnapshot {
             last_index: through,
             last_term: term,
             data,
+            members: Some(members),
         })
     }
 
@@ -254,14 +416,18 @@ impl RaftState {
         });
     }
 
+    /// A majority of the latest configuration's voters, floor(N/2)+1. During
+    /// a single-server change, any majority of the old configuration and any
+    /// of the new one overlap, which is why counting only the latest is safe.
     fn quorum(&self) -> usize {
-        // Cluster size is peers + self. A majority is floor(N/2)+1. `peers`
-        // excludes self, so N = peers.len()+1 and majority = ceil(peers/2)+1.
-        self.peers.len().div_ceil(2) + 1
+        self.config.len() / 2 + 1
     }
 
+    /// Whether `id` may talk to this group at all: a voter of the latest
+    /// configuration, or of the committed one while a change is pending — a
+    /// leader being removed still replicates the entry that removes it.
     fn is_member(&self, id: NodeId) -> bool {
-        self.peers.contains(&id)
+        id != self.me && (self.config.contains(id) || self.committed_config.contains(id))
     }
 
     /// Whether `term` is one a real peer could send: not absurdly far ahead
@@ -294,6 +460,12 @@ impl RaftState {
 
     pub fn on_election_timeout(&mut self) -> Vec<Action> {
         if self.role == Role::Leader {
+            return Vec::new();
+        }
+        // A node outside the latest configuration — joining and not yet
+        // added, or removed — never campaigns: it could only lose, and its
+        // ever higher terms would depose the leaders of the real group.
+        if !self.config.contains(self.me) {
             return Vec::new();
         }
         self.start_election()
@@ -354,9 +526,18 @@ impl RaftState {
             .iter()
             .map(|p| self.read_acks.get(p).copied().unwrap_or(0))
             .collect();
-        acks.push(self.read_seq);
+        // The leader vouches for itself only while it is a voter: a leader
+        // that is removing itself is not in the latest configuration, and the
+        // quorum is counted among that configuration's voters.
+        if self.config.contains(self.me) {
+            acks.push(self.read_seq);
+        }
+        let quorum = self.quorum();
+        if quorum == 0 || acks.len() < quorum {
+            return 0;
+        }
         acks.sort_unstable();
-        acks[acks.len() - self.quorum()]
+        acks[acks.len() - quorum]
     }
 
     /// Whether this leader has committed an entry of its own term. Until it
@@ -386,6 +567,12 @@ impl RaftState {
             return Vec::new();
         }
         let msg_term = msg.term();
+        // Votes count only within the latest configuration, so a request
+        // from outside it (a removed node, or one whose addition we have not
+        // seen) can win nothing here, and must not depose anyone either.
+        if matches!(msg, Message::RequestVote(_)) && !self.config.contains(sender) {
+            return Vec::new();
+        }
         if !self.term_is_plausible(msg_term) {
             tracing::warn!(
                 me = self.me,
@@ -432,19 +619,46 @@ impl RaftState {
         }
 
         actions.extend(self.drain_apply_actions());
+        actions.extend(self.after_change());
         actions
     }
 
-    /// Propose a membership change. Must be called on the Leader.
-    pub fn try_change_membership(
+    /// Propose a single-server membership change (§4.1). Must be called on
+    /// the leader. The new configuration is in effect from the moment its
+    /// entry is appended, here, before anything is replicated.
+    pub fn propose_member_change(
         &mut self,
-        add: Vec<NodeId>,
-        remove: Vec<NodeId>,
-    ) -> (ProposeOutcome, Vec<Action>) {
+        change: &MemberChange,
+    ) -> Result<(LogIndex, Vec<Action>), ChangeRefused> {
         if self.role != Role::Leader {
-            return (ProposeOutcome::NotLeader(self.leader_hint), Vec::new());
+            return Err(ChangeRefused::NotLeader(self.leader_hint));
         }
-        self.try_propose(encode_config_change(add, remove))
+        if self.has_uncommitted_change() {
+            return Err(ChangeRefused::InProgress(self.config_index));
+        }
+        if self.log.term_at(self.commit_index) != Some(self.current_term) {
+            return Err(ChangeRefused::LeaderNotReady);
+        }
+        match change {
+            MemberChange::Add { id, .. } if self.config.contains(*id) => {
+                return Err(ChangeRefused::AlreadyInEffect)
+            }
+            MemberChange::Remove { id } if !self.config.contains(*id) => {
+                return Err(ChangeRefused::AlreadyInEffect)
+            }
+            MemberChange::Remove { .. } if self.config.len() == 1 => {
+                return Err(ChangeRefused::LastVoter)
+            }
+            _ => {}
+        }
+        let index = self.append_local(encode_member_change(change));
+        let mut actions: Vec<Action> = self.refresh_config().into_iter().collect();
+        // A group of one commits on its own; and removing a node can leave
+        // the entries already acknowledged by the rest a majority.
+        self.recompute_commit_index();
+        actions.extend(self.drain_apply_actions());
+        actions.extend(self.after_change());
+        Ok((index, actions))
     }
 
     /// Client / broker calls this on the Leader to append a new entry.
@@ -460,7 +674,8 @@ impl RaftState {
         // immediately. For multi-node clusters this is a no-op until an
         // AppendEntriesResp comes back.
         self.recompute_commit_index();
-        let actions = self.drain_apply_actions();
+        let mut actions = self.drain_apply_actions();
+        actions.extend(self.after_change());
         (ProposeOutcome::Accepted { index: next_idx }, actions)
     }
 
@@ -483,41 +698,14 @@ impl RaftState {
             let Some(e) = self.log.get(self.last_applied) else {
                 continue;
             };
-            if e.payload.is_empty() {
-                // A leader's election no-op: nothing to apply.
+            // A leader's election no-op has nothing to apply, and a config
+            // entry took effect when it was appended.
+            if e.payload.is_empty() || is_config_entry(&e.payload) {
                 continue;
             }
-            if let Some((add, remove)) = decode_config_change(&e.payload) {
-                self.apply_config_change(add, remove);
-            } else {
-                out.push(Action::Apply(e.clone()));
-            }
+            out.push(Action::Apply(e.clone()));
         }
         out
-    }
-
-    fn apply_config_change(&mut self, add: Vec<NodeId>, remove: Vec<NodeId>) {
-        for id in &remove {
-            self.peers.retain(|p| p != id);
-            self.match_index.remove(id);
-            self.next_index.remove(id);
-            self.snapshot_cursor.remove(id);
-        }
-        for id in &add {
-            if !self.peers.contains(id) && *id != self.me {
-                self.peers.push(*id);
-                self.next_index.insert(*id, 1);
-                self.match_index.insert(*id, 0);
-            }
-        }
-        self.peers.sort_unstable();
-        tracing::info!(
-            me = self.me,
-            added = ?add,
-            removed = ?remove,
-            new_peers = ?self.peers,
-            "raft: config change applied"
-        );
     }
 
     // ---------- internals ----------
@@ -565,6 +753,7 @@ impl RaftState {
             self.become_leader();
             let mut out = self.on_heartbeat_tick();
             out.extend(self.drain_apply_actions());
+            out.extend(self.after_change());
             return out;
         }
         vec![
@@ -608,7 +797,12 @@ impl RaftState {
         }
         if rvr.vote_granted {
             self.votes_received.insert(rvr.voter_id);
-            if self.votes_received.len() >= self.quorum() {
+            let votes = self
+                .votes_received
+                .iter()
+                .filter(|v| self.config.contains(**v))
+                .count();
+            if votes >= self.quorum() {
                 self.become_leader();
                 return self.on_heartbeat_tick();
             }
@@ -766,7 +960,15 @@ impl RaftState {
         let mut installed_index = 0;
         if is.done {
             if is.last_index > self.log.base_index {
+                // The snapshot replaces the config entries it covers: adopt
+                // the voters it carries, or — from a 0.2 leader, which sends
+                // none — what our own log says they were at that point.
+                let at_snapshot = match is.members {
+                    Some(m) => m,
+                    None => self.config_through(is.last_index).0,
+                };
                 let kept = self.log.install_snapshot(is.last_index, is.last_term);
+                self.base_config = at_snapshot;
                 if kept {
                     self.pending.push(PersistOp::CompactThrough(is.last_index));
                 } else {
@@ -860,14 +1062,21 @@ impl RaftState {
     }
 
     fn recompute_commit_index(&mut self) {
-        // Build the multiset of replicated indices (including leader's own),
-        // counting only current members.
+        // Build the multiset of replicated indices of the latest
+        // configuration's voters — the leader's own only if it is one: a
+        // leader removing itself manages the change without counting toward
+        // it (§4.2.2).
         let mut indices: Vec<LogIndex> = self
             .peers
             .iter()
             .map(|p| self.match_index.get(p).copied().unwrap_or(0))
             .collect();
-        indices.push(self.log.last_index());
+        if self.config.contains(self.me) {
+            indices.push(self.log.last_index());
+        }
+        if indices.is_empty() {
+            return;
+        }
         indices.sort_unstable();
         // The highest index replicated on a majority: with N members sorted
         // ascending, the entry at position N - quorum.
@@ -908,16 +1117,6 @@ mod tests {
         }));
         assert_eq!(s.role, Role::Leader);
         s
-    }
-
-    #[test]
-    fn decode_config_change_rejects_truncated_payload() {
-        let mut payload = CONFIG_MAGIC.to_vec();
-        payload.extend_from_slice(&1u32.to_be_bytes());
-        assert!(decode_config_change(&payload).is_none());
-        let mut huge = CONFIG_MAGIC.to_vec();
-        huge.extend_from_slice(&u32::MAX.to_be_bytes());
-        assert!(decode_config_change(&huge).is_none());
     }
 
     #[test]
@@ -1105,6 +1304,7 @@ mod tests {
             offset: 0,
             done: true,
             data: Vec::new(),
+            members: None,
         })
     }
 
@@ -1316,5 +1516,257 @@ mod tests {
         assert!(actions
             .iter()
             .any(|a| matches!(a, Action::Apply(e) if e.index == 1)));
+    }
+
+    // ---------- membership (Bonfire #731) ----------
+
+    fn add(id: NodeId) -> MemberChange {
+        MemberChange::Add {
+            id,
+            addr: format!("10.0.0.{id}:6000"),
+        }
+    }
+
+    fn ack(s: &mut RaftState, peer: NodeId, index: LogIndex) -> Vec<Action> {
+        s.on_message(Message::AppendEntriesResp(AppendEntriesResp {
+            term: s.current_term,
+            success: true,
+            responder_id: peer,
+            match_index: index,
+        }))
+    }
+
+    /// A leader of {1, 2, 3} that has committed an entry of its term, and so
+    /// may change the configuration.
+    fn ready_leader() -> RaftState {
+        let mut s = leader_of_three();
+        s.try_propose(b"x".to_vec());
+        ack(&mut s, 2, 1);
+        assert_eq!(s.commit_index, 1);
+        s
+    }
+
+    fn entry(term: Term, index: LogIndex, payload: Vec<u8>) -> LogEntry {
+        LogEntry {
+            term,
+            index,
+            payload,
+        }
+    }
+
+    fn append(term: Term, leader: NodeId, entries: Vec<LogEntry>, commit: LogIndex) -> Message {
+        Message::AppendEntries(AppendEntries {
+            term,
+            leader_id: leader,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries,
+            leader_commit: commit,
+        })
+    }
+
+    #[test]
+    fn a_change_takes_effect_when_appended_not_when_committed() {
+        let mut s = ready_leader();
+        let (index, actions) = s.propose_member_change(&add(4)).unwrap();
+        assert_eq!(index, 2);
+        assert!(s.config.contains(4) && s.peers.contains(&4));
+        assert_eq!(s.quorum(), 3, "four voters: three make a majority");
+        assert!(s.has_uncommitted_change());
+        assert!(!s.committed_config.contains(4));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Membership(v) if v.latest.contains(4))),
+            "the transport is told at once: {actions:?}"
+        );
+        assert_eq!(
+            s.config.voters.get(&4).map(String::as_str),
+            Some("10.0.0.4:6000")
+        );
+
+        ack(&mut s, 2, 2);
+        assert_eq!(s.commit_index, 1, "two of four is not a majority any more");
+        ack(&mut s, 4, 2);
+        assert_eq!(s.commit_index, 2);
+        assert!(s.committed_config.contains(4));
+        assert!(!s.has_uncommitted_change());
+    }
+
+    #[test]
+    fn a_second_change_is_refused_while_the_first_is_uncommitted() {
+        let mut s = ready_leader();
+        s.propose_member_change(&add(4)).unwrap();
+        assert_eq!(
+            s.propose_member_change(&add(5)).unwrap_err(),
+            ChangeRefused::InProgress(2)
+        );
+        assert_eq!(
+            s.propose_member_change(&MemberChange::Remove { id: 3 })
+                .unwrap_err(),
+            ChangeRefused::InProgress(2)
+        );
+        ack(&mut s, 2, 2);
+        ack(&mut s, 3, 2);
+        assert!(s.propose_member_change(&add(5)).is_ok(), "once committed");
+    }
+
+    #[test]
+    fn a_new_leader_must_commit_in_its_term_before_changing_membership() {
+        let mut s = leader_of_three();
+        assert_eq!(
+            s.propose_member_change(&add(4)).unwrap_err(),
+            ChangeRefused::LeaderNotReady
+        );
+        let mut f = n(2, &[1, 3]);
+        assert_eq!(
+            f.propose_member_change(&add(4)).unwrap_err(),
+            ChangeRefused::NotLeader(None)
+        );
+    }
+
+    #[test]
+    fn a_change_already_in_effect_or_removing_the_last_voter_is_refused() {
+        let mut s = ready_leader();
+        assert_eq!(
+            s.propose_member_change(&add(2)).unwrap_err(),
+            ChangeRefused::AlreadyInEffect
+        );
+        assert_eq!(
+            s.propose_member_change(&MemberChange::Remove { id: 9 })
+                .unwrap_err(),
+            ChangeRefused::AlreadyInEffect
+        );
+        let mut solo = n(1, &[]);
+        solo.on_election_timeout();
+        solo.try_propose(b"x".to_vec());
+        assert_eq!(
+            solo.propose_member_change(&MemberChange::Remove { id: 1 })
+                .unwrap_err(),
+            ChangeRefused::LastVoter
+        );
+    }
+
+    #[test]
+    fn a_follower_adopts_a_config_on_append_and_drops_it_on_truncation() {
+        let mut f = n(2, &[1, 3]);
+        let change = encode_member_change(&add(4));
+        let a = f.on_message(append(1, 1, vec![entry(1, 1, change)], 0));
+        assert!(f.config.contains(4) && f.peers.contains(&4));
+        assert!(!f.committed_config.contains(4));
+        assert!(a.iter().any(|a| matches!(a, Action::Membership(_))));
+        // A message from the new member is now heard...
+        assert!(f.is_member(4));
+
+        // ...until a new leader overwrites the uncommitted entry.
+        f.on_message(append(2, 3, vec![entry(2, 1, b"data".to_vec())], 0));
+        assert!(
+            !f.config.contains(4),
+            "the truncated entry's config is undone"
+        );
+        assert!(!f.is_member(4));
+    }
+
+    #[test]
+    fn a_removed_leader_steps_down_once_the_change_commits() {
+        let mut s = ready_leader();
+        s.propose_member_change(&MemberChange::Remove { id: 1 })
+            .unwrap();
+        assert_eq!(
+            s.role,
+            Role::Leader,
+            "it manages the change until it commits"
+        );
+        assert_eq!(s.peers, vec![2, 3]);
+        ack(&mut s, 2, 2);
+        assert_eq!(
+            s.commit_index, 1,
+            "the leader does not count itself in a configuration it is not in"
+        );
+        let actions = ack(&mut s, 3, 2);
+        assert_eq!(s.commit_index, 2);
+        assert_eq!(s.role, Role::Follower);
+        for peer in [2, 3] {
+            assert!(
+                actions.iter().any(|a| matches!(
+                    a,
+                    Action::SendTo(p, Message::AppendEntries(ae)) if *p == peer && ae.leader_commit == 2
+                )),
+                "the others hear the change committed: {actions:?}"
+            );
+        }
+        assert!(s.on_election_timeout().is_empty(), "and it never campaigns");
+    }
+
+    #[test]
+    fn a_node_outside_the_configuration_never_campaigns() {
+        let mut s = n(4, &[1, 2, 3]);
+        s.set_joining();
+        assert!(!s.config.contains(4));
+        assert!(s.on_election_timeout().is_empty());
+        assert_eq!(s.current_term, 0);
+        // The leader adds it: from then on it is a voter like any other.
+        s.on_message(append(
+            1,
+            1,
+            vec![entry(1, 1, encode_member_change(&add(4)))],
+            0,
+        ));
+        assert!(s.config.contains(4));
+        assert!(!s.on_election_timeout().is_empty());
+        assert_eq!(s.current_term, 2);
+    }
+
+    #[test]
+    fn vote_requests_from_outside_the_latest_configuration_are_ignored() {
+        let mut f = n(2, &[1, 3]);
+        let remove = encode_member_change(&MemberChange::Remove { id: 3 });
+        f.on_message(append(1, 1, vec![entry(1, 1, remove)], 0));
+        let a = f.on_message(Message::RequestVote(RequestVote {
+            term: 5,
+            candidate_id: 3,
+            last_log_index: 9,
+            last_log_term: 4,
+        }));
+        assert!(a.is_empty());
+        assert_eq!(f.current_term, 1, "a removed node cannot bump our term");
+    }
+
+    #[test]
+    fn a_snapshot_records_the_membership_and_a_restart_restores_it() {
+        let mut s = ready_leader();
+        s.propose_member_change(&add(4)).unwrap();
+        ack(&mut s, 2, 2);
+        ack(&mut s, 3, 2);
+        let snap = s.take_snapshot(Vec::new(), None).unwrap();
+        assert!(snap.members.as_ref().unwrap().contains(4));
+        assert!(s.log.entries.is_empty(), "the config entry was compacted");
+        assert!(s.config.contains(4), "and its effect stays");
+
+        let mut restarted = n(1, &[2, 3]);
+        restarted
+            .restore(PersistedRaft::default(), Some(&snap))
+            .unwrap();
+        assert!(restarted.config.contains(4));
+        assert_eq!(restarted.peers, vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn an_installed_snapshot_brings_its_membership() {
+        let mut f = n(2, &[1, 3]);
+        let mut members = Membership::new([1, 2, 3]);
+        members.voters.insert(4, "10.0.0.4:6000".into());
+        f.on_message(Message::InstallSnapshot(InstallSnapshot {
+            term: 1,
+            leader_id: 1,
+            last_index: 5,
+            last_term: 1,
+            offset: 0,
+            done: true,
+            data: Vec::new(),
+            members: Some(members),
+        }));
+        assert!(f.config.contains(4));
+        assert!(f.peers.contains(&4));
     }
 }
