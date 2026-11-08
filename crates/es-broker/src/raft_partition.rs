@@ -21,6 +21,29 @@
 //! leader's Raft log is caught up by streaming it the records it is missing
 //! from the leader's partition ([`SnapshotTransfer`]).
 //!
+//! # Idempotent producers
+//!
+//! A produce with a `producer_id` carries the producer, its owner and the
+//! first sequence in a trailer of its entry, and every replica applies them
+//! to the partition's [`ReplicatedProducers`] along with the records. The
+//! table goes into each snapshot after the state end, and to a lagging
+//! follower beside the last chunk of a transfer; a restart restores it from
+//! the snapshot and re-applies the log after it. Whoever leads next knows
+//! every sequence committed before it.
+//!
+//! The leader decides a retry against the table **and** its own log past what
+//! the table has applied: an entry proposed but not yet committed — its own,
+//! or one a previous leader left — is waited for before the producer's next
+//! request is checked ([`RaftPartition::producer_state`]), and re-checked as
+//! the proposal is made, so a sequence cannot be accepted twice while its
+//! first copy is in flight.
+//!
+//! A 0.3.0 or 0.2 broker cannot decode such an entry and would stop applying.
+//! So a leader writes producer data only once every voter has advertised that
+//! it understands it, or once the log already holds some (every member then
+//! did); until then the partition keeps the per-broker windows of
+//! [`crate::producers::ProducerRegistry`].
+//!
 //! # Reads
 //!
 //! A plain read serves whatever this replica has applied, which can be behind
@@ -46,6 +69,8 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::partition::{now_ms, AppendRecord, Durability, Partition};
+use crate::producers::PartitionWindow;
+use crate::raft::messages::FEATURE_PRODUCER_STATE;
 use crate::raft::state::{is_config_entry, ChangeRefused, RaftState};
 use crate::raft::{
     spawn_node_with_options,
@@ -53,10 +78,20 @@ use crate::raft::{
     JsonStore, LogIndex, MemberChange, NodeHandle, NodeId, NodeOptions, Outbound, ProposeReply,
     RaftStore, ReadIndexReply, SnapshotSender, SnapshotTransfer, Timing,
 };
+use crate::replicated_producers::{ProducerOp, ReplicatedProducers};
 use tokio::sync::Mutex as TokioMutex;
 
 /// Version tag of a data entry. Entries written before batching began with an
 /// `i32` key length instead, whose first byte is 0x00 or 0xFF.
+///
+/// ```text
+///   0x01 | proposal u64 | base_offset u64 | count u32
+///   per record: ts i64 | key (i32 len, -1 = none) | value (u32 len)
+///   [producer trailer]                       see `ProducerOp`
+/// ```
+///
+/// The trailer is optional: entries without one — every entry 0.2 and 0.3.0
+/// wrote — decode as before.
 const ENTRY_V1: u8 = 0x01;
 
 /// A decoded data entry.
@@ -66,6 +101,7 @@ enum Command {
         proposal: u64,
         base_offset: u64,
         records: Vec<(i64, Option<Vec<u8>>, Vec<u8>)>,
+        producer: Option<ProducerOp>,
     },
     /// The pre-batching single-record format. Its offset was the entry's
     /// index minus one by construction.
@@ -75,7 +111,13 @@ enum Command {
     },
 }
 
-fn encode_batch(proposal: u64, base_offset: u64, ts: i64, records: &[AppendRecord]) -> Vec<u8> {
+fn encode_batch(
+    proposal: u64,
+    base_offset: u64,
+    ts: i64,
+    records: &[AppendRecord],
+    producer: Option<&ProducerOp>,
+) -> Vec<u8> {
     let size: usize = records
         .iter()
         .map(|r| 8 + 4 + r.key.as_ref().map_or(0, |k| k.len()) + 4 + r.value.len())
@@ -97,7 +139,32 @@ fn encode_batch(proposal: u64, base_offset: u64, ts: i64, records: &[AppendRecor
         out.extend_from_slice(&(r.value.len() as u32).to_be_bytes());
         out.extend_from_slice(&r.value);
     }
+    if let Some(op) = producer {
+        op.encode(&mut out);
+    }
     out
+}
+
+/// Just the producer trailer of a batch entry, without copying records.
+fn producer_op(bytes: &[u8]) -> Option<ProducerOp> {
+    if bytes.first() != Some(&ENTRY_V1) {
+        return None;
+    }
+    let mut c = Cur { b: bytes, p: 17 };
+    let n = c.u32().ok()?;
+    for _ in 0..n {
+        c.take(8).ok()?;
+        let k = c.i32().ok()?;
+        if k > 0 {
+            c.take(k as usize).ok()?;
+        }
+        let v = c.u32().ok()? as usize;
+        c.take(v).ok()?;
+    }
+    if c.p == bytes.len() {
+        return None;
+    }
+    ProducerOp::decode(&bytes[c.p..]).ok()
 }
 
 /// Just the `(base_offset, count)` of a batch entry, without copying records.
@@ -163,13 +230,16 @@ fn decode_command(bytes: &[u8]) -> Result<Command> {
             let value = c.bytes()?;
             records.push((ts, key, value));
         }
-        if c.p != bytes.len() {
-            return Err(anyhow!("trailing bytes after batch entry"));
-        }
+        let producer = if c.p == bytes.len() {
+            None
+        } else {
+            Some(ProducerOp::decode(&bytes[c.p..]).context("batch entry trailer")?)
+        };
         return Ok(Command::Batch {
             proposal,
             base_offset,
             records,
+            producer,
         });
     }
     let mut c = Cur { b: bytes, p: 0 };
@@ -255,6 +325,50 @@ impl std::fmt::Display for ReadBarrierError {
 
 impl std::error::Error for ReadBarrierError {}
 
+/// An idempotent produce that cannot be decided now but can be retried: an
+/// earlier write of the same producer is still in flight, or the producer's
+/// state moved between the check and the proposal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProducerRetry(pub String);
+
+impl std::fmt::Display for ProducerRetry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ProducerRetry {}
+
+/// What this replica knows of one producer on this partition.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProducerView {
+    /// The key the log first recorded the producer id for.
+    pub owner: Option<String>,
+    /// The producer's window here, through every entry it has committed.
+    pub window: Option<PartitionWindow>,
+    /// Whether the partition replicates producer state: a write may carry
+    /// it, and `window` is the partition's, not this broker's.
+    pub replicated: bool,
+}
+
+/// The producer data a write carries. See [`RaftPartition::append_batch_as`].
+#[derive(Debug, Clone)]
+pub struct ProducerWrite {
+    pub producer_id: String,
+    pub owner: String,
+    /// Sequence of the first record; the others follow it one by one.
+    pub first_sequence: i64,
+    /// The window's last sequence when the request was checked, `None` if
+    /// the partition had no window for the producer.
+    pub checked_last_seen: Option<i64>,
+}
+
+/// What an entry does to the producer table, before it has a timestamp.
+enum ProducerChange {
+    Write(ProducerWrite),
+    Forget(String),
+}
+
 #[derive(Debug)]
 pub struct AppendResult {
     pub offset: u64,
@@ -270,6 +384,8 @@ type Waiters = Arc<Mutex<HashMap<u64, Waiter>>>;
 
 pub struct RaftPartition {
     partition: Arc<Partition>,
+    /// Idempotent-producer state, as of the last entry applied.
+    producers: Arc<Mutex<ReplicatedProducers>>,
     raft: NodeHandle,
     waiters: Waiters,
     /// Serializes "assign offsets, propose" so proposals enter the log in
@@ -328,6 +444,11 @@ impl RaftPartitionConfig {
 /// headroom also keeps `offset + 1` from overflowing anywhere downstream.
 const MAX_OFFSET: u64 = i64::MAX as u64;
 
+/// Largest producer table sent with a snapshot: with the last chunk (at most
+/// [`crate::raft::node::SNAPSHOT_CHUNK_BYTES`]) it stays well under the
+/// transport's frame limit. About ten thousand producers with full windows.
+const MAX_SNAPSHOT_PRODUCERS_BYTES: usize = 32 * 1024 * 1024;
+
 /// Ships partition records to a lagging follower.
 ///
 /// Chunk format: `end u64` (the state end of the snapshot being installed),
@@ -335,6 +456,7 @@ const MAX_OFFSET: u64 = i64::MAX as u64;
 /// (u32 len)`.
 struct PartitionTransfer {
     partition: Arc<Partition>,
+    producers: Arc<Mutex<ReplicatedProducers>>,
 }
 
 impl SnapshotTransfer for PartitionTransfer {
@@ -369,7 +491,13 @@ impl SnapshotTransfer for PartitionTransfer {
         Ok((out, cursor >= end))
     }
 
-    fn apply_chunk(&self, data: &[u8], done: bool) -> Result<()> {
+    fn apply_chunk(&self, data: &[u8], done: bool, extra: Option<&[u8]>) -> Result<()> {
+        // Before anything is stored: a chunk refused is retried whole.
+        let table = extra
+            .filter(|_| done)
+            .map(ReplicatedProducers::decode)
+            .transpose()
+            .context("snapshot producer table")?;
         let mut c = Cur { b: data, p: 0 };
         let end = c.u64()?;
         if end > MAX_OFFSET {
@@ -405,6 +533,12 @@ impl SnapshotTransfer for PartitionTransfer {
             self.partition.advance_to(end);
             // The Raft log behind this snapshot is about to be dropped.
             self.partition.sync_all()?;
+            if let Some(t) = table {
+                let mut ours = self.producers.lock().unwrap();
+                if t.applied() > ours.applied() {
+                    *ours = t;
+                }
+            }
         }
         Ok(())
     }
@@ -419,6 +553,53 @@ impl SnapshotTransfer for PartitionTransfer {
             .map(u64::from_be_bytes)
             .unwrap_or(0)
     }
+
+    fn snapshot_extra(&self, data: &[u8]) -> Option<Vec<u8>> {
+        let table = data.get(8..).filter(|t| !t.is_empty())?;
+        if table.len() > MAX_SNAPSHOT_PRODUCERS_BYTES {
+            // It rides in one message beside a chunk, and a message over the
+            // transport's frame limit would fail the transfer every time it
+            // was retried. The follower catches up without the windows.
+            tracing::warn!(
+                partition = self.partition.id,
+                bytes = table.len(),
+                "raft_partition: producer table too large to send with a snapshot; the \
+                 follower gets none"
+            );
+            return None;
+        }
+        Some(table.to_vec())
+    }
+
+    fn installed(&self, last_index: LogIndex) -> Vec<u8> {
+        let mut table = self.producers.lock().unwrap();
+        // From a leader that sent no table, ours is all there is; it still
+        // covers everything through the snapshot from now on.
+        if table.applied() < last_index {
+            table.applied = last_index;
+        }
+        snapshot_data(self.partition.end_offset(), &table)
+    }
+}
+
+/// A snapshot's data: the state end, then the producer table.
+fn snapshot_data(end: u64, producers: &ReplicatedProducers) -> Vec<u8> {
+    let mut out = end.to_be_bytes().to_vec();
+    out.extend_from_slice(&producers.encode());
+    out
+}
+
+/// The producer table a stored snapshot restores: the one it carries, or an
+/// empty one from a snapshot that predates them.
+fn snapshot_producers(snap: &crate::raft::PersistedSnapshot) -> Result<ReplicatedProducers> {
+    let mut table = match snap.data.get(8..).filter(|t| !t.is_empty()) {
+        Some(t) => ReplicatedProducers::decode(t).context("snapshot producer table")?,
+        None => ReplicatedProducers::default(),
+    };
+    if table.applied() < snap.last_index {
+        table.applied = snap.last_index;
+    }
+    Ok(table)
 }
 
 impl RaftPartition {
@@ -436,10 +617,18 @@ impl RaftPartition {
             flush_every_records,
         )?;
         let store: Arc<dyn RaftStore> = Arc::new(JsonStore::new(config.raft_store_path));
+        // The windows as of the snapshot; the apply loop re-applies the log
+        // after it.
+        let producers = match store.load_snapshot()? {
+            Some(snap) => snapshot_producers(&snap)?,
+            None => ReplicatedProducers::default(),
+        };
+        let producers = Arc::new(Mutex::new(producers));
         let options = NodeOptions {
             noop_on_elect: true,
             transfer: Some(Arc::new(PartitionTransfer {
                 partition: partition.clone(),
+                producers: producers.clone(),
             })),
             joining: config.joining,
         };
@@ -463,6 +652,7 @@ impl RaftPartition {
         let (applied_tx, applied_rx) = watch::channel(raft.applied_at_start());
         let apply = ApplyLoop {
             partition: partition.clone(),
+            producers: producers.clone(),
             waiters: waiters.clone(),
             snapshot_after_applies: config.snapshot_after_applies,
             applied: applied_tx,
@@ -478,6 +668,7 @@ impl RaftPartition {
 
         Ok(Arc::new(Self {
             partition,
+            producers,
             raft,
             waiters,
             propose_lock: TokioMutex::new(()),
@@ -602,6 +793,146 @@ impl RaftPartition {
         if records.is_empty() {
             return Ok(Vec::new());
         }
+        self.propose(records, None).await
+    }
+
+    /// [`Self::append_batch`] for an idempotent producer: the entry carries
+    /// `producer`, and every replica records the sequences when it applies
+    /// it.
+    ///
+    /// The caller has checked the sequences against [`Self::producer_state`].
+    /// If that state has moved since — the producer's window, its owner, or a
+    /// write of it now in flight — nothing is proposed and the answer is a
+    /// [`ProducerRetry`].
+    pub async fn append_batch_as(
+        &self,
+        records: Vec<AppendRecord>,
+        producer: ProducerWrite,
+    ) -> Result<Vec<u64>> {
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.propose(records, Some(ProducerChange::Write(producer)))
+            .await
+    }
+
+    /// Forget `producer_id` on every replica of this partition. `false` when
+    /// there was nothing to forget here, or this broker cannot do it: it does
+    /// not lead the partition, or producer state is not replicated on it.
+    pub async fn forget_producer(&self, producer_id: &str) -> Result<bool> {
+        let (view, _) = self.producer_view(producer_id).await;
+        if !view.replicated || (view.owner.is_none() && view.window.is_none()) {
+            return Ok(false);
+        }
+        match self
+            .propose(
+                Vec::new(),
+                Some(ProducerChange::Forget(producer_id.to_string())),
+            )
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(e) if e.is::<NotLeader>() => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Every producer's window on this partition, as applied here.
+    pub fn producer_windows(&self) -> Vec<(String, PartitionWindow)> {
+        self.producers
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, w)| (id.to_string(), w.clone()))
+            .collect()
+    }
+
+    /// `producer_id`'s state on this partition, once every write of it this
+    /// replica's log holds has been applied.
+    ///
+    /// A write proposed but not committed — this leader's, after its caller
+    /// gave up waiting, or one a previous leader left in the log — is waited
+    /// for, up to `timeout`, so a retry of it is recognised rather than
+    /// accepted a second time. Past `timeout` the answer is a
+    /// [`ProducerRetry`].
+    pub async fn producer_state(
+        &self,
+        producer_id: &str,
+        timeout: Duration,
+    ) -> Result<ProducerView> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let (view, pending) = self.producer_view(producer_id).await;
+            let Some(index) = pending else {
+                return Ok(view);
+            };
+            if tokio::time::Instant::now() >= deadline {
+                return Err(ProducerRetry(format!(
+                    "an earlier write of producer '{producer_id}' (raft entry {index}) has not \
+                     committed yet; retry"
+                ))
+                .into());
+            }
+            // Not only the applied index: an entry can also leave the log,
+            // replaced by a new leader's, and nothing is applied in its place
+            // until the next write.
+            let mut applied = self.applied.clone();
+            let _ =
+                tokio::time::timeout(Duration::from_millis(20), applied.wait_for(|a| *a >= index))
+                    .await;
+        }
+    }
+
+    /// The producer's applied state, and the last entry in this replica's
+    /// log past it that writes the producer, if any.
+    async fn producer_view(&self, producer_id: &str) -> (ProducerView, Option<LogIndex>) {
+        let mut attempts = 0;
+        loop {
+            let (applied, owner, window, latched) = {
+                let t = self.producers.lock().unwrap();
+                (
+                    t.applied(),
+                    t.owner(producer_id).map(str::to_string),
+                    t.window(producer_id).cloned(),
+                    t.replicated(),
+                )
+            };
+            let state = self.raft.state.lock().await;
+            // Entries were applied and compacted between the two locks: the
+            // log no longer holds everything past what was read.
+            attempts += 1;
+            if state.log.base_index > applied && attempts < 10 {
+                drop(state);
+                tokio::task::yield_now().await;
+                continue;
+            }
+            let mut pending = None;
+            let mut carried = false;
+            for e in state.log.entries.iter().filter(|e| e.index > applied) {
+                if let Some(op) = producer_op(&e.payload) {
+                    carried = true;
+                    if op.producer_id() == producer_id {
+                        pending = Some(e.index);
+                    }
+                }
+            }
+            // The log carrying producer data means every member understood
+            // it when it was written; until then, every voter must say so.
+            let replicated = latched || carried || state.peers_support(FEATURE_PRODUCER_STATE);
+            let view = ProducerView {
+                owner,
+                window,
+                replicated,
+            };
+            return (view, pending);
+        }
+    }
+
+    async fn propose(
+        &self,
+        records: Vec<AppendRecord>,
+        producer: Option<ProducerChange>,
+    ) -> Result<Vec<u64>> {
         let proposal = self
             .proposal_nonce
             .wrapping_add(self.proposal_counter.fetch_add(1, Ordering::Relaxed));
@@ -613,12 +944,44 @@ impl RaftPartition {
             .unwrap()
             .insert(proposal, Waiter { tx, index: None });
 
-        let reply = {
+        let reply = async {
             let _guard = self.propose_lock.lock().await;
+            let ts = now_ms();
+            // Checked again under the lock that orders proposals, so nothing
+            // for this producer can enter the log between the check and ours.
+            let op = match producer {
+                None => None,
+                Some(ProducerChange::Forget(producer_id)) => Some(ProducerOp::Forget {
+                    ts_ms: ts,
+                    producer_id,
+                }),
+                Some(ProducerChange::Write(w)) => {
+                    let (view, pending) = self.producer_view(&w.producer_id).await;
+                    let moved = pending.is_some()
+                        || view.window.as_ref().map(PartitionWindow::last_seen)
+                            != w.checked_last_seen
+                        || view.owner.as_deref().is_some_and(|o| o != w.owner);
+                    if moved {
+                        return Err(ProducerRetry(format!(
+                            "producer '{}' wrote to this partition while this request was \
+                             being checked; retry",
+                            w.producer_id
+                        ))
+                        .into());
+                    }
+                    Some(ProducerOp::Produce {
+                        ts_ms: ts,
+                        producer_id: w.producer_id,
+                        owner: w.owner,
+                        first_sequence: w.first_sequence,
+                    })
+                }
+            };
             let base = self.next_assignable_offset().await;
-            let payload = encode_batch(proposal, base, now_ms(), &records);
+            let payload = encode_batch(proposal, base, ts, &records, op.as_ref());
             self.raft.propose(payload).await
-        };
+        }
+        .await;
         let index = match reply {
             Ok(ProposeReply::Accepted { index }) => index,
             Ok(ProposeReply::NotLeader { leader_hint }) => {
@@ -711,6 +1074,7 @@ impl RaftPartition {
 
 struct ApplyLoop {
     partition: Arc<Partition>,
+    producers: Arc<Mutex<ReplicatedProducers>>,
     waiters: Waiters,
     snapshot_after_applies: u32,
     /// Advanced after each entry is in the partition; read barriers wait on it.
@@ -764,12 +1128,15 @@ impl ApplyLoop {
     }
 
     async fn apply(&self, entry: crate::raft::messages::LogEntry) -> Result<()> {
+        let mut producer = None;
         let (proposal, records) = match decode_command(&entry.payload)? {
             Command::Batch {
                 proposal,
                 base_offset,
                 records,
+                producer: op,
             } => {
+                producer = op.map(|op| (op, base_offset, records.len() as u64));
                 // Checked: in a release build a batch running past u64::MAX
                 // wraps to low offsets, which `append_batch` takes for records
                 // it already has, and the batch is silently lost.
@@ -806,11 +1173,25 @@ impl ApplyLoop {
                 }],
             ),
         };
-        let p = self.partition.clone();
-        let offsets =
+        let offsets = if records.is_empty() {
+            Vec::new()
+        } else {
+            let p = self.partition.clone();
             tokio::task::spawn_blocking(move || p.append_batch(&records, Durability::Deferred))
                 .await
-                .map_err(|e| anyhow!("apply task: {e}"))??;
+                .map_err(|e| anyhow!("apply task: {e}"))??
+        };
+        {
+            let mut table = self.producers.lock().unwrap();
+            // At or below `applied`, the entry is already in the table: it
+            // came with a snapshot, or is applied again after a restart.
+            if entry.index > table.applied() {
+                if let Some((op, base, count)) = &producer {
+                    table.apply(op, *base, *count);
+                }
+                table.applied = entry.index;
+            }
+        }
 
         let mut waiters = self.waiters.lock().unwrap();
         if let Some(pid) = proposal {
@@ -847,7 +1228,12 @@ impl ApplyLoop {
         })
         .await
         .map_err(|e| anyhow!("snapshot sync task: {e}"))??;
-        raft.take(end.to_be_bytes().to_vec(), Some(through)).await?;
+        // Taken between two entries, the table holds everything through
+        // `through`. A snapshot installed meanwhile can have taken it
+        // further; it says how far (`applied`), and a restart re-applies only
+        // the entries past that.
+        let data = snapshot_data(end, &self.producers.lock().unwrap());
+        raft.take(data, Some(through)).await?;
         tracing::debug!(
             partition = self.partition.id,
             through,
@@ -877,14 +1263,16 @@ mod tests {
             AppendRecord::new(None, b"v-only".to_vec()),
             AppendRecord::new(Some(Vec::new()), Vec::new()),
         ];
-        let bytes = encode_batch(42, 100, 7, &recs);
+        let bytes = encode_batch(42, 100, 7, &recs, None);
         assert_eq!(batch_span(&bytes), Some((100, 3)));
         match decode_command(&bytes).unwrap() {
             Command::Batch {
                 proposal,
                 base_offset,
                 records,
+                producer,
             } => {
+                assert_eq!(producer, None);
                 assert_eq!(proposal, 42);
                 assert_eq!(base_offset, 100);
                 assert_eq!(
@@ -896,6 +1284,111 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    /// A batch entry as 0.2 and 0.3.0 wrote it, built by hand: no trailer.
+    #[test]
+    fn a_batch_entry_without_producer_data_still_decodes() {
+        let mut bytes = vec![ENTRY_V1];
+        bytes.extend_from_slice(&7u64.to_be_bytes());
+        bytes.extend_from_slice(&40u64.to_be_bytes());
+        bytes.extend_from_slice(&1u32.to_be_bytes());
+        bytes.extend_from_slice(&123i64.to_be_bytes());
+        bytes.extend_from_slice(&(-1i32).to_be_bytes());
+        bytes.extend_from_slice(&2u32.to_be_bytes());
+        bytes.extend_from_slice(b"hi");
+        assert_eq!(
+            decode_command(&bytes).unwrap(),
+            Command::Batch {
+                proposal: 7,
+                base_offset: 40,
+                records: vec![(123, None, b"hi".to_vec())],
+                producer: None,
+            }
+        );
+        assert_eq!(producer_op(&bytes), None);
+        // What this build writes for a plain produce is that same entry.
+        let ours = encode_batch(7, 40, 123, &[AppendRecord::new(None, b"hi".to_vec())], None);
+        assert_eq!(ours, bytes);
+    }
+
+    #[test]
+    fn a_producer_trailer_roundtrips_and_leaves_the_span_alone() {
+        let op = ProducerOp::Produce {
+            ts_ms: 5,
+            producer_id: "orders.svc".into(),
+            owner: "key_a".into(),
+            first_sequence: 9,
+        };
+        let recs = [
+            AppendRecord::new(Some(b"k".to_vec()), b"v1".to_vec()),
+            AppendRecord::new(None, b"v2".to_vec()),
+        ];
+        let bytes = encode_batch(1, 30, 5, &recs, Some(&op));
+        assert_eq!(batch_span(&bytes), Some((30, 2)));
+        assert_eq!(producer_op(&bytes), Some(op.clone()));
+        match decode_command(&bytes).unwrap() {
+            Command::Batch {
+                records, producer, ..
+            } => {
+                assert_eq!(records.len(), 2);
+                assert_eq!(producer, Some(op));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // A forget carries no records.
+        let forget = ProducerOp::Forget {
+            ts_ms: 6,
+            producer_id: "orders.svc".into(),
+        };
+        let bytes = encode_batch(2, 32, 6, &[], Some(&forget));
+        assert_eq!(batch_span(&bytes), Some((32, 0)));
+        assert_eq!(producer_op(&bytes), Some(forget));
+        // Garbage after the records is still refused.
+        let mut bad = encode_batch(3, 0, 0, &recs, None);
+        bad.extend_from_slice(b"??");
+        assert!(decode_command(&bad).is_err());
+    }
+
+    /// Applying an entry records its sequences, on any replica, and applying
+    /// it again — after a restart, or below a snapshot — changes nothing.
+    #[tokio::test]
+    async fn applying_an_entry_records_its_sequences_once() {
+        let d = tempfile::tempdir().unwrap();
+        let p = Partition::open(d.path().to_path_buf(), 0, 4096, 1).unwrap();
+        let apply = ApplyLoop {
+            partition: p.clone(),
+            producers: Default::default(),
+            waiters: Arc::new(Mutex::new(HashMap::new())),
+            snapshot_after_applies: 0,
+            applied: watch::channel(0).0,
+        };
+        let op = ProducerOp::Produce {
+            ts_ms: 1,
+            producer_id: "p".into(),
+            owner: "k".into(),
+            first_sequence: 4,
+        };
+        let recs = [
+            AppendRecord::new(None, b"a".to_vec()),
+            AppendRecord::new(None, b"b".to_vec()),
+        ];
+        let entry = crate::raft::messages::LogEntry {
+            term: 1,
+            index: 3,
+            payload: encode_batch(1, 0, 1, &recs, Some(&op)),
+        };
+        apply.apply(entry.clone()).await.unwrap();
+        apply.apply(entry).await.unwrap();
+        let table = apply.producers.lock().unwrap().clone();
+        assert_eq!(table.applied(), 3);
+        let w = table.window("p").unwrap();
+        assert_eq!(
+            w.check(5),
+            crate::producers::DedupeOutcome::Duplicate { prev_offset: 1 }
+        );
+        assert_eq!(w.recent.len(), 2, "recorded once");
+        assert_eq!(p.end_offset(), 2);
     }
 
     #[test]
@@ -922,6 +1415,7 @@ mod tests {
             0,
             0,
             &[AppendRecord::new(Some(b"k".to_vec()), b"v".to_vec())],
+            None,
         );
         bytes.truncate(bytes.len() - 1);
         assert!(decode_command(&bytes).is_err());
@@ -939,15 +1433,17 @@ mod tests {
         src.append_batch(&recs, Durability::Policy).unwrap();
         let tx = PartitionTransfer {
             partition: src.clone(),
+            producers: Default::default(),
         };
         let rx = PartitionTransfer {
             partition: dst.clone(),
+            producers: Default::default(),
         };
         let end = src.end_offset();
         let mut from = rx.progress();
         loop {
             let (chunk, done) = tx.read_chunk(from, end, 2048).unwrap();
-            rx.apply_chunk(&chunk, done).unwrap();
+            rx.apply_chunk(&chunk, done, None).unwrap();
             from = rx.progress();
             if done {
                 break;
@@ -973,23 +1469,24 @@ mod tests {
         let p = Partition::open(d.path().to_path_buf(), 0, 4096, 1).unwrap();
         let rx = PartitionTransfer {
             partition: p.clone(),
+            producers: Default::default(),
         };
 
         // An end of u64::MAX would push the next offset past everything.
         let chunk = u64::MAX.to_be_bytes().to_vec();
-        assert!(rx.apply_chunk(&chunk, true).is_err());
+        assert!(rx.apply_chunk(&chunk, true, None).is_err());
         assert_eq!(p.end_offset(), 0);
 
         // A record at or past the declared end is not part of the snapshot.
         let mut chunk = 5u64.to_be_bytes().to_vec();
         chunk_record(&mut chunk, 2);
         chunk_record(&mut chunk, 5);
-        assert!(rx.apply_chunk(&chunk, false).is_err());
+        assert!(rx.apply_chunk(&chunk, false, None).is_err());
         assert_eq!(p.end_offset(), 0, "nothing of a refused chunk is stored");
 
         let mut chunk = 5u64.to_be_bytes().to_vec();
         chunk_record(&mut chunk, 2);
-        rx.apply_chunk(&chunk, true).unwrap();
+        rx.apply_chunk(&chunk, true, None).unwrap();
         assert_eq!(p.end_offset(), 5);
     }
 
@@ -999,6 +1496,7 @@ mod tests {
         let p = Partition::open(d.path().to_path_buf(), 0, 4096, 1).unwrap();
         let apply = ApplyLoop {
             partition: p.clone(),
+            producers: Default::default(),
             waiters: Arc::new(Mutex::new(HashMap::new())),
             snapshot_after_applies: 0,
             applied: watch::channel(0).0,
@@ -1011,7 +1509,7 @@ mod tests {
             let entry = crate::raft::messages::LogEntry {
                 term: 1,
                 index: 1,
-                payload: encode_batch(1, base, 0, &recs),
+                payload: encode_batch(1, base, 0, &recs, None),
             };
             assert!(apply.apply(entry).await.is_err(), "base {base}");
         }

@@ -18,7 +18,7 @@
 │   │   └── 00000000000000000147.index
 │   └── 1/ …
 ├── groups/analytics.json                <span class="c-com"># committed offsets and owner</span>
-├── producers.json, producers.journal    <span class="c-com"># idempotent producer state</span>
+├── producers.json, producers.journal    <span class="c-com"># idempotent producer state (a Raft partition's is in its log)</span>
 ├── schemas.json
 └── api_keys.json                        <span class="c-com"># key hashes, never secrets</span></pre>
 </figure>

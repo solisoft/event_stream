@@ -14,6 +14,7 @@ pub mod partition_handle;
 pub mod producers;
 pub mod raft;
 pub mod raft_partition;
+pub mod replicated_producers;
 pub mod retention;
 pub mod schema;
 pub mod storage;

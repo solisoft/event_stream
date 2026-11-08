@@ -107,17 +107,22 @@ registry, tiered storage, and a security and performance audit (see below).
   protocol, to the partition's leader at its `--raft-peer-api` address, once, and returns the
   leader's offsets. The leader re-checks the caller's own key (so keys must match across
   brokers), dedupes idempotent producers and charges the quota; a TLS broker forwards over
-  https only. With the leader unknown or unreachable the answer is a retryable `503` (an
+  https only.
+- **Idempotent producers survive a leader change.** A producer's sequences, and the key that
+  owns its id, travel in the partition's Raft log, snapshots and snapshot transfers, so every
+  replica knows them and a retry reaching a new leader is answered as a duplicate. A leader
+  writes them once every member has said it understands them; until a cluster is fully
+  upgraded, dedup holds per leader, as before. With the leader unknown or unreachable the answer is a retryable `503` (an
   error frame on the binary protocol) starting "not leader" and naming the leader.
 
 ## What's not here yet
 
 The [roadmap](https://es.solisoft.net/docs/roadmap) plans each of these, release by release:
 
-- **0.3**, still open: replicated idempotent-producer state, forwarding topic, group and admin
-  calls, linearizable reads served by followers, and API addresses for brokers added at runtime.
-  (Leader routing, linearizable reads on the leader, per-broker identity and safe membership
-  changes are in: see above, `consistency=linearizable` and `/admin/raft/members`.)
+- **0.3**, still open: forwarding topic, group and admin calls, linearizable reads served by
+  followers, and API addresses for brokers added at runtime. (Leader routing, linearizable reads
+  on the leader, per-broker identity, safe membership changes and replicated idempotent-producer
+  state are in: see above, `consistency=linearizable` and `/admin/raft/members`.)
 - **0.4**: record format v2, with record headers, compression on disk and `sendfile(2)` consume.
 - **0.5**: object-store tiering.
 - **0.6**: transactions across partitions.

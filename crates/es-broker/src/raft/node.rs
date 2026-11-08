@@ -79,12 +79,23 @@ pub trait SnapshotTransfer: Send + Sync {
     /// snapshot whose state ends at `end`. Returns the chunk and whether it is
     /// the last one.
     fn read_chunk(&self, from: u64, end: u64, max_bytes: usize) -> Result<(Vec<u8>, bool)>;
-    /// Follower: apply a chunk produced by `read_chunk`.
-    fn apply_chunk(&self, data: &[u8], done: bool) -> Result<()>;
+    /// Follower: apply a chunk produced by `read_chunk`. The last one comes
+    /// with the leader's [`Self::snapshot_extra`], if it sent any.
+    fn apply_chunk(&self, data: &[u8], done: bool, extra: Option<&[u8]>) -> Result<()>;
     /// Follower: current state-machine position.
     fn progress(&self) -> u64;
     /// Decode the state end position from a snapshot's `data`.
     fn snapshot_end(&self, data: &[u8]) -> u64;
+    /// Leader: the part of a snapshot's `data` that is not in the chunks,
+    /// sent with the last one.
+    fn snapshot_extra(&self, _data: &[u8]) -> Option<Vec<u8>> {
+        None
+    }
+    /// Follower: the snapshot through `last_index` is installed. Returns the
+    /// `data` to store for it, so a restart restores the same state.
+    fn installed(&self, _last_index: LogIndex) -> Vec<u8> {
+        self.progress().to_be_bytes().to_vec()
+    }
 }
 
 /// Bytes of state per snapshot chunk.
@@ -618,8 +629,13 @@ impl Driver {
                 if !is.is_probe() {
                     let data = is.data.clone();
                     let done = is.done;
+                    let extra = if done { is.extra.clone() } else { None };
                     let t2 = t.clone();
-                    match tokio::task::spawn_blocking(move || t2.apply_chunk(&data, done)).await {
+                    let applied = tokio::task::spawn_blocking(move || {
+                        t2.apply_chunk(&data, done, extra.as_deref())
+                    })
+                    .await;
+                    match applied {
                         Ok(Ok(())) => {}
                         Ok(Err(e)) => {
                             tracing::error!(error = %e, "raft: applying a snapshot chunk failed");
@@ -655,14 +671,10 @@ impl Driver {
         let mut pending_snapshot = PersistedSnapshot {
             last_index: is.last_index,
             last_term: is.last_term,
+            // With a transfer, filled in once the snapshot is installed: our
+            // own copy of the state, which ends where the leader's did.
             data: if self.transfer.is_some() {
-                // Our own copy of the state ends where the leader's did.
-                let end = self
-                    .transfer
-                    .as_ref()
-                    .map(|t| t.progress())
-                    .unwrap_or_default();
-                end.to_be_bytes().to_vec()
+                Vec::new()
             } else {
                 is.data.clone()
             },
@@ -680,6 +692,9 @@ impl Driver {
             (actions, done && s.log.base_index > before)
         };
         if installed {
+            if let Some(t) = &self.transfer {
+                pending_snapshot.data = t.installed(pending_snapshot.last_index);
+            }
             // The snapshot must be on disk before the log compaction it allows.
             let store = self.store.clone();
             let snap = pending_snapshot;
@@ -792,6 +807,7 @@ impl Driver {
                 offset: 0,
                 done: true,
                 data: snap.data,
+                extra: None,
             },
             (Some(_), None) => InstallSnapshot {
                 term,
@@ -802,10 +818,12 @@ impl Driver {
                 done: false,
                 data: Vec::new(),
                 members: None,
+                extra: None,
             },
             (Some(t), Some(from)) => {
                 let t = t.clone();
                 let end = t.snapshot_end(&snap.data);
+                let extra = t.snapshot_extra(&snap.data);
                 let chunk = tokio::task::spawn_blocking(move || {
                     t.read_chunk(from, end, SNAPSHOT_CHUNK_BYTES)
                 })
@@ -830,6 +848,7 @@ impl Driver {
                     done,
                     data,
                     members: snap.members.clone(),
+                    extra: if done { extra } else { None },
                 }
             }
         };
@@ -909,7 +928,7 @@ mod tests {
         fn read_chunk(&self, _: u64, _: u64, _: usize) -> Result<(Vec<u8>, bool)> {
             Ok((Vec::new(), true))
         }
-        fn apply_chunk(&self, data: &[u8], _done: bool) -> Result<()> {
+        fn apply_chunk(&self, data: &[u8], _done: bool, _: Option<&[u8]>) -> Result<()> {
             self.chunks.lock().unwrap().push(data.to_vec());
             Ok(())
         }
@@ -949,6 +968,7 @@ mod tests {
             done: false,
             data: marker.to_vec(),
             members: None,
+            extra: None,
         })
     }
 

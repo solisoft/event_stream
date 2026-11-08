@@ -117,7 +117,8 @@ es-broker --data-dir /var/lib/es --bind 10.0.0.1:9000 --auth required \
   <li><strong>One hop.</strong> A forwarded request is marked, and a broker that receives one without leading the
     partition answers "not leader" instead of forwarding it again. The mark grants nothing.</li>
   <li><strong>Idempotent producers keep working.</strong> <code>producer_id</code> and sequences go through unchanged,
-    and the leader dedupes them. A retry after any failure is safe.</li>
+    and the leader dedupes them against the partition's <a href="#idempotent-producers">replicated windows</a>. A retry
+    after any failure is safe, whichever broker it reaches.</li>
   <li><strong>Failures are retryable.</strong> With no leader known, no <code>--raft-peer-api</code> for it, or a leader
     that cannot be reached within 2&nbsp;s (or does not answer within 15&nbsp;s), the produce fails with
     <code>503</code> and <code>Retry-After: 1</code> (an error frame on the binary protocol) whose message starts
@@ -139,6 +140,38 @@ es-broker --data-dir /var/lib/es --bind 10.0.0.1:9000 --auth required \
   waiting for the next client write.
 </p>
 
+<h2 id="idempotent-producers">Idempotent producers</h2>
+<p>
+  A produce with a <code>producer_id</code> carries the producer, the key that owns it and its first sequence in its
+  log entry, and every broker records the sequences when it applies the entry, not only the leader that accepted it.
+  Each partition therefore knows every sequence committed to it, whoever led at the time. When leadership moves, a
+  retry of a write the old leader committed reaches the new leader, directly or through a follower, and is answered
+  with the original offset and <code>"duplicate": true</code>.
+</p>
+<ul>
+  <li><strong>In flight.</strong> A write the leader has appended but not yet committed (its own, or one its
+    predecessor left in the log) is waited for, up to 5&nbsp;s, before another request of the same producer is
+    checked, and the check is repeated as the entry is proposed. Two retries of one sequence are never both written.
+    If the earlier write does not commit in time the answer is a retryable <code>503</code>.</li>
+  <li><strong>Ownership.</strong> The key that first used a producer id on a partition is recorded with the sequences,
+    so a new leader that never saw the claim still refuses the id to any other key, and still lets the owner use it.</li>
+  <li><strong>Snapshots and restarts.</strong> Each snapshot carries the partition's producer windows, a broker caught
+    up from one receives them with the last chunk, and a restarted broker rebuilds them from its snapshot and the log
+    after it.</li>
+  <li><strong>Expiry.</strong> A producer idle for 7 days is forgotten, measured on the timestamps in the log rather
+    than each broker's clock, so every replica forgets it after the same write.</li>
+  <li><strong>Revoking.</strong> <code>DELETE /admin/producers/:id</code> forgets the producer on the partitions the
+    broker it is sent to leads, through their logs. Send it to every broker, as for membership changes.</li>
+</ul>
+<aside class="note">
+  <p>During a rolling upgrade</p>
+  <p>Brokers of 0.2 and 0.3.0 cannot read producer data in a log entry. A leader writes it only once every voter of
+    the partition has told it that it can, and from then on the partition keeps writing it, whoever leads. Until every
+    member is upgraded, a partition dedupes as before: on the leader that accepted the writes, and not across a change
+    of leader. Once producer data is in a partition's log, do not downgrade a member, and add only brokers of this
+    version or later.</p>
+</aside>
+
 <h2>Snapshots and catching up</h2>
 <p>
   The partition files already hold the data, so the Raft log does not need to keep it forever. Every
@@ -148,7 +181,8 @@ es-broker --data-dir /var/lib/es --bind 10.0.0.1:9000 --auth required \
 <p>
   A broker that was down long enough, or a new one, may need entries the leader has already dropped. The leader then
   streams it the records it is missing straight from its own partition, in 1&nbsp;MiB chunks, each acknowledged with
-  the follower's new position. When the follower has everything up to the snapshot, ordinary replication resumes.
+  the follower's new position, and sends the partition's producer windows with the last chunk. When the follower has
+  everything up to the snapshot, ordinary replication resumes.
 </p>
 
 <h2>Transport and security</h2>
@@ -318,8 +352,6 @@ openssl x509 -req -in node1.csr -CA ca.pem -CAkey ca.key -days 365 -extfile node
 <ul>
   <li><strong>Only produces are forwarded.</strong> Topic creation, consumer groups and admin calls act on the broker
     they are sent to.</li>
-  <li><strong>Idempotent-producer state is per broker.</strong> It lives on the leader that accepted the writes; after
-    a leadership change, the new leader does not know the producer's earlier sequences.</li>
   <li><strong>Membership changes go to each leader.</strong> A change is applied by the leader of each partition, so it is sent to every broker. One broker at a time; there is no joint consensus.</li>
   <li><strong>A broker added at runtime has no API address.</strong> Followers learn peer API addresses from
     <code>--raft-peer-api</code> only, so produces for partitions an added broker leads are not forwarded to it until the

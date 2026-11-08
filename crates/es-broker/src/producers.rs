@@ -22,6 +22,11 @@
 //!   it describes after a crash.
 //! * **Bounds.** Producers idle for [`PRODUCER_EXPIRY`] are forgotten, and each
 //!   key may hold at most [`MAX_PRODUCERS_PER_KEY`].
+//! * **Raft partitions** keep their windows themselves, replicated with their
+//!   log ([`crate::replicated_producers`]): a broker's registry would know only
+//!   what that broker accepted while it led. Here the registry still decides
+//!   who may claim an id, and keeps the windows of a Raft partition only until
+//!   every member of its group can replicate them.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, Write};
@@ -64,11 +69,57 @@ pub const MAX_PRODUCERS_PER_KEY: usize = 10_000;
 /// transactional ids is the same seven days).
 pub const PRODUCER_EXPIRY: Duration = Duration::from_secs(7 * 24 * 3600);
 
-#[derive(Debug, Clone, Default)]
-struct PartitionWindow {
-    last_seen: i64,
-    last_offset: u64,
-    recent: VecDeque<(i64, u64)>,
+/// What one producer has written to one partition: the highest sequence and
+/// its offset, and the last [`WINDOW`] sequences with theirs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PartitionWindow {
+    pub(crate) last_seen: i64,
+    pub(crate) last_offset: u64,
+    pub(crate) recent: VecDeque<(i64, u64)>,
+}
+
+impl PartitionWindow {
+    pub fn last_seen(&self) -> i64 {
+        self.last_seen
+    }
+
+    pub fn last_offset(&self) -> u64 {
+        self.last_offset
+    }
+
+    pub fn check(&self, sequence: i64) -> DedupeOutcome {
+        if sequence == self.last_seen.saturating_add(1) {
+            return DedupeOutcome::Accept;
+        }
+        if sequence > self.last_seen {
+            return DedupeOutcome::Gap {
+                expected: self.last_seen.saturating_add(1),
+                got: sequence,
+            };
+        }
+        if let Some((_, off)) = self.recent.iter().find(|(s, _)| *s == sequence) {
+            return DedupeOutcome::Duplicate { prev_offset: *off };
+        }
+        if sequence == self.last_seen {
+            return DedupeOutcome::Duplicate {
+                prev_offset: self.last_offset,
+            };
+        }
+        DedupeOutcome::SequenceTooLow {
+            last_seen: self.last_seen,
+        }
+    }
+
+    pub fn record(&mut self, sequence: i64, offset: u64) {
+        if self.recent.is_empty() || sequence > self.last_seen {
+            self.last_seen = sequence;
+            self.last_offset = offset;
+        }
+        self.recent.push_back((sequence, offset));
+        while self.recent.len() > WINDOW {
+            self.recent.pop_front();
+        }
+    }
 }
 
 /// One producer's state. Lock it (via [`ProducerRegistry::admit`]) for the
@@ -82,46 +133,19 @@ pub struct ProducerState {
 
 impl ProducerState {
     pub fn check(&self, topic: &str, partition: u32, sequence: i64) -> DedupeOutcome {
-        let Some(w) = self.partitions.get(&(topic.to_string(), partition)) else {
+        match self.partitions.get(&(topic.to_string(), partition)) {
+            Some(w) => w.check(sequence),
             // First record from this producer on this partition. Any starting
             // sequence is accepted: a client may resume after its own restart.
-            return DedupeOutcome::Accept;
-        };
-        if sequence == w.last_seen.saturating_add(1) {
-            return DedupeOutcome::Accept;
-        }
-        if sequence > w.last_seen {
-            return DedupeOutcome::Gap {
-                expected: w.last_seen.saturating_add(1),
-                got: sequence,
-            };
-        }
-        if let Some((_, off)) = w.recent.iter().find(|(s, _)| *s == sequence) {
-            return DedupeOutcome::Duplicate { prev_offset: *off };
-        }
-        if sequence == w.last_seen {
-            return DedupeOutcome::Duplicate {
-                prev_offset: w.last_offset,
-            };
-        }
-        DedupeOutcome::SequenceTooLow {
-            last_seen: w.last_seen,
+            None => DedupeOutcome::Accept,
         }
     }
 
     pub fn record(&mut self, topic: &str, partition: u32, sequence: i64, offset: u64) {
-        let w = self
-            .partitions
+        self.partitions
             .entry((topic.to_string(), partition))
-            .or_default();
-        if w.recent.is_empty() || sequence > w.last_seen {
-            w.last_seen = sequence;
-            w.last_offset = offset;
-        }
-        w.recent.push_back((sequence, offset));
-        while w.recent.len() > WINDOW {
-            w.recent.pop_front();
-        }
+            .or_default()
+            .record(sequence, offset);
         self.last_used_ms = now_ms();
     }
 
@@ -184,6 +208,15 @@ impl std::fmt::Display for AdmitError {
 }
 
 impl std::error::Error for AdmitError {}
+
+/// The refusal for an id the caller may not use: the same words whether
+/// another key holds it or it is outside the caller's namespace.
+pub fn not_available(producer_id: &str) -> AdmitError {
+    AdmitError::Forbidden(format!(
+        "producer_id '{}' is not available to this key",
+        producer_id
+    ))
+}
 
 type Slot = Arc<Mutex<ProducerState>>;
 
@@ -294,6 +327,24 @@ impl ProducerRegistry {
         owner: &str,
         may_claim: bool,
     ) -> Result<OwnedMutexGuard<ProducerState>, AdmitError> {
+        self.admit_as(producer_id, owner, may_claim, None).await
+    }
+
+    /// [`Self::admit`], given the owner a replicated partition has recorded
+    /// for `producer_id`, if any.
+    ///
+    /// That record was committed through the partition's Raft log, so it
+    /// outranks this broker's own: a key that claimed the id on an earlier
+    /// leader keeps it here, even where this broker never saw the claim, and
+    /// any other key is refused in the usual words. The id is not claimed
+    /// anew, so neither `may_claim` nor the limits apply to it.
+    pub async fn admit_as(
+        &self,
+        producer_id: &str,
+        owner: &str,
+        may_claim: bool,
+        recorded_owner: Option<&str>,
+    ) -> Result<OwnedMutexGuard<ProducerState>, AdmitError> {
         if producer_id.is_empty() || producer_id.len() > 200 {
             return Err(AdmitError::Invalid(
                 "producer_id length must be 1..=200".into(),
@@ -307,12 +358,12 @@ impl ProducerRegistry {
                 "producer_id may only contain ASCII alphanumerics, '_', '-', '.'".into(),
             ));
         }
-        let unavailable = || {
-            AdmitError::Forbidden(format!(
-                "producer_id '{}' is not available to this key",
-                producer_id
-            ))
-        };
+        let unavailable = || not_available(producer_id);
+        match recorded_owner {
+            Some(o) if o != owner => return Err(unavailable()),
+            Some(_) => return Ok(self.adopt(producer_id, owner).await),
+            None => {}
+        }
         let slot = match self.state.get(producer_id).map(|s| s.clone()) {
             Some(s) => s,
             None => {
@@ -362,6 +413,37 @@ impl ProducerRegistry {
         }
         guard.touch();
         Ok(guard)
+    }
+
+    /// Lock `producer_id`'s state as `owner`'s, creating it or handing it
+    /// over from whichever key this broker last thought held it.
+    async fn adopt(&self, producer_id: &str, owner: &str) -> OwnedMutexGuard<ProducerState> {
+        let mut created = false;
+        let slot = self
+            .state
+            .entry(producer_id.to_string())
+            .or_insert_with(|| {
+                created = true;
+                Arc::new(Mutex::new(ProducerState {
+                    owner: owner.to_string(),
+                    last_used_ms: now_ms(),
+                    partitions: BTreeMap::new(),
+                }))
+            })
+            .clone();
+        let mut guard = slot.lock_owned().await;
+        if created {
+            *self.per_owner.entry(owner.to_string()).or_insert(0) += 1;
+        } else if guard.owner != owner {
+            if let Some(mut c) = self.per_owner.get_mut(&guard.owner) {
+                *c = c.saturating_sub(1);
+            }
+            *self.per_owner.entry(owner.to_string()).or_insert(0) += 1;
+            guard.owner = owner.to_string();
+            self.dirty.store(true, Ordering::Release);
+        }
+        guard.touch();
+        guard
     }
 
     /// Durably record sequences accepted by a request, before it is

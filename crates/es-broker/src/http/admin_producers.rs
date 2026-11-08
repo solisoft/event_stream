@@ -6,7 +6,10 @@ use axum::{
     Json,
 };
 
-use es_protocol::{ListProducersResponse, ResetOffsetsRequest, ResetOffsetsResponse};
+use es_protocol::{
+    ListProducersResponse, ProducerPartitionStateDto, ProducerStateDto, ResetOffsetsRequest,
+    ResetOffsetsResponse,
+};
 
 use crate::broker::Broker;
 
@@ -20,7 +23,42 @@ pub async fn list(
     if !key.is_admin() {
         return Err(AppError::forbidden("admin grant required"));
     }
-    let producers = broker.producers.list().await;
+    let mut producers = broker.producers.list().await;
+    // A Raft partition keeps its producers' windows itself, replicated; they
+    // stand in for whatever this broker's registry remembers of it.
+    for name in broker.list_topics() {
+        let Some(topic) = broker.topic(&name) else {
+            continue;
+        };
+        for part in &topic.partitions {
+            let Some(rp) = part.as_raft() else {
+                continue;
+            };
+            let id = rp.partition().id;
+            for (producer_id, w) in rp.producer_windows() {
+                let dto = ProducerPartitionStateDto {
+                    topic: name.clone(),
+                    partition: id,
+                    last_seen_sequence: w.last_seen(),
+                    last_offset: w.last_offset(),
+                };
+                let at = match producers.iter().position(|p| p.producer_id == producer_id) {
+                    Some(i) => i,
+                    None => {
+                        producers.push(ProducerStateDto {
+                            producer_id,
+                            partitions: Vec::new(),
+                        });
+                        producers.len() - 1
+                    }
+                };
+                let parts = &mut producers[at].partitions;
+                parts.retain(|q| !(q.topic == name && q.partition == id));
+                parts.push(dto);
+            }
+        }
+    }
+    producers.sort_by(|a, b| a.producer_id.cmp(&b.producer_id));
     Ok(Json(ListProducersResponse { producers }))
 }
 
@@ -32,7 +70,24 @@ pub async fn revoke(
     if !key.is_admin() {
         return Err(AppError::forbidden("admin grant required"));
     }
-    broker.producers.revoke(&producer_id).await?;
+    let revoked = broker.producers.revoke(&producer_id).await;
+    // On a Raft partition the producer's windows are replicated: forgetting
+    // them is a write, made by the partition's leader. Partitions led
+    // elsewhere are forgotten by sending the same call to their leaders.
+    let mut forgotten = false;
+    for name in broker.list_topics() {
+        let Some(topic) = broker.topic(&name) else {
+            continue;
+        };
+        for part in &topic.partitions {
+            if let Some(rp) = part.as_raft() {
+                forgotten |= rp.forget_producer(&producer_id).await?;
+            }
+        }
+    }
+    if !forgotten {
+        revoked?;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 

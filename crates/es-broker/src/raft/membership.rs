@@ -98,8 +98,16 @@ impl Membership {
         }
     }
 
-    /// Decode what [`Self::encode`] wrote, from the front of `bytes`.
+    /// Decode what [`Self::encode`] wrote, from the front of `bytes`: what a
+    /// 0.3.0 node does with whatever trails an InstallSnapshot.
+    #[cfg(test)]
     pub(crate) fn decode(bytes: &[u8]) -> Option<Self> {
+        Self::decode_prefix(bytes).map(|(m, _)| m)
+    }
+
+    /// [`Self::decode`], also returning how many bytes the membership took:
+    /// fields added after it start there.
+    pub(crate) fn decode_prefix(bytes: &[u8]) -> Option<(Self, usize)> {
         let mut pos = 0usize;
         let n = take_u32(bytes, &mut pos)? as usize;
         let mut voters = BTreeMap::new();
@@ -117,7 +125,7 @@ impl Membership {
             pos += len;
             voters.insert(id, addr.to_string());
         }
-        Some(Self { voters })
+        Some((Self { voters }, pos))
     }
 }
 
