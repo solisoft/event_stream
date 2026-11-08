@@ -10,6 +10,7 @@
        ["demo", "Quickstart", docs_demo_path()],
        ["api", "HTTP and binary API", docs_api_path()],
        ["cli", "CLI and broker flags", docs_cli_path()],
+       ["clients", "Clients", docs_clients_path()],
        ["storage", "How storage works", docs_storage_path()],
        ["cluster", "Clustering with Raft", docs_cluster_path()],
        ["tools", "Backup and restore", docs_tools_path()]
@@ -26,6 +27,7 @@
           <h2>Reference</h2>
           <a href="<%= docs_api_path() %>" <% if section == "api" %>aria-current="page"<% end %>>HTTP and binary API</a>
           <a href="<%= docs_cli_path() %>" <% if section == "cli" %>aria-current="page"<% end %>>CLI and broker flags</a>
+          <a href="<%= docs_clients_path() %>" <% if section == "clients" %>aria-current="page"<% end %>>Clients</a>
           <h2>How it works</h2>
           <a href="<%= docs_storage_path() %>" <% if section == "storage" %>aria-current="page"<% end %>>How storage works</a>
           <a href="<%= docs_cluster_path() %>" <% if section == "cluster" %>aria-current="page"<% end %>>Clustering with Raft</a>

@@ -1,0 +1,84 @@
+<h1>Clients</h1>
+<p class="lede">
+  Anything that speaks HTTP and JSON is a client. Two libraries speak the binary protocol as well, for produce and
+  consume: Soli's built-in <code>ES</code> class, and the Rust crate <code>es-client</code> it is built on.
+</p>
+
+<h2 id="soli">Soli</h2>
+<p>
+  Soli ships a driver, the <a href="https://soli.solisoft.net/docs/builtins/es"><code>ES</code> class</a>, in its
+  default build from the release after 2.12.1. It reads the variables the <code>es</code> CLI reads, plus one for the binary listener:
+</p>
+<figure class="code">
+  <figcaption><span>.env</span></figcaption>
+<pre>ES_BROKER=https://es.internal:9000   # the HTTP API: topics, groups, commits
+ES_BINARY=es.internal:9001           # es-broker --bind-binary: produce and consume
+ES_AUTH=esk_mR3jH8cN...              # with --auth required</pre>
+</figure>
+<p>
+  With <code>ES_BINARY</code> set, produce, consume and ping go over the binary protocol, on connections pooled per
+  application; without it, over HTTP. Topics and consumer groups are HTTP either way. An <code>https://</code>
+  broker means TLS on both, and <code>ES_CA_FILE</code> names a private CA.
+</p>
+<figure class="code">
+  <figcaption><span>soli</span></figcaption>
+<pre>ES.create_topic("orders", {"partitions": 3})
+
+# A Hash value is sent as JSON; the key picks the partition.
+ES.emit("orders", order.user_id.to_s, {"event": "order.created", "order_id": order.id})
+
+# Read from the group's committed offset, handle, then commit.
+page = ES.group_consume("billing", "orders", 0, {"max_records": 500})
+page["records"].each { |record| handle(JSON.parse(record["value"])) }
+ES.commit("billing", "orders", 0, page["next_offset"])</pre>
+</figure>
+<p>
+  A <code>producer_id</code> with a <code>sequence</code> makes retries safe
+  (<code>ES.emit(topic, key, value, {"producer_id": "web-1", "sequence": n})</code>); consumer groups are
+  <code>ES.join</code>, <code>ES.heartbeat</code> and <code>ES.leave</code>. A produce whose connection breaks is
+  not retried by the driver, since the broker may already have appended it.
+</p>
+<p>From one single-threaded Soli script, broker and script pinned to separate cores of a Ryzen 9 9950X, fsync every 1&nbsp;000 records, median of three runs:</p>
+<table>
+  <thead><tr><th>Call</th><th>Binary</th><th>HTTP</th></tr></thead>
+  <tbody>
+    <tr><td><code>ES.emit</code>, one record per call</td><td>51,200/s (19.5&nbsp;µs)</td><td>37,700/s (26.5&nbsp;µs)</td></tr>
+    <tr><td><code>ES.produce</code>, 100 records per call</td><td>774k records/s</td><td>521k records/s</td></tr>
+    <tr><td><code>ES.consume</code>, 1&nbsp;000 records per page</td><td>1.40M records/s</td><td>1.15M records/s</td></tr>
+  </tbody>
+</table>
+<p>
+  With the broker's default fsync after every record, single-record emits fall to 18,600/s (binary) and 16,200/s
+  (HTTP): past one call per record, the disk sets the pace, not the protocol.
+</p>
+
+<h2 id="rust">Rust</h2>
+<p>
+  <code>es-client</code> is a blocking client &mdash; <code>std::net</code>, one request at a time, no tokio, no
+  dependency on the broker &mdash; for programs that already have their own threads:
+</p>
+<figure class="code">
+  <figcaption><span>rust</span></figcaption>
+<pre>use es_client::{Client, Options, WireConsumeRequest, WireProduceRecord};
+
+let mut client = Client::connect("127.0.0.1:9001", &amp;Options { gzip: true, ..Options::default() })?;
+let results = client.produce("orders", None, vec![WireProduceRecord {
+    key: Some(b"user-7".to_vec()),
+    value: br#"{"event":"order.created"}"#.to_vec(),
+    partition: None,
+    sequence: None,
+}])?;
+let page = client.consume(&amp;WireConsumeRequest {
+    topic: "orders".into(), partition: 0, offset: 0, max_records: 100, max_bytes: 1 &lt;&lt; 20,
+})?;</pre>
+</figure>
+<ul>
+  <li><strong>Errors say what is left of the connection.</strong> Only <code>Error::Server</code> (an unknown topic, a sequence gap, a missing grant) leaves it usable; after <code>Io</code>, <code>Protocol</code> or <code>Handshake</code>, connect again.</li>
+  <li><strong><code>is_closed()</code></strong> tells whether an idle connection was closed by the broker (<code>--binary-idle-timeout</code>), so a pool can check before reusing one rather than send a produce into a dead socket.</li>
+  <li><strong>TLS</strong> is the default <code>tls</code> feature: <code>Options { tls: Some(Tls::from_ca_file(path, "es.internal")?), .. }</code>.</li>
+</ul>
+<p>
+  On tokio, the broker crate has <code>es_broker::binary::BinaryClient</code> and the pipelined
+  <code>PipelinedClient</code>, which keeps up to 32 requests in flight on one connection. The frames are described
+  in <a href="<%= docs_api_path() %>#binary-protocol">the binary protocol</a>.
+</p>

@@ -48,6 +48,7 @@ crates/
 ├── es-protocol/   # serde DTOs + binary wire format
 ├── es-broker/     # broker: storage, HTTP, binary, auth, retention, compaction
 ├── es-cli/        # `es` binary
+├── es-client/     # blocking binary-protocol client (std::net, no tokio)
 └── es-tools/      # offline dump/restore tools
 scripts/demo.sh    # one-command end-to-end exercise
 Makefile           # build · run-broker · demo · test · clean

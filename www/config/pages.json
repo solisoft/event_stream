@@ -38,5 +38,10 @@
     "kicker": "Docs",
     "title": "Backup and restore",
     "description": "Copy a broker's data into one archive and restore it on any machine, checked before anything is replaced."
+  },
+  "clients": {
+    "kicker": "Docs",
+    "title": "Clients",
+    "description": "Soli's ES class and the Rust es-client: produce and consume over the binary protocol, everything else over HTTP."
   }
 }
